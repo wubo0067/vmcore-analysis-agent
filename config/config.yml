@@ -1,0 +1,9 @@
+# To separate your traces from other application
+LANGSMITH_PROJECT: vmcore-analysis-agent
+LANGSMITH_TRACING: true
+LANGSMITH_API_KEY: [REDACTED_LANGSMITH_TOKEN]
+
+## LLM choice:
+DEEPSEEK_API_KEY: [REDACTED_API_KEY]
+LLM_MODEL: deepseek-chat
+BASE_URL: https://api.deepseek.com
