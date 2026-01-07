@@ -5,5 +5,6 @@ LANGSMITH_API_KEY: [REDACTED_LANGSMITH_TOKEN]
 
 ## LLM choice:
 DEEPSEEK_API_KEY: [REDACTED_API_KEY]
-LLM_MODEL: deepseek-chat
+LLM_MODEL: deepseek-chat # deepseek-reasoner
 BASE_URL: https://api.deepseek.com
+TEMPERATURE: 1.0
