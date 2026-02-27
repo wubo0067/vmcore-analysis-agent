@@ -1,14 +1,23 @@
 # VMCore Analysis Agent
 
-一个基于 LangGraph 和 MCP 的智能 vmcore 分析代理，能够自动诊断 Linux 内核崩溃问题。
+一个基于 LangGraph ReAct 模式与 MCP 工具的智能 Linux 内核崩溃（vmcore）分析代理。
 
-## 项目概述
+## 项目介绍
 
-VMCore Analysis Agent 是一个结合了 RAG（检索增强生成）和 ReAct（推理与行动）框架的智能诊断系统。它能够：
+### Linux Kernel Crash 定位分析
 
-1. **从 RHEL 官方文档中提取诊断逻辑**：将非结构化的故障排除文档转化为结构化的诊断知识库，将 rhel engineer 的经验进行沉淀
-2. **自动化 vmcore 分析**：通过智能代理自动执行 crash 工具命令，分析内核转储文件
-3. **提供诊断建议**：基于历史案例和诊断知识库，给出问题根因分析和解决方案
+Linux 内核崩溃分析是系统工程领域皇冠上的明珠，也是最具挑战性的技术难题之一。
+
+**挑战与难点**：
+- **知识体系庞杂**：要求精通 C 语言、操作系统原理、常用数据结构与算法、内核子系统架构（内存管理、调度、文件系统等）。
+- **技能要求极高**：需掌握各类硬件工作原理及内核基础架构实现，熟练运用 crash、gdb 等复杂的调试工具。
+- **推理能力门槛**：在海量堆栈和内存数据中抽丝剥茧，需要极其强大的逻辑推理和归纳分析能力。
+
+**项目核心优势**：
+本项目创新性地引入了 **ReAct (Reasoning + Acting)** 模式的 AI Agent 架构，结合 **MCP (Model Context Protocol)** 工具体系，实现了自动化的 vmcore 深度分析：
+- **专家经验数字化**：复刻 RHEL 资深工程师的分析思维，通过精心设计的专业 Prompts，让 LLM 习得顶级专家的推理路径。
+- **工具使用智能化**：AI 能够自主规划和执行 crash 调试命令，像人类专家一样动态探索内存现场，而非简单的静态匹配。
+- **分析过程透明化**：提供完整的思考链（Chain of Thought）和操作记录，不仅给出结论，更展示完整的分析逻辑。
 
 ## 架构设计
 
@@ -16,381 +25,175 @@ VMCore Analysis Agent 是一个结合了 RAG（检索增强生成）和 ReAct（
 
 ```mermaid
 graph TB
-    subgraph "数据预处理流水线"
-        A[RHEL MD 文档] --> B[LLM 提取 DSL]
-        B --> C[诊断 DSL JSON]
-        C --> D[知识库集成]
-        D --> E[diagnostic_knowledge.json]
+    subgraph Client
+        A[client.py] -->|HTTP / SSE| B
     end
 
-    subgraph "智能分析代理"
-        F[Vmcore 文件] --> G[gather_vmcore_detail]
-        G --> H[retrieval RAG]
-        H --> I[call_llm_analysis]
-        I --> J{需要工具调用?}
-        J -->|是| K[call_mcp_crash_tool]
-        J -->|否| L[生成报告]
-        K --> I
-        L --> M[结束]
+    subgraph "FastAPI Server"
+        B["POST /analyze\nGET /analyze/stream"] --> C[create_agent_graph]
+        B --> D[generate_markdown_report]
     end
 
-    E --> H
-```
-
-## 第一部分：RAG 数据预处理流水线
-
-### 1.1 数据来源
-
-项目从 RHEL（Red Hat Enterprise Linux）官方知识库中收集了大量内核故障排除文档，这些文档以 Markdown 格式存储，包含：
-
-- **故障现象描述**：具体的错误信息和堆栈跟踪
-- **诊断步骤**：专家手动执行的 crash 工具命令序列
-- **根因分析**：问题根本原因和修复方案
-
-### 1.2 处理流程
-
-#### 步骤 1：从 MD 文件中提取 DSL（诊断逻辑）
-
-使用 LLM（DeepSeek）从原始 Markdown 文档中提取结构化的诊断逻辑：
-
-```python
-# 提取流程
-MD 文档 → LLM 解析 → 诊断 DSL（JSON 格式）
-
-# DSL 结构示例
-{
-  "os": "Red Hat Enterprise Linux 7",
-  "scenario": "Soft lockup or Hard lockup due to race between ring_buffer_detach() and ring_buffer_wakeup()",
-  "symptoms": ["NMI watchdog: BUG: soft lockup - CPU#0 stuck for 22s!"],
-  "workflow": [
-    {
-      "step_number": 1,
-      "thought": "Check system information and panic details",
-      "action": "sys -i",
-      "observation": "System BIOS, vendor, and product details"
-    }
-  ]
-}
-```
-
-#### 步骤 2：从 DSL 中汇总诊断字典
-
-将多个 DSL 文件整合为统一的诊断知识库：
-
-```python
-# 集成流程
-多个 DSL JSON → LLM 整合 → diagnostic_knowledge.json
-
-# 诊断知识库结构
-{
-  "summary": "Comprehensive diagnostic matrix for Linux kernel Hard LOCKUP scenarios",
-  "init_cmds": ["sys -i", "bt", "log | grep -i lockup"],
-  "matrix": [
-    {
-      "trigger": "Watchdog detected hard LOCKUP on cpu {cpu}",
-      "action": "bt -c {cpu}",
-      "arg_hints": "cpu: CPU number from lockup message",
-      "why": "Examine what's running on the locked CPU",
-      "expect": "Stack trace showing stuck function or spinlock",
-      "is_end": false
-    }
-  ]
-}
-```
-
-#### 步骤 3：数据对比示例
-
-##### 示例 1：系统信息检查 (sys -i)
-
-以 `3870151.md` 和 `3870151.json` 为例：
-
-**原始 MD 文件中的诊断步骤**：
-```markdown
-## Diagnostic Steps
-- vmcore analysis
-crash> sys -i
-crash> bt
-
-crash> sys -i
-        DMI_BIOS_VENDOR: innotek GmbH
-       DMI_BIOS_VERSION: VirtualBox
-          DMI_BIOS_DATE: 12/01/2006
-         DMI_SYS_VENDOR: innotek GmbH
-       DMI_PRODUCT_NAME: VirtualBox
-```
-
-**提取的 DSL 片段**：
-```json
-{
-  "step_number": 1,
-  "thought": "Check system information and panic details",
-  "action": "sys -i",
-  "observation": "System BIOS, vendor, and product details"
-}
-```
-
-**最终诊断知识库条目**：
-```json
-{
-  "trigger": "Need to check system information",
-  "action": "sys -i",
-  "arg_hints": null,
-  "why": "Get kernel version, BIOS, and system configuration",
-  "expect": "Kernel version, BIOS version, system uptime",
-  "is_end": false
-}
-```
-
-##### 示例 2：堆栈回溯分析 (bt -c {cpu})
-
-以 `6348992.json` 为例：
-
-**原始 MD 文件中的相关症状**：
-```markdown
-## Issue
-- Hard lockup occurs with following messages:
-[26404900.348486] NMI watchdog: Watchdog detected hard LOCKUP on cpu 23
-```
-
-**提取的 DSL 片段**：
-```json
-{
-  "step_number": 10,
-  "thought": "Examine backtrace of CPU 72 to understand its state",
-  "action": "bt -c 72",
-  "observation": "CPU 72 in idle state with mwait_idle_with_hints"
-}
-```
-
-**最终诊断知识库条目**：
-```json
-{
-  "trigger": "Watchdog detected hard LOCKUP on cpu {cpu}",
-  "action": "bt -c {cpu}",
-  "arg_hints": "cpu: CPU number from lockup message",
-  "why": "Examine what's running on the locked CPU",
-  "expect": "Stack trace showing stuck function or spinlock",
-  "is_end": false
-}
-```
-
-##### 示例 3：结构体检查 (struct spinlock_t)
-
-以 `6348992.json` 为例：
-
-**原始 MD 文件中的诊断上下文**：
-```markdown
-## Diagnostic Steps
-- vmcore analysis
-crash> bt
-    [exception RIP: _raw_spin_lock_irqsave+0x26]
-    RIP: ffffffffa496c816  RSP: ffff90da3fd03d88  RFLAGS: 00000046
-    RAX: 0000000000000000  RBX: 0000000000000046  RCX: 0000000000000000
-    RDX: 0000000000000001  RSI: 0000000000000003  RDI: ffff90da3a6cd2a8
-```
-
-**提取的 DSL 片段**：
-```json
-{
-  "step_number": 11,
-  "thought": "Inspect spinlock state that's causing the deadlock",
-  "action": "struct spinlock_t ffff8820b8915a80",
-  "observation": "Spinlock raw_lock value showing waiter/serving tickets"
-}
-```
-
-**最终诊断知识库条目**：
-```json
-{
-  "trigger": "Spinlock deadlock suspected at address {addr}",
-  "action": "struct spinlock_t {addr}",
-  "arg_hints": "addr: spinlock address from backtrace or memory dump",
-  "why": "Check spinlock state for deadlock indicators",
-  "expect": "raw_lock showing waiter/serving ticket mismatch",
-  "is_end": false
-}
-```
-
-**完整转换流程总结**：
-1. **MD 文档分析**：从原始 RHEL 知识库文章中提取故障现象和诊断步骤
-2. **DSL 提取**：使用 LLM 将非结构化的诊断步骤转化为结构化的 DSL（诊断逻辑）
-3. **知识库集成**：将多个 DSL 文件整合为统一的诊断知识库，进行泛化和去重
-4. **参数抽象**：将具体值（CPU 编号、内存地址）替换为占位符（{cpu}、{addr}）
-5. **意图保留**：保持原始诊断思想的核心目的和逻辑
-6. **上下文增强**：添加参数提示和期望结果，形成完整的诊断规则
-
-### 1.3 处理流程图
-
-```mermaid
-flowchart TD
-    A["原始 MD 文档"] --> B["LLM 提取"]
-    B --> C["诊断 DSL"]
-    C --> D["DSL 文件存储"]
-    D --> E["LLM 知识库集成"]
-    E --> F["诊断知识库"]
-    F --> G["RAG 检索"]
-
-    subgraph "文件目录结构"
-        H["rag-preprcessing/data/md/"] --> I["原始 MD 文档"]
-        J["rag-preprcessing/data/dsl/"] --> K["DSL JSON 文件"]
-        L["rag-preprcessing/data/"] --> M["diagnostic_knowledge.json"]
+    subgraph "LangGraph ReAct Agent"
+        C --> E["collect_crash_init_data_node\nsys / bt"]
+        E -->|HumanMessage| F{should_continue}
+        F -->|初始数据就绪| G["llm_analysis_node\nDeepSeek-Reasoner"]
+        G -->|AIMessage with tool_calls| H{should_continue}
+        H -->|需要工具| I[crash_tool_node]
+        H -->|reasoning_to_structure| J["structure_reasoning_node\ndeepseek-chat"]
+        H -->|分析完毕| K[__end__]
+        I -->|after_crash_tool| G
+        J -->|结构化后| H
     end
+
+    subgraph "MCP Tools"
+        I -->|crash 命令| L["crash MCP Server\nmcp_tools/crash"]
+        I -->|源码补丁| M["source_patch MCP Server\nmcp_tools/source_patch"]
+        L --> N["crash utility\nvmcore + vmlinux"]
+        M --> O[unified diff patch]
+    end
+
+    K --> D
+    D -->|Markdown 报告| P[reports]
 ```
 
-### 1.4 关键代码文件
+## Vmcore Analysis React Agent
 
-- `rag-preprcessing/extract_md-dsl/extract_integrate.py`：从 MD 提取 DSL 的主程序
-- `rag-preprcessing/dsl-diagnostic_dict/dsl_integration.py`：集成 DSL 到诊断知识库
-- `rag-preprcessing/data/diagnostic_knowledge.json`：生成的诊断知识库
+### 代理架构
 
-## 第二部分：Vmcore Analysis React Agent
+基于 LangGraph 的 ReAct（推理 - 行动）代理，包含四个核心节点：
 
-### 2.1 代理架构
+| 节点 | 说明 |
+|------|------|
+| `collect_crash_init_data_node` | 初始节点，并发执行 `sys`、`bt` 等命令收集 vmcore 基础信息 |
+| `llm_analysis_node` | 调用 DeepSeek-Reasoner，输出结构化 `VMCoreAnalysisStep`，决定下一步行动 |
+| `crash_tool_node` | 解析 LLM 工具调用请求，通过 MCP 并发执行 crash 命令 |
+| `structure_reasoning_node` | 当 Reasoner 返回纯文本 `reasoning_content` 时，用 deepseek-chat 将其结构化（可选） |
 
-基于 LangGraph 的 ReAct（推理 - 行动）代理，包含五个核心节点：
-
-1. **gather_vmcore_detail_node**：收集 vmcore 基础信息
-2. **retrieval_rag_node**：从 RAG 检索诊断知识库
-3. **llm_analysis_node**：LLM 分析决策
-4. **crash_tool_node**：执行 MCP crash 工具
-5. **报告生成**：输出最终诊断结果
-
-### 2.2 节点流转图
+### 节点流转图
 
 ```mermaid
 stateDiagram-v2
-    [*] --> gather_vmcore_detail
-    gather_vmcore_detail --> retrieval_rag: 收集基础信息
-    retrieval_rag --> call_llm_analysis: 检索诊断知识库
+    [*] --> collect_crash_init_data_node
+    collect_crash_init_data_node --> llm_analysis_node : HumanMessage（基础信息）
 
-    state call_llm_analysis {
-        [*] --> 分析决策
-        分析决策 --> 需要工具: 需要更多数据
-        分析决策 --> 生成报告: 已有结论
+    state llm_analysis_node {
+        [*] --> DeepSeek_Reasoner
+        DeepSeek_Reasoner --> 有tool_calls : 需要更多数据
+        DeepSeek_Reasoner --> reasoning_to_structure : Reasoner 纯文本输出
+        DeepSeek_Reasoner --> 分析完毕 : is_conclusive = true
     }
 
-    call_llm_analysis --> call_mcp_crash_tool: 需要工具调用
-    call_mcp_crash_tool --> call_llm_analysis: 返回工具结果
+    llm_analysis_node --> crash_tool_node : 有 tool_calls
+    llm_analysis_node --> structure_reasoning_node : reasoning_to_structure
+    llm_analysis_node --> [*] : 分析完毕
 
-    call_llm_analysis --> report: 生成最终报告
-    report --> [*]
+    crash_tool_node --> llm_analysis_node : ToolMessage（命令结果）
+    crash_tool_node --> [*] : is_last_step
+
+    structure_reasoning_node --> llm_analysis_node : 结构化 AIMessage
 ```
 
-### 2.3 详细节点说明
+### 详细节点说明
 
-#### 节点 1：gather_vmcore_detail_node
+#### 节点 1：collect_crash_init_data_node
+
 **功能**：执行默认的 crash 命令集合，收集 vmcore 基础信息
+
 **默认命令**：
 ```python
 DEFAULT_CRASH_COMMANDS = [
-    "sys",    # 系统信息
-    "bt",     # 所有线程的堆栈回溯
-    "runq",   # 运行队列
-    "swap",   # 交换空间
-    "timer",  # 定时器信息
-    "sig",    # 信号处理
-    "mach",   # 机器相关信息
-    "ipcs",   # IPC 信息
-    "waitq",  # 等待队列
+    "sys",  # 系统信息（内核版本、崩溃时间等）
+    "bt",   # 崩溃现场的堆栈回溯
 ]
 ```
 
-#### 节点 2：retrieval_rag_node
-**功能**：从 RAG 检索诊断知识库，基于收集的 vmcore 信息查找相关诊断逻辑
-**检索流程**：
-1. 提取 vmcore 中的关键症状（错误信息、堆栈符号等）
-2. 在 `diagnostic_knowledge.json` 中检索匹配的诊断规则
-3. 返回相关的诊断矩阵和初始命令建议
+执行结果以 `HumanMessage` 形式写入消息队列，作为 LLM 分析的初始上下文。
+
+#### 节点 2：llm_analysis_node
+
+**功能**：调用 DeepSeek-Reasoner，按 ReAct 模式输出结构化分析步骤
+
+**核心 Prompt 设计**：
+- 角色定义为资深 Linux Kernel Crash Dump 分析专家
+- 严格遵循 `VMCoreAnalysisStep` JSON Schema 输出
+- 内置防止重复执行同一命令的规则（Anti-Repetition Policy）
+- 禁止触发 token 溢出的高危命令（`sym -l`、`bt -a`、`ps -m` 等）
+- 支持 `run_script` 批量执行，确保模块符号在同一 crash session 内加载
+
+**输出 Schema**：
+```json
+{
+  "step_id": 1,
+  "reasoning": "分析当前状态，决定下一步",
+  "action": { "command_name": "bt", "arguments": ["-c", "3"] },
+  "is_conclusive": false,
+  "final_diagnosis": null,
+  "fix_suggestion": null,
+  "confidence": null,
+  "additional_notes": null
+}
+```
+
+#### 节点 3：crash_tool_node
+
+**功能**：接收 LLM 的工具调用请求，通过 MCP 并发执行 crash 命令
+
 **技术实现**：
-- 向量数据库：存储诊断知识库的嵌入向量
-- 相似度检索：基于症状匹配最相关的诊断规则
-- 上下文增强：将检索结果作为 LLM 分析的上下文
+- 使用 `langchain-mcp-adapters` 加载 MCP 工具
+- 通过 `asyncio.gather` 并发执行多条命令，提升效率
+- 每次调用独立管理 MCP 会话生命周期
+- 安全封装工具调用，捕获异常并以错误字符串返回，不中断流程
 
-#### 节点 3：llm_analysis_node
-**功能**：基于收集的信息和 RAG 检索结果，决定下一步行动
-**决策逻辑**：
-- 如果已有足够信息 → 生成诊断报告
-- 如果需要更多数据 → 调用 crash 工具
-- 如果遇到错误 → 终止流程
+**支持的 MCP 工具服务**：
+- **crash MCP Server**：提供 `run_script` 及各 crash 子命令（`bt`、`dis`、`struct`、`kmem`、`sym` 等）
+- **source_patch MCP Server**：根据 LLM 的源码分析结论生成 unified diff patch 文件
 
-#### 节点 4：crash_tool_node
-**功能**：通过 MCP（Model Context Protocol）调用 crash 工具
-**技术栈**：
-- MCP 服务器：提供 crash 工具接口
-- LangChain MCP Adapters：工具调用适配层
-- 异步执行：并发执行多个工具调用
+#### 节点 4：structure_reasoning_node（可选）
 
-#### 节点 5：报告生成
-**功能**：汇总所有分析结果，生成结构化诊断报告
+**功能**：DeepSeek-Reasoner 有时仅返回 `reasoning_content` 纯文本而 `content` 为空，此节点使用 deepseek-chat 将其转化为合法的 `VMCoreAnalysisStep` JSON，保证图的正常流转。
 
-### 2.4 状态流转逻辑
+### 路由逻辑（should_continue / after_crash_tool）
 
 ```python
 def should_continue(state: AgentState) -> str:
-    """决定下一步执行的节点"""
-    # 1. 检查错误状态
-    if state.get("error"):
+    # 1. 发生错误 → 结束
+    if error_state and error_state.get("is_error"):
         return "__end__"
 
-    # 2. 检查最后一条消息
-    last_message = state["messages"][-1]
+    # 2. 需要结构化 reasoning_content → structure_reasoning_node
+    if state.get("reasoning_to_structure"):
+        return structure_reasoning_node
 
-    # 3. 如果是 HumanMessage（来自 gather_vmcore_detail）
+    # 3. AIMessage 带 tool_calls → crash_tool_node（除非是最后一步）
+    if isinstance(last_message, AIMessage) and tool_calls:
+        return crash_tool_node if not is_last_step else "__end__"
+
+    # 4. AIMessage 无 tool_calls（is_conclusive=true）→ 结束
+    if isinstance(last_message, AIMessage):
+        return "__end__"
+
+    # 5. HumanMessage（初始数据收集完毕）→ llm_analysis_node
     if isinstance(last_message, HumanMessage):
-        return "retrieval_rag_node"  # 进入 RAG 检索
-
-    # 4. 如果是 ToolMessage（来自 crash_tool_node）
-    elif isinstance(last_message, ToolMessage):
-        return "llm_analysis_node"  # 返回 LLM 分析
-
-    # 5. 如果是 AIMessage 且有工具调用
-    elif isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "crash_tool_node"  # 执行工具
-
-    # 6. 如果是 AIMessage 但无工具调用
-    elif isinstance(last_message, AIMessage):
-        return "__end__"  # 生成报告
-
-    # 7. 其他情况继续分析
-    return "llm_analysis_node"
+        return llm_analysis_node
 ```
 
-### 2.5 图构建代码
+### MCP Crash 工具调用示例
 
 ```python
-def create_agent_graph(llm, tools_list):
-    """构建 LangGraph 状态图"""
-    builder = StateGraph(AgentState)
+# 并发执行多条 crash 命令
+async def dispatch_crash_commands(commands, state):
+    async with crash_client(state) as tools:
+        tasks = [_invoke_tool(tool, cmd, state) for cmd in commands]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    return list(zip(commands, results))
 
-    # 添加节点
-    builder.add_node("gather_vmcore_detail_node", gather_vmcore_detail)
-    builder.add_node("retrieval_rag_node", retrieval_rag)
-    builder.add_node("llm_analysis_node", partial(call_llm_analysis, llm_with_tools=llm))
-    builder.add_node("crash_tool_node", call_crash_tool)
-
-    # 添加边
-    builder.add_edge(START, "gather_vmcore_detail_node")
-    builder.add_conditional_edges("gather_vmcore_detail_node", should_continue)
-    builder.add_conditional_edges("retrieval_rag_node", should_continue)
-    builder.add_conditional_edges("llm_analysis_node", should_continue)
-
-    return builder.compile()
-```
-
-### 2.6 MCP Crash 工具集成
-
-项目通过 MCP 协议与 crash 工具集成：
-
-```python
-# MCP 工具调用示例
-async def _invoke_tool(tool, cmd: str, state: AgentState) -> str:
-    """调用 crash MCP 工具执行命令"""
-    result = await tool.ainvoke({
-        "command": cmd,
-        "vmcore_path": state["vmcore_path"],
-        "vmlinux_path": state["vmlinux_path"]
-    })
-    return result
+# 单条工具调用
+result = await tool.ainvoke({
+    "command": "bt -c 3",
+    "vmcore_path": state["vmcore_path"],
+    "vmlinux_path": state["vmlinux_path"],
+})
 ```
 
 ## 项目结构
@@ -398,29 +201,40 @@ async def _invoke_tool(tool, cmd: str, state: AgentState) -> str:
 ```
 vmcore-analysis-agent/
 ├── README.md                          # 项目说明文档
-├── main.py                            # 主程序入口
+├── main.py                            # FastAPI 服务入口
 ├── pyproject.toml                     # Python 项目配置
 ├── config/
-│   └── config.yml                     # 配置文件
-├── rag-preprcessing/                  # RAG 数据预处理
-│   ├── data/
-│   │   ├── md/                        # 原始 MD 文档
-│   │   ├── dsl/                       # 提取的 DSL 文件
-│   │   └── diagnostic_knowledge.json  # 诊断知识库
-│   ├── extract_md-dsl/                # MD 到 DSL 提取
-│   └── dsl-diagnostic_dict/           # DSL 到知识库集成
+│   └── config.yml                     # LLM / MCP 配置文件
+├── client/
+│   └── client.py                      # 命令行客户端
 ├── src/
-│   ├── llm/                           # LLM 模型配置
-│   ├── react/                         # ReAct 代理实现
-│   │   ├── graph.py                   # 图构建
+│   ├── llm/
+│   │   └── model.py                   # DeepSeek LLM 初始化
+│   ├── react/
+│   │   ├── graph.py                   # LangGraph 图构建
 │   │   ├── nodes.py                   # 节点实现
-│   │   ├── edges.py                   # 边逻辑
-│   │   ├── graph_state.py             # 状态定义
-│   │   └── prompts.py                 # 提示词模板
-│   ├── mcp_tools/crash/               # MCP crash 工具
-│   ├── retrival/                      # RAG 检索模块
-│   └── utils/                         # 工具函数
-└── logs/                              # 日志目录
+│   │   ├── edges.py                   # 路由逻辑
+│   │   ├── graph_state.py             # AgentState 定义
+│   │   ├── prompts.py                 # 专业分析 Prompt
+│   │   ├── llm_node.py                # LLM 调用与结构化
+│   │   ├── report_generator.py        # Markdown 报告生成
+│   │   └── logging_callback.py        # 图执行日志回调
+│   ├── mcp_tools/
+│   │   ├── crash/                     # crash MCP Server
+│   │   │   ├── server.py              # FastMCP 工具注册
+│   │   │   ├── executor.py            # crash 命令执行器
+│   │   │   └── client.py              # MCP 客户端封装
+│   │   └── source_patch/              # source_patch MCP Server
+│   │       ├── server.py              # patch 生成工具
+│   │       └── client.py              # MCP 客户端封装
+│   └── utils/                         # 日志、配置等工具函数
+├── simulate-crash/                    # 内核崩溃模拟模块
+│   ├── rcu_stall/                     # RCU stall 复现
+│   └── soft_lockup/                   # Soft lockup 复现
+├── reports/                           # 分析报告输出目录
+├── logs/                              # 运行日志目录
+└── tools/
+    └── show_first_global_func.sh      # 调试符号验证脚本
 ```
 
 ## 快速开始
@@ -429,30 +243,21 @@ vmcore-analysis-agent/
 
 ```bash
 cd vmcore-analysis-agent
-pip install -e .
-
-# 安装 FastAPI 相关依赖
-uv add fastapi uvicorn httpx
+uv sync
 ```
 
-### 2. 配置环境变量
+### 2. 配置
 
-```bash
-export DEEPSEEK_API_KEY="your-api-key"
-export MCP_CRASH_SERVER_PATH="/path/to/crash/server"
+编辑 `config/config.yml`，配置 LLM API Key 和 MCP 服务路径：
+
+```yaml
+llm:
+  api_key: "your-deepseek-api-key"
+  model: "deepseek-reasoner"
+  base_url: "https://api.deepseek.com"
 ```
 
-### 3. 运行数据预处理
-
-```bash
-# 提取 MD 到 DSL
-python rag-preprcessing/extract_md-dsl/extract_integrate.py
-
-# 集成 DSL 到知识库
-python rag-preprcessing/dsl-diagnostic_dict/dsl_integration.py
-```
-
-### 4. 启动 FastAPI 服务
+### 3. 启动 FastAPI 服务
 
 ```bash
 # 方式1：直接运行
@@ -466,59 +271,57 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 - API 文档：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/health
 
-### 5. 使用客户端调用分析接口
+### 4. 使用客户端调用分析接口
 
-#### 5.1 检查服务健康状态
-
-```bash
-python client.py --health
-```
-
-#### 5.2 同步模式分析（使用默认参数）
+#### 4.1 检查服务健康状态
 
 ```bash
-python client.py
+python client/client.py --health
 ```
 
-#### 5.3 流式模式分析
+#### 4.2 同步模式分析（使用默认参数）
 
 ```bash
-python client.py --stream
+python client/client.py
 ```
 
-#### 5.4 自定义参数分析
+#### 4.3 流式模式分析
 
 ```bash
-python client.py --vmcore-path "/path/to/vmcore" \
-                 --vmlinux-path "/path/to/vmlinux" \
-                 --vmcore-dmesg-path "/path/to/vmcore-dmesg.txt" \
-                 --debug-symbols "/path/to/module1.ko" "/path/to/module2.ko"
+python client/client.py --stream
 ```
 
-#### 5.5 指定服务地址
+#### 4.4 自定义参数分析
 
 ```bash
-python client.py --url http://192.168.1.100:8000 --stream
+python client/client.py --vmcore-path "/path/to/vmcore" \
+                         --vmlinux-path "/path/to/vmlinux" \
+                         --vmcore-dmesg-path "/path/to/vmcore-dmesg.txt" \
+                         --debug-symbols "/path/to/module1.ko" "/path/to/module2.ko"
 ```
 
-#### 5.6 报告保存选项
+#### 4.5 指定服务地址
+
+```bash
+python client/client.py --url http://192.168.1.100:8000 --stream
+```
+
+#### 4.6 报告保存选项
 
 ```bash
 # 流式模式分析并保存报告到当前目录（默认行为）
-python client.py --stream
+python client/client.py --stream
 
 # 指定报告输出目录
-python client.py --stream --output-dir ./reports
+python client/client.py --stream --output-dir ./reports
 
 # 不保存文件，仅显示
-python client.py --stream --no-save
+python client/client.py --stream --no-save
 ```
 
-#### 5.7 客户端完整参数说明
+#### 4.7 客户端完整参数说明
 
-```bash
-python client.py --help
-
+```
 参数说明：
   --url URL                   API 服务地址 (默认: http://localhost:8000)
   --stream                    使用流式模式
@@ -534,11 +337,8 @@ python client.py --help
 
 **说明**：
 - 分析完成后，默认会自动保存 markdown 报告到指定目录
-- 报告文件名格式：`127.0.0.1-2026-01-30-22-51-43.md`（从 vmcore 路径提取）
-- 报告包含完整的分析过程、推理步骤和最终诊断结果
-
-## 技术栈
-
+- 报告文件名格式：`127.0.0.1-2026-01-30-22-51-43.md`（从服务器 IP 和时间戳生成）
+- 报告包含完整的分析过程、推理步骤和最终诊断结论
 
 ## 应用场景
 
