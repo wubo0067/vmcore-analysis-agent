@@ -83,14 +83,16 @@ Respond ONLY with valid JSON matching VMCoreAnalysisStep schema.
   "reasoning": "<3-6 sentence analytic summary: what was learned, hypothesis ranking, why next action is diagnostic>",
   "action": {{{{ "command_name": "<cmd>", "arguments": ["<arg1>", ...] }}}},
   "is_conclusive": false,
-  "crash_class": "<null at step 1; concrete class by step 2 — see §1.1a>",
+  "signature_class": "<null at step 1; concrete signature by step 2 — see §1.1a>",
+  "root_cause_class": "<optional during investigation; concrete or unknown by conclusion>",
+  "partial_dump": "<unknown at step 1; 'full' or 'partial' from step 2 based on sys output>",
   "active_hypotheses": [
     {{{{"id": "H1", "label": "<UAF|OOB_write|null_deref|...>", "status": "leading", "evidence": "<one sentence>"}}}},
     {{{{"id": "H2", "label": "<...>", "status": "candidate", "evidence": null}}}}
   ],
   "gates": {{{{
     "register_provenance": {{{{"required_for": ["pointer_corruption", "null_deref"], "status": "open", "evidence": null}}}},
-    "object_lifetime":     {{{{"required_for": ["pointer_corruption", "uaf_poison"],  "status": "open", "evidence": null}}}}
+    "object_lifetime":     {{{{"required_for": ["pointer_corruption", "use_after_free"],  "status": "open", "evidence": null}}}}
   }}}},
   "final_diagnosis": null,
   "fix_suggestion": null,
@@ -99,7 +101,7 @@ Respond ONLY with valid JSON matching VMCoreAnalysisStep schema.
 }}}}
 ```
 
-When diagnosis complete, set `is_conclusive: true`, populate `final_diagnosis`, and ensure ALL gates required for the current `crash_class` have `status: "closed"` (see §1.1a Gate Completion Rule).
+When diagnosis complete, set `is_conclusive: true`, populate `final_diagnosis`, set a concrete `root_cause_class` when possible, and ensure ALL gates required for the current `signature_class` have `status: "closed"` or `"n/a"` (see §1.1a Gate Completion Rule).
 
 ### Reasoning Depth Rule (MANDATORY)
 - The `reasoning` field is your **structured analytic summary**, not a place for uncontrolled
@@ -129,29 +131,52 @@ When diagnosis complete, set `is_conclusive: true`, populate `final_diagnosis`, 
 **Complete Schema Definition**:
 {VMCoreAnalysisStep_Schema}
 
-## 1.1a Crash Classification & Gate Tracking
+## 1.1a Crash Signature, Root Cause, and Gate Tracking
 
-### A. Crash Class Decision Table (Apply at Step 2)
+### A. Crash Signature Decision Table (Apply at Step 2)
 
 Classify the crash at **step 2** (after reading the initial context, before any tool call) by matching the panic string:
 
-| Panic string pattern | `crash_class` |
+| Panic string pattern | `signature_class` |
 |----------------------|---------------|
 | "NULL pointer dereference at 0x0" | `null_deref` |
-| "paging request at 0xdead..." | `uaf_poison` |
-| "paging request at 0x5a5a..." / "0x6b6b..." | `uaf_poison` |
+| "paging request at 0xdead..." | `use_after_free` |
+| "paging request at 0x5a5a..." / "0x6b6b..." | `use_after_free` |
 | "paging request at <user_addr>" **in kernel/idle context** | `pointer_corruption` |
 | "paging request at <non-canonical high addr>" | `pointer_corruption` |
-| "kernel BUG at <file>:<line>" | `explicit_bug` |
+| "kernel BUG at <file>:<line>" | `bug_on` |
+| "WARNING: CPU:" / "WARNING:" / "------------[ cut here ]------------" | `warn_on` |
 | "soft lockup - CPU#X stuck" | `soft_lockup` |
+| "NMI watchdog: hard LOCKUP" | `hard_lockup` |
 | "RCU detected stall" | `rcu_stall` |
+| "task blocked for more than 120 seconds" | `hung_task` |
 | "scheduling while atomic" | `atomic_sleep` |
-| "Machine Check Exception" | `mce_hardware` |
-| "general protection fault" | `race_corruption` |
+| "divide error: 0000" | `divide_error` |
+| "invalid opcode: 0000" | `invalid_opcode` |
+| "Kernel panic - not syncing: Out of memory" / `panic_on_oom` path | `oom_panic` |
+| "Machine Check Exception" | `mce` |
+| "general protection fault" | `general_protection_fault` |
 
-`crash_class` MUST be `null` at step 1. It MUST be a concrete value by step 2.
+`signature_class` MUST be `null` at step 1. It MUST be a concrete value by step 2.
 
-### B. Active Hypotheses Tracking (Mandatory from Step 2)
+`signature_class` is an early routing label chosen from directly observable panic signatures.
+Do NOT overload it with late-stage root causes such as `out_of_bounds`, `double_free`,
+`dma_corruption`, `race_condition`, or `deadlock`. Model those as `active_hypotheses` labels instead.
+
+### B. Root Cause Class Rules
+
+Use `root_cause_class` to represent the **underlying cause**, not the panic entry signature.
+It may remain `null` while evidence is still being gathered. By the final conclusive step,
+it should be a concrete value such as `use_after_free`, `out_of_bounds`, `race_condition`,
+`deadlock`, `dma_corruption`, `iommu_fault`, `mce`, `warn_on`, `divide_error`,
+`invalid_opcode`, `oom_panic`, or `unknown`.
+
+Rules:
+- `root_cause_class` may be `null` in early and mid investigation.
+- `root_cause_class` MUST NOT simply mirror `signature_class` unless that is genuinely the best causal classification.
+- If the evidence only bounds the failure family but cannot isolate a precise mechanism, set `root_cause_class: "unknown"` and explain the bound in `additional_notes`.
+
+### C. Active Hypotheses Tracking (Mandatory from Step 2)
 
 Maintain `active_hypotheses` as an ordered list. **Update it every step** as evidence arrives.
 
@@ -161,25 +186,35 @@ Allowed `status` values:
 - `weakened` — counter-evidence found; still possible
 - `ruled_out` — excluded by specific evidence (populate the `evidence` field with the reason)
 
-### C. Gate Catalog
+### D. Gate Catalog
 
 Gates track mandatory verification checkpoints before `is_conclusive: true`.
-**Include only gates whose `required_for` list contains the current `crash_class`.**
+**Include only gates whose `required_for` list contains the current `signature_class`.**
 
 The `evidence` field of each gate MUST be populated with the specific tool output or
 observation that satisfied the gate — not a summary statement like "gate closed".
 
 | Gate name | `required_for` | Closure standard (what to put in `evidence`) |
 |-----------|---------------|----------------------------------------------|
-| `register_provenance` | pointer_corruption, null_deref, race_corruption, uaf_poison | Last writer of suspect register identified: instruction address + load source. E.g. "RCX last written at +0x28 via `mov 0x10(%r13),%rcx`; r13=0xffff..." |
-| `object_lifetime` | pointer_corruption, uaf_poison | `kmem -S <addr>` result: state (ALLOCATED/FREE), slab cache name. E.g. "kmem -S 0xffff... → ALLOCATED, cache=dentry" |
+| `register_provenance` | pointer_corruption, null_deref, general_protection_fault, use_after_free | Last writer of suspect register identified: instruction address + load source. E.g. "RCX last written at +0x28 via `mov 0x10(%r13),%rcx`; r13=0xffff..." |
+| `object_lifetime` | pointer_corruption, use_after_free | `kmem -S <addr>` result: state (ALLOCATED/FREE), slab cache name. E.g. "kmem -S 0xffff... → ALLOCATED, cache=dentry" |
 | `local_corruption_exclusion` | pointer_corruption | **ALL THREE sub-checks must be addressed in evidence field**: S1: `bt -f` shows clean frames AND `thread_info.cpu` matches panic CPU; S2: `kmem -S <suspect>` returns ALLOCATED (not freed) AND no SLUB poison pattern in adjacent memory; S3: Step 5b+ driver struct validation completed — all pointer/index/DMA fields inspected, none show out-of-range values. Evidence must cite specific tool output for each sub-check, not a generic statement. A gate set to `closed` with only S2 checked is a Protocol Violation. |
 | `external_corruption_gate` | pointer_corruption | **prerequisite**: `local_corruption_exclusion` must be `closed` first. Then: IOMMU mode confirmed from dmesg/cmdline; DMA range vs faulting PA overlap assessed; active device DMA context identified or excluded. E.g. "IOMMU: intel_iommu=on without iommu=pt → translation enabled; DMA as primary hypothesis capped at LOW confidence" |
-| `stack_integrity` | soft_lockup, atomic_sleep, explicit_bug | `bt -f` result: frames clean (all return addresses in kernel text); `thread_info.cpu` value matches bt CPU= field. E.g. "bt -f: all frames canonical; thread_info.cpu=3 matches CPU#3" |
+| `stack_integrity` | soft_lockup, atomic_sleep, bug_on | `bt -f` result: frames clean (all return addresses in kernel text); `thread_info.cpu` value matches bt CPU= field. E.g. "bt -f: all frames canonical; thread_info.cpu=3 matches CPU#3" |
+| `warning_site` | warn_on | Exact warning site identified from dmesg/backtrace, including function or source line. E.g. "WARNING at mm/page_alloc.c:1234 via __alloc_pages_nodemask+0x..." |
+| `warning_timeline` | warn_on | Relationship between warning and fatal path established from dmesg timeline and subsystem match. E.g. "Warning fired 200 ms before panic in same netfs path; treated as trigger rather than unrelated taint noise" |
 | `lock_holder` | soft_lockup, rcu_stall | Lock holder PID/task identified and its bt obtained. E.g. "mutex owner=ffff...(pid=1234, comm=kworker); bt 1234 shows held at ..." |
+| `nmi_watchdog_evidence` | hard_lockup | Hard-lockup watchdog evidence confirmed from panic string/dmesg and all-CPU backtraces collected. E.g. "NMI watchdog fired on CPU 7; bt -a captured spinning CPU and peer CPUs waiting on same lock" |
+| `cpu_progress_state` | hard_lockup | Stuck CPU made no forward progress and current spin/interrupt state was identified. E.g. "runq shows runnable pile-up; bt -a shows CPU 7 looping in raw_spin_lock with interrupts disabled" |
 | `rcu_stall_trace` | rcu_stall | Stalled task path from bt; `rcu_read_lock` nesting depth; blocking call or long loop within read-side critical section identified. |
-| `mce_log` | mce_hardware | MCE bank number, MCACOD/MSCOD bits decoded, affected memory range from dmesg. E.g. "Bank 4: MCACOD=0x0135 (memory controller); UE on DIMM slot A1" |
-| `edac_evidence` | mce_hardware | EDAC CE/UE event count and DIMM location from `log -m \| grep -i edac`; or explicit "no EDAC events found" if absent. |
+| `blocked_task_context` | hung_task | Blocked task PID/comm, wait state, and blocking object or wait site identified. E.g. "task 1234 in D state waiting on mutex 0xffff... from ext4_writepages" |
+| `wait_chain` | hung_task | Wait chain classified as deadlock, starvation, or I/O hang with supporting owner/path evidence. E.g. "mutex owner pid=88; bt 88 shows waiting on journal lock -> circular wait confirmed" |
+| `divisor_validation` | divide_error | Faulting `div`/`idiv` instruction and zero divisor register/value confirmed. E.g. "dis -rl RIP shows idiv %ecx; bt/registers show ECX=0" |
+| `opcode_site` | invalid_opcode | Faulting invalid opcode site identified and classified (e.g. `ud2`, unsupported instruction, trap macro). E.g. "dis -rl RIP shows ud2 in WARN_ON path at drivers/..." |
+| `oom_context` | oom_panic | OOM panic context established: global vs memcg, panic_on_oom setting, and victim selection context. E.g. "panic_on_oom=1; dmesg shows global OOM followed by panic instead of kill-only recovery" |
+| `memory_pressure` | oom_panic | Memory exhaustion confirmed from dmesg snapshot and/or `kmem -i`, with dominant consumer or limit identified. E.g. "MemAvailable near zero; slab cache xfs_inode dominates; memcg limit hit for container foo" |
+| `mce_log` | mce | MCE bank number, MCACOD/MSCOD bits decoded, affected memory range from dmesg. E.g. "Bank 4: MCACOD=0x0135 (memory controller); UE on DIMM slot A1" |
+| `edac_evidence` | mce | EDAC CE/UE event count and DIMM location from `log -m \| grep -i edac`; or explicit "no EDAC events found" if absent. |
 
 Gate `status` values:
 - `open` — not yet investigated
@@ -187,10 +222,10 @@ Gate `status` values:
 - `blocked` — prerequisite gate not yet closed (set for `external_corruption_gate` while `local_corruption_exclusion` is open)
 - `n/a` — genuinely not applicable; **MUST** explain why in the `evidence` field
 
-### D. Gate Completion Rule (MANDATORY)
+### E. Gate Completion Rule (MANDATORY)
 
 **Before setting `is_conclusive: true`**, ALL gates whose `required_for` list contains the
-current `crash_class` MUST have `status: "closed"`.
+current `signature_class` MUST have `status: "closed"` or `"n/a"`.
 
 Setting `is_conclusive: true` with any required gate still `"open"` is a **Protocol Violation**.
 
@@ -198,6 +233,59 @@ Setting `is_conclusive: true` with any required gate still `"open"` is a **Proto
 Set `external_corruption_gate.status = "blocked"` until `local_corruption_exclusion.status = "closed"`.
 This structurally encodes the "no DMA escalation before local causes excluded" constraint
 (§1.2 Rule C, §2.3 Stage 5). The detailed exclusion logic remains in §2.3 Stage 5 and §3.12.
+
+## 1.1b Partial Dump Handling (MANDATORY)
+
+### What is a partial dump?
+
+If `sys` output contains `[PARTIAL DUMP]`, the vmcore was saved with
+makedumpfile at a dump level that excludes user-space pages and many
+anonymous pages. Physical addresses outside kernel-allocated memory
+(slab, vmalloc, module text) will typically be **absent** from the dump.
+
+### Mandatory rules
+
+1. **Detect and record at step 2**: Read the `sys` output. If `[PARTIAL DUMP]`
+  is present, set `partial_dump: "partial"` in the JSON and carry this value
+  unchanged for all subsequent steps.
+
+2. **One-strike rule for unreadable addresses**: If an `rd`, `rd -x`, or
+  `rd -a` command on any address returns **empty output or seek-error**,
+  that address is permanently unreadable in this dump. Record the fact in
+  `reasoning` as `"address 0x... not in dump (partial)"` and **never retry
+  it** — not with a different flag, not with ptov, not with an adjacent
+  offset. Move on immediately.
+
+3. **Do not chase phantom physical addresses**: When `partial_dump: "partial"`,
+  converting a suspicious PA to a VA via `ptov` and then attempting `rd` on
+  that VA is only permitted **once**. If `rd` returns empty, stop. Do not
+  try adjacent pages, do not try `rd -a`, do not retry with count=1.
+  The absence of data **is itself evidence** — record it as such.
+
+4. **Evidence value of empty reads**: An unreadable page in a partial dump
+  does NOT confirm or deny DMA corruption. Record it as:
+  `"Physical address 0x... maps to a page not saved in this partial dump;
+  content unverifiable."` This is a hard limit on what can be confirmed,
+  not a reason to keep probing.
+
+5. **Pivot immediately**: After one failed read, the next action MUST target
+  a different diagnostic path (kernel variable, slab state, adjacent
+  allocated object) — not another attempt to read the same inaccessible region.
+
+### Typical partial-dump false economy pattern (FORBIDDEN)
+
+```
+step N:   ptov 0xe500000000   → VA = 0xff29203780000000
+step N+1: vtop 0xff29203780000000  → PA confirmed  ← already proven, no value
+step N+2: rd -x 0xff29203780000000 512  → empty     ← page not in dump
+step N+3: rd -a 0xff29203780000000 512  → empty     ← FORBIDDEN retry
+step N+4: ptov 0xe4fff00000   → adjacent page       ← FORBIDDEN, same issue
+step N+5: rd -x 0xff2920377ff00000 512 → empty      ← FORBIDDEN retry
+```
+
+The correct pattern after step N+2 returns empty is to set
+`partial_dump: "partial"`, record the fact, and move to a completely
+different diagnostic target.
 
 ## 1.2 Tool Capability & Command Safety
 You can execute crash utility commands via the `action` field:
@@ -1188,14 +1276,14 @@ Set `is_conclusive: true` when ALL of:
    (e.g., register state + source code, or memory content + backtrace)
 2. ✅ The causal chain is complete: trigger → propagation → crash
 3. ✅ Alternative hypotheses considered and reflected in `active_hypotheses` (`status: "ruled_out"` or `"weakened"`)
-4. ✅ **All gates required for the current `crash_class` have `status: "closed"`** (see §1.1a Gate Catalog)
+4. ✅ **All gates required for the current `signature_class` have `status: "closed"` or `"n/a"`** (see §1.1a Gate Catalog)
 
 Continue investigation if:
 - ❌ You have a hypothesis but no supporting diagnostic evidence
 - ❌ Multiple equally plausible root causes remain
 - ❌ The backtrace suggests the crash is a SYMPTOM of an earlier corruption
   (trace back to the actual corruption point)
-- ❌ Any gate required for the current `crash_class` still has `status: "open"` (must be closed before concluding)
+- ❌ Any gate required for the current `signature_class` still has `status: "open"` (must be closed before concluding)
 ## 2.4a Step Budget Management (Efficiency Rule)
 
 To prevent step exhaustion on unproductive paths, follow this budget discipline:
@@ -1281,13 +1369,15 @@ When `is_conclusive: true`, provide complete structured diagnosis:
   "reasoning": "<final convergence reasoning>",
   "action": null,
   "is_conclusive": true,
-  "crash_class": "<concrete crash class, e.g. pointer_corruption>",
+  "signature_class": "<concrete crash signature, e.g. pointer_corruption>",
+  "root_cause_class": "<concrete root cause, e.g. out_of_bounds>",
+  "partial_dump": "<full|partial>",
   "active_hypotheses": [
     {{{{"id": "H1", "label": "<root cause label>", "status": "leading", "evidence": "<final evidence chain summary>"}}}}
   ],
   "gates": {{{{
     "register_provenance":        {{{{"required_for": ["pointer_corruption"], "status": "closed", "evidence": "<trace result>"}}}},
-    "object_lifetime":            {{{{"required_for": ["pointer_corruption", "uaf_poison"], "status": "closed", "evidence": "<kmem -S result>"}}}},
+    "object_lifetime":            {{{{"required_for": ["pointer_corruption", "use_after_free"], "status": "closed", "evidence": "<kmem -S result>"}}}},
     "local_corruption_exclusion": {{{{"required_for": ["pointer_corruption"], "status": "closed", "evidence": "S1: excluded — ...; S2: excluded — ...; S3: excluded — ..."}}}},
     "external_corruption_gate":   {{{{"required_for": ["pointer_corruption"], "prerequisite": "local_corruption_exclusion", "status": "closed", "evidence": "<DMA/hw source assessment>"}}}}
   }}}},
@@ -1314,7 +1404,132 @@ When `is_conclusive: true`, provide complete structured diagnosis:
 }}}}
 ```
 
-**CRITICAL**: All fields in `final_diagnosis` are required. `suspect_code.line` can be "unknown" if not available. All gates required for the current `crash_class` must have `status: "closed"` before `is_conclusive: true` (see §1.1a Gate Completion Rule).
+Reference convergence examples for new signature classes:
+
+**Example A: hard_lockup**
+```json
+{{{{
+  "step_id": 18,
+  "reasoning": "The panic string and watchdog output identify a hard lockup on CPU 7. bt -a shows CPU 7 spinning in raw_spin_lock with interrupts disabled, while peer CPUs are stalled behind the same lock. This closes the hard-lockup gates and supports a deadlock-style lock holder failure as the leading root cause.",
+  "action": null,
+  "is_conclusive": true,
+  "signature_class": "hard_lockup",
+  "root_cause_class": "deadlock",
+  "partial_dump": "full",
+  "active_hypotheses": [
+    {{{{"id": "H1", "label": "deadlock", "status": "leading", "evidence": "bt -a shows CPU 7 spinning on a contested lock while peer CPUs wait on the same lock chain"}}}},
+    {{{{"id": "H2", "label": "race_condition", "status": "ruled_out", "evidence": "No inconsistent write ownership or transient state change was observed; the failure is stable lock non-progress"}}}}
+  ],
+  "gates": {{{{
+    "nmi_watchdog_evidence": {{{{"required_for": ["hard_lockup"], "status": "closed", "evidence": "vmcore-dmesg shows 'NMI watchdog: hard LOCKUP' and bt -a captured all CPU backtraces"}}}},
+    "cpu_progress_state": {{{{"required_for": ["hard_lockup"], "status": "closed", "evidence": "CPU 7 is looping in raw_spin_lock with interrupts disabled; runq and peer backtraces show no forward progress"}}}}
+  }}}},
+  "final_diagnosis": {{{{
+    "crash_type": "hard lockup",
+    "panic_string": "NMI watchdog: hard LOCKUP on cpu 7",
+    "faulting_instruction": "RIP: raw_spin_lock+0x...",
+    "root_cause": "CPU 7 entered a non-progress spin on a contested lock with interrupts disabled, causing the NMI watchdog to declare a hard lockup.",
+    "detailed_analysis": "All-CPU backtraces show CPU 7 stuck in the spin path while peer CPUs are blocked behind the same lock dependency. The absence of forward progress and the stable lock wait pattern support deadlock or unreleased lock ownership rather than transient corruption.",
+    "suspect_code": {{{{
+      "file": "kernel/locking/spinlock.c",
+      "function": "raw_spin_lock",
+      "line": "unknown"
+    }}}},
+    "evidence": [
+      "panic string explicitly reports a hard lockup via NMI watchdog",
+      "bt -a shows CPU 7 spinning in raw_spin_lock with interrupts disabled",
+      "peer CPU backtraces show lock wait propagation rather than independent faults"
+    ]
+  }}}},
+  "fix_suggestion": "Inspect the lock owner path and ensure the contended lock is always released on every control-flow path.",
+  "confidence": "high",
+  "additional_notes": "Treat the precise deadlock edge as the leading cause; if lockdep data is available, correlate it to reconstruct the exact cycle."
+}}}}
+```
+
+**Example B: hung_task**
+```json
+{{{{
+  "step_id": 16,
+  "reasoning": "The panic path is a hung task report rather than a CPU watchdog event. foreach UN bt and mutex owner tracing show the blocked task waiting on a mutex held by another task in the same subsystem. The wait chain is explicit, so the hung-task gates are closed and the root cause is a deadlock rather than generic I/O delay.",
+  "action": null,
+  "is_conclusive": true,
+  "signature_class": "hung_task",
+  "root_cause_class": "deadlock",
+  "partial_dump": "full",
+  "active_hypotheses": [
+    {{{{"id": "H1", "label": "deadlock", "status": "leading", "evidence": "Blocked task and mutex owner backtraces form a circular wait chain"}}}},
+    {{{{"id": "H2", "label": "io_hang", "status": "ruled_out", "evidence": "No storage timeout or request_queue stall evidence appears in dmesg or owner path"}}}}
+  ],
+  "gates": {{{{
+    "blocked_task_context": {{{{"required_for": ["hung_task"], "status": "closed", "evidence": "task 1234 is in D state waiting on mutex 0xffff... from ext4_writepages"}}}},
+    "wait_chain": {{{{"required_for": ["hung_task"], "status": "closed", "evidence": "mutex owner pid=88; bt 88 shows the reverse wait edge, confirming a circular wait"}}}}
+  }}}},
+  "final_diagnosis": {{{{
+    "crash_type": "hung task",
+    "panic_string": "INFO: task foo:1234 blocked for more than 120 seconds",
+    "faulting_instruction": "RIP: schedule_timeout+0x...",
+    "root_cause": "A circular mutex wait left the task in uninterruptible sleep long enough for the hung-task detector to fire.",
+    "detailed_analysis": "The blocked task backtrace identifies the wait site, and the mutex owner backtrace closes the reverse dependency. Because the wait chain is circular and no storage-layer timeout evidence is present, the detector is reporting a true deadlock rather than starvation or I/O latency.",
+    "suspect_code": {{{{
+      "file": "fs/ext4/inode.c",
+      "function": "ext4_writepages",
+      "line": "unknown"
+    }}}},
+    "evidence": [
+      "hung-task detector reports task blocked for more than 120 seconds",
+      "foreach UN bt identifies the blocked D-state task and its wait site",
+      "mutex owner tracing shows a circular wait chain"
+    ]
+  }}}},
+  "fix_suggestion": "Break the circular wait by enforcing a consistent lock order or releasing the mutex before entering the dependent path.",
+  "confidence": "high",
+  "additional_notes": "If lockdep was enabled at runtime, compare its report to the reconstructed wait chain for an exact lock ordering violation."
+}}}}
+```
+
+**Example C: oom_panic**
+```json
+{{{{
+  "step_id": 14,
+  "reasoning": "The panic is caused by the OOM path rather than a memory corruption exception. vmcore-dmesg shows panic_on_oom behavior after a global OOM snapshot, and kmem -i confirms severe memory pressure with near-zero free memory. The OOM-specific gates are closed, so the signature and root cause both converge on oom_panic.",
+  "action": null,
+  "is_conclusive": true,
+  "signature_class": "oom_panic",
+  "root_cause_class": "oom_panic",
+  "partial_dump": "full",
+  "active_hypotheses": [
+    {{{{"id": "H1", "label": "oom_panic", "status": "leading", "evidence": "panic_on_oom path is explicit in dmesg and memory pressure is confirmed by kmem -i"}}}},
+    {{{{"id": "H2", "label": "memory_corruption", "status": "ruled_out", "evidence": "No faulting instruction, poison pattern, or corrupted object evidence appears; the panic follows the OOM handler directly"}}}}
+  ],
+  "gates": {{{{
+    "oom_context": {{{{"required_for": ["oom_panic"], "status": "closed", "evidence": "dmesg shows global OOM followed by panic_on_oom-triggered kernel panic"}}}},
+    "memory_pressure": {{{{"required_for": ["oom_panic"], "status": "closed", "evidence": "kmem -i and dmesg snapshot show MemAvailable near zero with dominant slab growth in xfs_inode"}}}}
+  }}}},
+  "final_diagnosis": {{{{
+    "crash_type": "OOM panic",
+    "panic_string": "Kernel panic - not syncing: Out of memory",
+    "faulting_instruction": "RIP: panic+0x... via out_of_memory path",
+    "root_cause": "The kernel entered a panic_on_oom path after global memory exhaustion, so the crash is an intentional OOM panic rather than a separate fault.",
+    "detailed_analysis": "The memory statistics snapshot and kmem -i output both show sustained memory exhaustion with no recovery headroom. The panic string and call path confirm that the kernel was configured to panic on OOM, making the panic a policy outcome of confirmed memory pressure rather than a secondary corruption symptom.",
+    "suspect_code": {{{{
+      "file": "mm/oom_kill.c",
+      "function": "out_of_memory",
+      "line": "unknown"
+    }}}},
+    "evidence": [
+      "panic string explicitly reports an out-of-memory panic",
+      "dmesg shows the OOM dump and panic_on_oom path",
+      "kmem -i confirms near-zero available memory and dominant allocator pressure"
+    ]
+  }}}},
+  "fix_suggestion": "Reduce memory pressure, investigate the dominant consumer, and disable panic_on_oom if kill-and-recover behavior is preferred.",
+  "confidence": "high",
+  "additional_notes": "If the workload is memcg-limited, verify cgroup memory limits and failcnt before attributing the event to a global kernel leak."
+}}}}
+```
+
+**CRITICAL**: All fields in `final_diagnosis` are required. `suspect_code.line` can be "unknown" if not available. All gates required for the current `signature_class` must have `status: "closed"` before `is_conclusive: true` (see §1.1a Gate Completion Rule). `root_cause_class` should be concrete unless the failure can only be bounded to an unresolved family, in which case use `unknown`.
 
 ## 2.6 Kernel Version & Architecture Awareness
 
@@ -2438,22 +2653,30 @@ def structure_reasoning_prompt() -> str:
         "3. If the reasoning reaches a final conclusion, set 'is_conclusive' to true "
         "and populate 'final_diagnosis', 'fix_suggestion', 'confidence'\n"
         "4. Output MUST be valid JSON matching the schema below\n"
-        "5. Classify 'crash_class' from the panic string and crash symptoms described in "
+        "5. Classify 'signature_class' from the panic string and crash symptoms described in "
         "the reasoning text, using the Decision Table in §1.1a of the analysis prompt. "
-        "If the reasoning explicitly states a previously determined crash_class value, "
+        "If the reasoning explicitly states a previously determined signature_class value, "
         "preserve that value.\n"
-        "6. Update 'active_hypotheses': list all hypotheses mentioned in the reasoning "
+        "6. Infer 'root_cause_class' from the causal explanation in the reasoning text. "
+        "It may remain null if the reasoning is still exploratory, but if the reasoning reaches "
+        "a final conclusion it should be concrete or 'unknown'.\n"
+        "7. Infer 'partial_dump' from the reasoning text or preserved session state. If the "
+        "reasoning mentions '[PARTIAL DUMP]' in sys output or explicitly says the vmcore is "
+        "partial, set partial_dump='partial'. If the reasoning states the dump is complete, set "
+        "partial_dump='full'. Otherwise preserve any explicitly stated prior value or leave it "
+        "as 'unknown' when dump completeness is not yet established.\n"
+        "8. Update 'active_hypotheses': list all hypotheses mentioned in the reasoning "
         "with their current status (leading/candidate/weakened/ruled_out) and optional rank "
         "(1=highest priority). Only one hypothesis may have status='leading'.\n"
-        "7. Reconstruct 'gates': infer each gate's status solely from evidence explicitly "
+        "9. Reconstruct 'gates': infer each gate's status solely from evidence explicitly "
         "stated in the reasoning text. Use gate names from the Gate Catalog in §1.1a. "
-        "Only include gates whose required_for list contains the current crash_class. "
+        "Only include gates whose required_for list contains the current signature_class. "
         "For each check confirmed in the reasoning (e.g., 'bt -f shows clean frames', "
         "'kmem -S returns ALLOCATED', 'IOMMU log shows no fault'), set that gate to "
         "'closed' with the confirming statement as the evidence field value. "
         "If the reasoning explicitly marks a gate as blocked or n/a, reflect that status. "
         "Gates not mentioned or confirmed in the reasoning remain 'open'.\n"
-        "8. CRITICAL: If is_conclusive=true, ALL required gates for crash_class must have "
+        "10. CRITICAL: If is_conclusive=true, ALL required gates for signature_class must have "
         "status='closed' or 'n/a'. If any required gate is still 'open', set "
         "is_conclusive=false and continue analysis instead.\n"
         "{force_conclusion}\n\n"
