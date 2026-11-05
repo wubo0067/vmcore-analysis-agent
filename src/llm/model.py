@@ -64,6 +64,7 @@ def create_reasoning_llm():
     model_name = settings.reasoning_model
     temperature = settings.reasoning_temperature
     reasoning_effort = settings.reasoning_effort
+    max_tokens = settings.reasoning_max_output_tokens
 
     # 配置 LangSmith 追踪
     if settings.langsmith_tracing:
@@ -79,7 +80,6 @@ def create_reasoning_llm():
         if thinking == "enabled":
             # 使用的是思考模式
             llm_class = ChatDeepSeekReasoner
-            max_tokens = 48000  # Reasoner 模型的 max_tokens 同时包含 reasoning_tokens + content_tokens，需要足够大
             llm_kwargs = {
                 "reasoning_effort": reasoning_effort,
                 "extra_body": {"thinking": {"type": "enabled"}},
@@ -87,7 +87,6 @@ def create_reasoning_llm():
         else:
             # 普通对话模式
             llm_class = ChatDeepSeek
-            max_tokens = 8192
             llm_kwargs = {
                 "top_p": 0.1,  # 使用低随机性设置，适合代码生成和事实回答
                 "presence_penalty": 0,  # 保持输出更贴近原始符号和事实
@@ -110,6 +109,5 @@ def create_reasoning_llm():
     except Exception as e:
         logger.error(f"Failed to create LLM instance: {e}")
         raise
-
 
 

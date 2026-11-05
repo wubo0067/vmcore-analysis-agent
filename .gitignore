@@ -1,2 +1,4 @@
 # Local secrets and runtime settings.
 .env
+"__pycache__/"
+"*.pyc"
