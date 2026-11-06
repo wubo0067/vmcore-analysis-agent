@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="430" viewBox="0 0 1200 430" role="img" aria-labelledby="title description">
+  <title id="title">VMCore analysis workflow</title>
+  <desc id="description">A workflow from client request through validation, crash data collection, LLM analysis, tool execution, evidence evaluation, and report generation. Tool results loop back to analysis.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0 0L10 4L0 8Z" fill="#475569"/>
+    </marker>
+    <style>
+      text { font-family: Arial, sans-serif; fill: #0f172a; }
+      .box { stroke-width: 2; rx: 12; }
+      .label { font-size: 17px; font-weight: 700; text-anchor: middle; }
+      .sub { font-size: 14px; text-anchor: middle; fill: #334155; }
+      .edge { fill: none; stroke: #475569; stroke-width: 2.5; marker-end: url(#arrow); }
+      .caption { font-size: 14px; fill: #475569; }
+    </style>
+  </defs>
+  <rect width="1200" height="430" fill="#ffffff"/>
+
+  <rect class="box" x="30" y="46" width="205" height="84" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text class="label" x="132" y="80">Client request</text>
+  <text class="sub" x="132" y="105">vmcore and debug files</text>
+
+  <rect class="box" x="270" y="46" width="205" height="84" fill="#eef2ff" stroke="#818cf8"/>
+  <text class="label" x="372" y="80">Validate paths</text>
+  <text class="sub" x="372" y="105">FastAPI creates state</text>
+
+  <rect class="box" x="510" y="46" width="205" height="84" fill="#ecfeff" stroke="#06b6d4"/>
+  <text class="label" x="612" y="80">Collect crash basics</text>
+  <text class="sub" x="612" y="105">sys, taint, backtrace</text>
+
+  <rect class="box" x="750" y="46" width="205" height="84" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text class="label" x="852" y="80">LLM analysis</text>
+  <text class="sub" x="852" y="105">Select next diagnostic action</text>
+
+  <rect class="box" x="990" y="46" width="180" height="84" fill="#fff7ed" stroke="#fb923c"/>
+  <text class="label" x="1080" y="80">Execute tools</text>
+  <text class="sub" x="1080" y="105">MCP / crash</text>
+
+  <path class="edge" d="M235 88H265"/>
+  <path class="edge" d="M475 88H505"/>
+  <path class="edge" d="M715 88H745"/>
+  <path class="edge" d="M955 88H985"/>
+
+  <rect class="box" x="775" y="235" width="265" height="84" fill="#f0fdf4" stroke="#22c55e"/>
+  <text class="label" x="907" y="269">Extract evidence</text>
+  <text class="sub" x="907" y="294">Evaluate verification gates</text>
+
+  <rect class="box" x="385" y="235" width="265" height="84" fill="#e0f2fe" stroke="#38bdf8"/>
+  <text class="label" x="517" y="269">Analysis complete</text>
+  <text class="sub" x="517" y="294">Markdown report and audit</text>
+
+  <path class="edge" d="M1080 130V190H907V229"/>
+  <path class="edge" d="M775 277H657"/>
+  <text class="caption" x="687" y="261">No more actions</text>
+  <path class="edge" d="M840 235V181H852V136"/>
+  <text class="caption" x="865" y="169">Continue analysis</text>
+</svg>

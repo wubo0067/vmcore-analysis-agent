@@ -17,16 +17,7 @@ Key capabilities:
 
 ## How it works
 
-```mermaid
-flowchart LR
-    A[Client request] --> B[FastAPI validates file paths]
-    B --> C[Collect basics: sys, sys -t, bt]
-    C --> D[LLM analyzes and selects an action]
-    D --> E[Execute MCP / crash tool]
-    E --> F[Extract evidence and evaluate gates]
-    F --> D
-    D -->|Analysis complete| G[Markdown report and audit]
-```
+![Analysis workflow](./doc/workflow-en.svg)
 
 An analysis follows these steps:
 

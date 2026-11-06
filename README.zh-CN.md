@@ -17,16 +17,7 @@
 
 ## 工作流程
 
-```mermaid
-flowchart LR
-    A[客户端请求] --> B[FastAPI 校验文件路径]
-    B --> C[收集基础信息: sys, sys -t, bt]
-    C --> D[LLM 分析并选择动作]
-    D --> E[MCP / crash 工具执行]
-    E --> F[提取证据并评估 Gate]
-    F --> D
-    D -->|分析结束| G[Markdown 报告与审计记录]
-```
+![分析工作流程](./doc/workflow.zh-CN.svg)
 
 一次分析大致经过以下步骤：
 
