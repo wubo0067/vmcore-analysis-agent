@@ -125,12 +125,18 @@ CorruptionMechanism = Literal[
 ]
 
 
+# 结论可信度：高/中/低，表示对待验证假设或结论的置信级别。
 ConfidenceLevel = Literal["high", "medium", "low"]
 
 
+# 假设状态：用于描述当前假设在分析链路中的推进与否。
+# "leading" 表示当前最有力的主导假设；"candidate" 表示可考虑候选；
+# "weakened" 表示已有证据削弱；"ruled_out" 表示已排除。
 HypothesisStatus = Literal["leading", "candidate", "weakened", "ruled_out"]
 
 
+# 审批/门禁状态：表示关键结论或检查节点是否已关闭、被阻塞或不适用。
+# Literal["open", "closed", "blocked", "n/a"] 表示该变量的值只能是这四个字符串
 GateStatus = Literal["open", "closed", "blocked", "n/a"]
 
 
@@ -301,7 +307,9 @@ def _coerce_root_cause_class(data: Any) -> Any:
 
     return data
 
-
+# * 是 Python 函数参数中的关键字参数分隔符（keyword-only marker）。* 之后的所有参数必须通过关键字方式传入，不能按位置传入。
+# ✅ 合法：data 按位置传，root_cause_field 用关键字传
+# _coerce_corruption_mechanism(some_dict, root_cause_field="kernel")
 def _coerce_corruption_mechanism(
     data: Any,
     *,
@@ -363,7 +371,16 @@ class ToolCall(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def fix_malformed_action(cls, data: Any) -> Any:
-        """修复 LLM 输出的常见格式错误"""
+        """修复 LLM 输出的常见格式错误。
+
+        `@model_validator(mode="before")` 会在 Pydantic 逐字段校验前先调用此方法，
+        允许我们对原始输入做规范化/清洗，避免外部 LLM 输出的格式异常直接触发
+        字段校验错误。这里的目标是把常见的 "command_name + list-like payload" 形式
+        统一修正成 schema 明确要求的 `arguments: List[str]` 结构。
+
+        `@classmethod` 使其作为类方法运行，适合做与实例状态无关的输入修正；
+        `cls` 表示当前模型类，而不是某个具体实例。
+        """
         if isinstance(data, dict):
             if "command_name" in data and "arguments" not in data:
                 for key, value in list(data.items()):

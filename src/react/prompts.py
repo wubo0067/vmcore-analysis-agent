@@ -20,10 +20,12 @@ from .schema import (
 
 
 def _quote_values(values: tuple[str, ...]) -> str:
+    # 遍历 values 中的每个元素， 用 f-string 给每个值加上单引号， 最终用 ", " 拼接
     return ", ".join(f"'{value}'" for value in values)
 
 
 def _invalid_aliases_text() -> str:
+    # 使用 * 解包合并各枚举别名字典的 key，{}创建集合去重，sort排序
     aliases = sorted(
         {
             *get_signature_class_aliases().keys(),
@@ -33,6 +35,7 @@ def _invalid_aliases_text() -> str:
             *get_confidence_aliases().keys(),
         }
     )
+    # tuple将列表转换为元组，传入_quote_values函数返回格式化字符串
     return _quote_values(tuple(aliases))
 
 

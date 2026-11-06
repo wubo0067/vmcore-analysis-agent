@@ -405,7 +405,7 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
                 if retry_data is not None
                 else None
             )
-            if retry_step is not None:
+            if retry_data is not None and retry_step is not None:
                 retry_raw = cast(AIMessage, retry_data.get("raw"))
                 retry_usage = getattr(retry_raw, "usage_metadata", {}) or {}
                 curr_token_usage += retry_usage.get("total_tokens", 0)
