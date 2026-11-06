@@ -290,4 +290,9 @@ bash vmcore-analysis-agent/tools/show_first_global_func.sh /usr/src/ofa_kernel-5
 
 ## Contributing and license
 
-Issues and pull requests are welcome. The existing project documentation identifies the license as MIT; include the corresponding license text in distributions.
+Issues and pull requests are welcome. This project is fully open source under the MIT License; include the corresponding license text in distributions.
+
+## Contact
+
+- Email: [wubo0067@hotmail.com](mailto:wubo0067@hotmail.com)
+- GitHub: [wubo0067](https://github.com/wubo0067)
