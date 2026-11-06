@@ -1,4 +1,19 @@
 # Local secrets and runtime settings.
 .env
-"__pycache__/"
-"*.pyc"
+
+# Python bytecode caches.
+__pycache__/
+*.pyc
+
+# Runtime logs.
+logs/
+
+# Local virtual environments.
+.venv/
+venv/
+
+# Test and tool caches.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
