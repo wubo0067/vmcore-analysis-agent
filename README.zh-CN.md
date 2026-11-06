@@ -2,6 +2,8 @@
 
 [English](./README.md) | 简体中文
 
+![VMCore Analysis Agent](./doc/vmcore-analysis-agent-logo.svg)
+
 基于 LangGraph、MCP 和 Linux `crash` 工具的 vmcore 分析服务。项目入口位于 [`vmcore-analysis-agent/`](./vmcore-analysis-agent/)；本 README 介绍该组件的工作流程、部署方式和输出。
 
 ## 项目能做什么

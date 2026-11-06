@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="256" viewBox="0 0 960 256" role="img" aria-labelledby="title description">
+  <title id="title">VMCore Analysis Agent</title>
+  <desc id="description">A glowing kernel core under a diagnostic lens, representing automated vmcore analysis.</desc>
+  <defs>
+    <linearGradient id="tile" x1="20" y1="20" x2="224" y2="224" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#142943"/>
+      <stop offset="1" stop-color="#0B1423"/>
+    </linearGradient>
+    <linearGradient id="core" x1="72" y1="66" x2="167" y2="170" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#67E8F9"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </linearGradient>
+    <linearGradient id="lens" x1="143" y1="112" x2="205" y2="191" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A5F3FC"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="url(#tile)"/>
+  <path d="M56 77H70M56 106H70M56 135H70M56 164H70M56 193H70M186 77H200M186 106H200M186 135H200M186 164H200M186 193H200M77 56V70M106 56V70M135 56V70M164 56V70M77 186V200M106 186V200M135 186V200M164 186V200" stroke="#38BDF8" stroke-linecap="round" stroke-width="5" opacity=".72"/>
+  <path d="M78 77H178V178H78z" fill="#102238" stroke="#38BDF8" stroke-width="4" stroke-linejoin="round"/>
+
+  <path d="M128 91 158 108V142L128 159 98 142V108L128 91Z" fill="#163A54" stroke="url(#core)" stroke-linejoin="round" stroke-width="4"/>
+  <path d="M128 92V125M98 108 128 125 158 108M128 125V158" fill="none" stroke="#67E8F9" stroke-linejoin="round" stroke-width="3" opacity=".9"/>
+  <path d="M108 134H116L121 124 128 143 135 128 140 134H148" fill="none" stroke="#F8FAFC" stroke-linecap="round" stroke-linejoin="round" stroke-width="3.5"/>
+
+  <circle cx="158" cy="151" r="25" fill="#0B1423" fill-opacity=".92" stroke="url(#lens)" stroke-width="7"/>
+  <path d="m176 169 19 19" stroke="#67E8F9" stroke-linecap="round" stroke-width="9"/>
+  <circle cx="151" cy="144" r="3" fill="#E0FBFF"/>
+
+  <text x="278" y="131" fill="#0F172A" font-family="Arial, Helvetica, sans-serif" font-size="68" font-weight="700" letter-spacing="-2">VM<tspan fill="#0891B2">Core</tspan></text>
+  <path d="M282 154H326" stroke="#F97316" stroke-linecap="round" stroke-width="5"/>
+  <text x="340" y="163" fill="#475569" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" letter-spacing="5">ANALYSIS AGENT</text>
+</svg>

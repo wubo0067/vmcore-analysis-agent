@@ -2,6 +2,8 @@
 
 [简体中文](./README.zh-CN.md) | English
 
+![VMCore Analysis Agent](./doc/vmcore-analysis-agent-logo.svg)
+
 A vmcore analysis service built with LangGraph, MCP, and the Linux `crash` utility. The application lives in [`vmcore-analysis-agent/`](./vmcore-analysis-agent/); this README explains its workflow, deployment, and outputs.
 
 ## What it does

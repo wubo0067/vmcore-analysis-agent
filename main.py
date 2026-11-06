@@ -33,6 +33,16 @@ AGENT_RECURSION_LIMIT = 151
 # 由命令行参数 --language 设置；为 zh 时在系统提示词中注入中文输出规则。
 ANALYSIS_LANGUAGE = "eng"
 
+STARTUP_LOGO = r"""
+  .------------------.
+  |   +----------+   |
+  |   |  VMCORE  |---O
+  |   |  ~~~~~~  |   |
+  |   +----------+   |
+  '------------------'
+   VMCORE ANALYSIS AGENT
+"""
+
 
 # 请求模型
 class VmcoreAnalysisRequest(BaseModel):
@@ -105,6 +115,7 @@ app_state: dict[str, Any] = {
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     logger.info("Starting vmcore-analysis-agent server...")
+    logger.info(STARTUP_LOGO)
     logger.info(f"settings: {get_settings().masked_summary()}")
 
     # 初始化推理 LLM
