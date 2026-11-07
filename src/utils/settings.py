@@ -24,6 +24,16 @@ load_dotenv(_ENV_FILE, override=False)
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 
+# 参数能力档位：不同网关对 /v1/chat/completions 的 schema 严格程度不同。
+#   deepseek —— DeepSeek 官方 / 阿里云 compatible-mode：接受私有扩展字段
+#               `thinking`（形如 {"type": "enabled"}），effort 可为 `max`。
+#   openai   —— 严格 OpenAI 兼容网关（如 AMD developer 网关）：未知顶层参数直接
+#               返回 400 unsupported_parameter，必须省略 `thinking`，effort 只能用
+#               标准取值。
+PARAM_PROFILES = ("deepseek", "openai")
+_DEEPSEEK_EFFORTS = ("minimal", "low", "medium", "high", "max")
+_STANDARD_EFFORTS = ("minimal", "low", "medium", "high")
+
 
 def _require(name: str) -> str:
     value = os.environ.get(name, "").strip()
@@ -87,6 +97,8 @@ class Settings:
     reasoning_model: str
     reasoning_thinking: str
     reasoning_effort: str
+    # 网关参数能力档位，见 PARAM_PROFILES。
+    reasoning_param_profile: str
     reasoning_temperature: float
     reasoning_context_window: int
     reasoning_max_output_tokens: int
@@ -99,12 +111,33 @@ class Settings:
     # Optional allowlist for request-supplied source roots (comma separated).
     kernel_source_allowed_roots: str = ""
 
+    @property
+    def sends_thinking_field(self) -> bool:
+        """是否向请求体写入 DeepSeek 私有的 ``thinking`` 字段。
+
+        严格 OpenAI 兼容网关会把未知顶层参数判为 400 unsupported_parameter，
+        因此只有 deepseek 档位才发送该字段。
+        """
+
+        return self.reasoning_param_profile == "deepseek"
+
+    @property
+    def allowed_reasoning_efforts(self) -> tuple[str, ...]:
+        """当前档位下合法的 reasoning_effort 取值。"""
+
+        return (
+            _DEEPSEEK_EFFORTS
+            if self.reasoning_param_profile == "deepseek"
+            else _STANDARD_EFFORTS
+        )
+
     def masked_summary(self) -> dict[str, Any]:
         """Return a log-safe view of the settings (never includes the API key)."""
 
         return {
             "reasoning_base_url": self.reasoning_base_url,
             "reasoning_model": self.reasoning_model,
+            "reasoning_param_profile": self.reasoning_param_profile,
             "reasoning_thinking": self.reasoning_thinking,
             "reasoning_effort": self.reasoning_effort,
             "reasoning_temperature": self.reasoning_temperature,
@@ -136,6 +169,24 @@ def get_settings() -> Settings:
             "expected 'enabled' or 'disabled'."
         )
 
+    profile = _optional("REASONING_PARAM_PROFILE", "deepseek").lower()
+    if profile not in PARAM_PROFILES:
+        raise RuntimeError(
+            f"Invalid value for REASONING_PARAM_PROFILE: {profile!r}; "
+            f"expected one of {', '.join(PARAM_PROFILES)}."
+        )
+
+    effort = _optional("REASONING_EFFORT", "max").lower()
+    allowed_efforts = (
+        _DEEPSEEK_EFFORTS if profile == "deepseek" else _STANDARD_EFFORTS
+    )
+    if effort not in allowed_efforts:
+        raise RuntimeError(
+            f"Invalid value for REASONING_EFFORT: {effort!r} is not supported by "
+            f"REASONING_PARAM_PROFILE={profile!r}; expected one of "
+            f"{', '.join(allowed_efforts)}."
+        )
+
     context_window = _parse_int("REASONING_CONTEXT_WINDOW", 524_288, 1)
     max_output_tokens = _parse_int("REASONING_MAX_OUTPUT_TOKENS", 48_000, 1)
     min_thinking_output_tokens = _parse_int(
@@ -153,7 +204,8 @@ def get_settings() -> Settings:
         reasoning_base_url=_require("REASONING_BASE_URL"),
         reasoning_model=_require("REASONING_MODEL"),
         reasoning_thinking=thinking,
-        reasoning_effort=_optional("REASONING_EFFORT", "max").lower(),
+        reasoning_effort=effort,
+        reasoning_param_profile=profile,
         reasoning_temperature=_parse_float("REASONING_TEMPERATURE", 0.1),
         reasoning_context_window=context_window,
         reasoning_max_output_tokens=max_output_tokens,

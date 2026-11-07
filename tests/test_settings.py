@@ -21,6 +21,7 @@ _REQUIRED = {
     "REASONING_MODEL": "DeepSeek-V4.1-Flash",
 }
 _OPTIONAL_KEYS = (
+    "REASONING_PARAM_PROFILE",
     "REASONING_THINKING",
     "REASONING_EFFORT",
     "REASONING_TEMPERATURE",
@@ -58,6 +59,8 @@ class SettingsTests(unittest.TestCase):
         with patch.dict(os.environ, _REQUIRED):
             settings = get_settings()
 
+        self.assertEqual(settings.reasoning_param_profile, "deepseek")
+        self.assertTrue(settings.sends_thinking_field)
         self.assertEqual(settings.reasoning_thinking, "disabled")
         self.assertEqual(settings.reasoning_effort, "max")
         self.assertAlmostEqual(settings.reasoning_temperature, 0.1)
@@ -66,6 +69,46 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.reasoning_min_thinking_output_tokens, 40_960)
         self.assertEqual(settings.reasoning_history_keep, 2)
         self.assertFalse(settings.langsmith_tracing)
+
+    def test_openai_profile_disables_thinking_field_and_validates_effort(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                **_REQUIRED,
+                "REASONING_PARAM_PROFILE": "openai",
+                "REASONING_EFFORT": "high",
+            },
+        ):
+            settings = get_settings()
+
+        self.assertEqual(settings.reasoning_param_profile, "openai")
+        self.assertFalse(settings.sends_thinking_field)
+        self.assertEqual(settings.reasoning_effort, "high")
+
+    def test_openai_profile_rejects_deepseek_only_max_effort(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                **_REQUIRED,
+                "REASONING_PARAM_PROFILE": "openai",
+                "REASONING_EFFORT": "max",
+            },
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                get_settings()
+
+        self.assertIn("REASONING_EFFORT", str(ctx.exception))
+        self.assertIn("openai", str(ctx.exception))
+
+    def test_invalid_param_profile_raises(self) -> None:
+        with patch.dict(
+            os.environ,
+            {**_REQUIRED, "REASONING_PARAM_PROFILE": "custom"},
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                get_settings()
+
+        self.assertIn("REASONING_PARAM_PROFILE", str(ctx.exception))
 
     def test_missing_api_key_raises(self) -> None:
         with patch.dict(

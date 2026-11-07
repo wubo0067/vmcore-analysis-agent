@@ -8,7 +8,7 @@ import os
 from typing import Any
 from pydantic import SecretStr
 
-# from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage
 from src.utils.logging import logger
 from src.utils.settings import get_settings
@@ -77,34 +77,55 @@ def create_reasoning_llm():
     # top_p=1.0     全部词汇       最高          最低          开放式创作
 
     try:
-        if thinking == "enabled":
-            # 使用的是思考模式
-            llm_class = ChatDeepSeekReasoner
-            llm_kwargs = {
-                "reasoning_effort": reasoning_effort,
-                "extra_body": {"thinking": {"type": "enabled"}},
-            }
+        if settings.sends_thinking_field:
+            # deepseek 档位（DeepSeek 官方 / 阿里云 compatible-mode）：
+            # 使用 ChatDeepSeek 系列并显式下发私有 thinking 字段；
+            # ChatDeepSeek 用 api_base 字段构建真实客户端，传 base_url 不会生效。
+            endpoint_kwargs = {"api_base": base_url}
+            if thinking == "enabled":
+                llm_class = ChatDeepSeekReasoner
+                llm_kwargs = {
+                    "reasoning_effort": reasoning_effort,
+                    "extra_body": {"thinking": {"type": "enabled"}},
+                }
+            else:
+                llm_class = ChatDeepSeek
+                llm_kwargs = {
+                    "top_p": 0.1,
+                    "presence_penalty": 0,
+                    "temperature": temperature,
+                    "extra_body": {"thinking": {"type": "disabled"}},
+                }
         else:
-            # 普通对话模式
-            llm_class = ChatDeepSeek
-            llm_kwargs = {
-                "top_p": 0.1,  # 使用低随机性设置，适合代码生成和事实回答
-                "presence_penalty": 0,  # 保持输出更贴近原始符号和事实
-                "temperature": temperature,  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings
-                "extra_body": {"thinking": {"type": "disabled"}},
-            }
+            # openai 档位（严格校验 /v1/chat/completions 的网关，如 AMD developer 网关）：
+            # 使用标准 ChatOpenAI（base_url），绝不注入未知顶层参数 thinking。
+            llm_class = ChatOpenAI
+            endpoint_kwargs = {"base_url": base_url}
+            if thinking == "enabled":
+                llm_kwargs = {
+                    "reasoning_effort": reasoning_effort,
+                }
+            else:
+                llm_kwargs = {
+                    "top_p": 0.1,
+                    "presence_penalty": 0,
+                    "temperature": temperature,
+                }
 
         llm = llm_class(
             api_key=SecretStr(str(api_key)),
-                    # ChatDeepSeek 用 api_base 字段构建真实客户端，传 base_url(openai_api_base) 不会生效
-                    api_base=base_url,
-                    model=model_name,
-                    max_tokens=max_tokens,
-                    timeout=300,  # 5 分钟超时，后期步骤对话历史很长，LLM 推理耗时较久
-                    max_retries=3,  # 遇到连接超时等瞬态错误时自动重试
+            model=model_name,
+            max_tokens=max_tokens,
+            timeout=300,  # 5 分钟超时，后期步骤对话历史很长，LLM 推理耗时较久
+            max_retries=3,  # 遇到连接超时等瞬态错误时自动重试
+            **endpoint_kwargs,
             **llm_kwargs,
         )
-        logger.info(f"Successfully created LLM instance, model: {llm}")
+        logger.info(
+            "Successfully created LLM instance (profile=%s): %s",
+            settings.reasoning_param_profile,
+            llm,
+        )
         return llm
     except Exception as e:
         logger.error(f"Failed to create LLM instance: {e}")

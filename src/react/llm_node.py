@@ -37,28 +37,45 @@ from .prompts import (
 )
 from .schema import VMCoreAnalysisStep, VMCoreLLMAnalysisStep
 from .state_manager import project_managed_analysis_step
+from langchain_deepseek.chat_models import ChatDeepSeek
 from src.utils.logging import logger
 from src.utils.settings import get_settings
 
 
-def _build_structured_chain(llm, budget: OutputBudget):
+def _build_structured_chain(
+    llm,
+    budget: OutputBudget,
+    *,
+    send_thinking_field: bool | None = None,
+):
     """按真实预算构造结构化输出链。
 
     max_tokens/thinking/effort 必须作为 with_structured_output 的参数传入，
     由其内部与 response_format 一起 bind 到底层模型；如果再套一层
     `.bind(...)`，RunnableSequence 不会把这些 kwargs 传给底层 chat model。
+
+    仅在 deepseek 档位（或底层模型为 ChatDeepSeek 子类）时附带私有顶层字段
+    ``extra_body={"thinking": ...}``；严格 OpenAI 兼容网关会因未知参数返回 400。
     """
     if budget.max_tokens is None:
         raise ContextBudgetError("Cannot build LLM chain without an output budget")
+    if send_thinking_field is None:
+        send_thinking_field = isinstance(llm, ChatDeepSeek)
+
+    bind_kwargs: dict[str, Any] = {
+        "max_tokens": budget.max_tokens,
+        "reasoning_effort": budget.reasoning_effort,
+    }
+    if send_thinking_field:
+        bind_kwargs["extra_body"] = {
+            "thinking": {"type": "enabled" if budget.thinking else "disabled"}
+        }
+
     return llm.with_structured_output(
         VMCoreLLMAnalysisStep,
         method="json_mode",
         include_raw=True,
-        max_tokens=budget.max_tokens,
-        reasoning_effort=budget.reasoning_effort,
-        extra_body={
-            "thinking": {"type": "enabled" if budget.thinking else "disabled"}
-        },
+        **bind_kwargs,
     )
 
 
@@ -243,7 +260,11 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
     # 结构化输出，设置 include_raw=True 以获取 token 消耗等元数据。
     # 链在预算确定后构造，确保 max_tokens/thinking/effort 真正进入请求。
     try:
-        llm_analysis = _build_structured_chain(llm, budget)
+        llm_analysis = _build_structured_chain(
+            llm,
+            budget,
+            send_thinking_field=settings.sends_thinking_field,
+        )
         try:
             # 使用 include_raw=True 后，ainvoke 返回包含 'parsed' 和 'raw' 的字典
             output_data = await ainvoke_with_retry(llm_analysis, messages_to_send)
@@ -267,7 +288,11 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
             )
             compressed_messages = fallback_messages
             messages_to_send = [system_message_obj, *compressed_messages]
-            llm_analysis = _build_structured_chain(llm, budget)
+            llm_analysis = _build_structured_chain(
+                llm,
+                budget,
+                send_thinking_field=settings.sends_thinking_field,
+            )
             logger.info(
                 f"Retrying once with thinking disabled: "
                 f"prompt_est={budget.prompt_tokens} "
@@ -553,7 +578,11 @@ async def structure_reasoning_content(state: AgentState, llm) -> dict:
             budget_config,
         )
         messages_to_send = [system_message_obj, *compressed]
-        chat_with_structured = _build_structured_chain(llm, budget)
+        chat_with_structured = _build_structured_chain(
+            llm,
+            budget,
+            send_thinking_field=settings.sends_thinking_field,
+        )
     except ContextBudgetError as exc:
         logger.error(f"Context budget error in structure node: {exc}")
         return {

@@ -190,6 +190,35 @@ class BindingTests(unittest.TestCase):
             {"thinking": {"type": "disabled"}},
         )
 
+    def test_structured_chain_omits_thinking_field_when_disabled_by_profile(
+        self,
+    ) -> None:
+        llm = _ProbeLLM(
+            api_key="test",
+            api_base="https://example.invalid/v1",
+            model="test",
+            max_tokens=48_000,
+        )
+        budget = OutputBudget(
+            max_tokens=123,
+            thinking=True,
+            reasoning_effort="high",
+            prompt_tokens=1,
+            prompt_chars=2,
+        )
+        chain = _build_structured_chain(
+            llm,
+            budget,
+            send_thinking_field=False,
+        )
+
+        chain.invoke([AIMessage(content="x")])
+
+        self.assertEqual(llm.captured_kwargs["max_tokens"], 123)
+        self.assertEqual(llm.captured_kwargs["reasoning_effort"], "high")
+        self.assertNotIn("extra_body", llm.captured_kwargs)
+        self.assertNotIn("extra_body", llm.captured_payload)
+
 
 class _LengthErrorChain:
     def __init__(self) -> None:
