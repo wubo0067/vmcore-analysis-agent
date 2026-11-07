@@ -139,8 +139,14 @@ def simplified_structure_reasoning_prompt() -> str:
         "REQUIRED FIELDS TO EXTRACT:\n"
         "1. 'reasoning': Summarize the key reasoning points (3-6 sentences)\n"
         "2. 'step_id': Set to {current_step}\n"
-        "3. 'action': If the reasoning suggests a specific MCP tool call, return an object with exactly two fields: 'command_name' and 'arguments'. "
-        'Example: {{"command_name": "rd", "arguments": ["-x", "ffff...", "16"]}}, {{"command_name": "run_script", "arguments": ["log -m | grep -i \\"mpt3sas\\" | grep -Ei \\"error|timeout|reset\\""]}}, or {{"command_name": "resolve_stack_canary_slot", "arguments": ["search_module_extables"]}}. Otherwise set it to null. Do NOT return action as a string.\n'
+        "3. 'action': If the reasoning suggests a specific MCP tool call, return an object with 'command_name' plus either 'arguments' (token list, for crash commands) or 'parameters' (named JSON object, for kernel_source tools). "
+        'Examples: {{"command_name": "rd", "arguments": ["-x", "ffff...", "16"]}}, '
+        '{{"command_name": "run_script", "arguments": ["log -m | grep -i \\"mpt3sas\\" | grep -Ei \\"error|timeout|reset\\""]}}, '
+        '{{"command_name": "read_source", "parameters": {{"file": "drivers/net/foo.c", "line": 1203}}}}, '
+        '{{"command_name": "list_writers", "parameters": {{"field": "sk_state"}}}}, '
+        'or {{"command_name": "resolve_stack_canary_slot", "arguments": ["search_module_extables"]}}. '
+        "For read_source / grep_source / list_writers / git_history / source_status always use 'parameters', never 'arguments'. "
+        "Otherwise set it to null. Do NOT return action as a string.\n"
         "4. 'is_conclusive': Set to true ONLY if the reasoning explicitly states a final conclusion with root cause. "
         "Otherwise set to false.\n"
         f"5. 'signature_class': Extract the crash signature class from panic string analysis. Allowed values: {_quote_values(signature_values)}.\n"

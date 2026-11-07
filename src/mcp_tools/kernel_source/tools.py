@@ -149,7 +149,7 @@ def source_status_impl(source_root: str = "") -> str:
     if tree.note:
         lines.append(f"note={tree.note}")
     lines.append(
-        "guidance=Pass kver with the exact KERNEL value from `sys`; a tree from a "
+        "guidance=Pass kver with the kernel release from `sys` (`RELEASE:`); a tree from a "
         "different kernel release is rejected, a dist/arch-tag-only difference is "
         "accepted with a note."
     )

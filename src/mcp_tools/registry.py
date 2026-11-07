@@ -6,7 +6,7 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, cast
 
 from src.utils.logging import logger
 
@@ -114,8 +114,12 @@ def list_registered_tool_providers() -> dict[str, MCPToolProvider]:
         # 只要子模块暴露了它们，registry 就能把它接进统一执行框架。
         mcp_client = getattr(module, "MCP_CLIENT", None)
         server_name = getattr(module, "MCP_SERVER_NAME", None)
-        initialize_tools = getattr(module, "initialize_tools", None)
-        build_tool_payload = getattr(module, "build_tool_payload", None)
+        # getattr 返回的是 Any，这里显式收窄成约定类型，
+        # 否则构造 MCPToolProvider 时会被推断为 (...) -> object 而报类型不兼容。
+        initialize_tools = cast(Initializer, getattr(module, "initialize_tools", None))
+        build_tool_payload = cast(
+            PayloadBuilder, getattr(module, "build_tool_payload", None)
+        )
 
         # 任意一个标准接口缺失，都说明这个子包还不满足自动注册约定。
         if (

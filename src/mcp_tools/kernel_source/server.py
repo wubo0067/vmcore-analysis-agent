@@ -58,7 +58,8 @@ def read_source(
     Args:
         file: Path as printed by `dis -s`, relative to the kernel tree root
             (absolute paths are rejected). A trailing ":<line>" is accepted.
-        kver: Exact KERNEL value from `sys`; the tree is rejected when it differs.
+        kver: Kernel release from `sys` (`RELEASE:`; the `KERNEL:` line is the vmlinux
+            path). A tree from a different release is rejected.
         line: Center line. 0 reads the beginning of the file.
         context: Lines before and after `line` (max 80).
         source_root: Injected by the runtime; do not set it yourself.

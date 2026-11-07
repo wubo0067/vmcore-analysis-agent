@@ -1049,6 +1049,13 @@ def _canonical_commands_from_tool_call(name: object, args: object) -> list[str]:
                 return [canonicalize_command_line(rendered)]
         return [canonicalize_command_line(line) for line in lines if line.strip()]
 
+    # 结构化参数工具（kernel_source 等）没有命令行；只记工具名会丢掉
+    # file/line/pattern，模型在历史滑出窗口后就不知道读过什么。
+    if isinstance(args, dict) and args:
+        rendered_args = " ".join(f"{key}={args[key]}" for key in sorted(args))
+        if rendered_args:
+            return [f"{tool_name} {rendered_args}".strip()]
+
     if tool_name and tool_name != "unknown":
         return [tool_name]
 
@@ -1141,7 +1148,13 @@ def _extract_commands_from_ai_message(message: AIMessage) -> list[str]:
             elif "command" in args:
                 commands.append(_render_command(str(name), [args["command"]]))
             else:
-                commands.append(str(name))
+                # 结构化参数（kernel_source 等）：保留 k=v，避免只记录工具名。
+                rendered_args = " ".join(
+                    f"{key}={args[key]}" for key in sorted(args)
+                )
+                commands.append(
+                    f"{name} {rendered_args}".strip() if rendered_args else str(name)
+                )
         elif name:
             commands.append(_render_command(str(name), args))
 

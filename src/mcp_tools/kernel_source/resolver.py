@@ -140,6 +140,25 @@ def normalize_kver(value: str) -> str:
     return " ".join(str(value or "").split()).strip().strip("'\"")
 
 
+_KVER_TOKEN_RE = re.compile(r"\d+\.\d+\.\d+-[A-Za-z0-9._+]+")
+
+
+def derive_kver(value: str) -> str:
+    """Accept a bare version, or text that embeds one.
+
+    ``crash``'s ``sys`` prints the kernel release on the ``RELEASE:`` line, but
+    ``KERNEL:`` carries the *vmlinux path*.  Models routinely copy the latter, so
+    pull the version token out of whatever string arrives instead of failing the
+    comparison with a path.
+    """
+
+    normalized = normalize_kver(value)
+    if _KVER_TOKEN_RE.fullmatch(normalized):
+        return normalized
+    match = _KVER_TOKEN_RE.search(normalized)
+    return match.group(0) if match else normalized
+
+
 def version_core(value: str) -> str:
     """Strip the dist tag and arch suffix.
 
@@ -286,7 +305,7 @@ def resolve_tree(requested_kver: str = "", requested_root: str = "") -> SourceTr
         )
 
     scored: list[tuple[Path, str]] = [(path, tree_version(path)) for path in candidates]
-    requested = normalize_kver(requested_kver)
+    requested = derive_kver(requested_kver)
     note = ""
 
     if requested:
@@ -339,8 +358,8 @@ def resolve_tree(requested_kver: str = "", requested_root: str = "") -> SourceTr
     known = ", ".join(f"{path.name}={version or 'unknown'}" for path, version in scored)
     raise SourceTreeError(
         f"multiple kernel source trees are configured under {base} ({known}); "
-        "pass kver with the exact KERNEL value from `sys`, or point the request at "
-        "one specific tree"
+        "pass kver with the kernel release from `sys` (`RELEASE:`, or a path that "
+        "contains it), or point the request at one specific tree"
     )
 
 

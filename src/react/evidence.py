@@ -39,6 +39,18 @@ _KASAN_UAF_RE = re.compile(r"\bKASAN:\s*(?:slab-)?use-after-free\b", re.IGNORECA
 # kernel_source 工具在输出里标注的源码锚点："SOURCE_REF: path/to/file.c:1203"。
 # 该事实只用于审计"源码被真正读过"，不参与门控闭合（闭合仍要求运行时事实）。
 _SOURCE_REF_RE = re.compile(r"SOURCE_REF:\s*(?P<file>[^\s:]+):(?P<line>\d+)")
+# kernel_source 其余头部行：它们没有 SOURCE_REF，但同样证明"这一轮真的查了源码"，
+# 必须计入 evidence_delta，否则合法的 source_status / 0 命中检索会被判成无进展。
+_SOURCE_STATUS_RE = re.compile(r"SOURCE_STATUS\s+configured=(?P<configured>true|false)")
+_SOURCE_GREP_RE = re.compile(
+    r"SOURCE_GREP\s+pattern=(?P<pattern>.+?)\s+hits=(?P<hits>\d+)"
+)
+_SOURCE_WRITERS_RE = re.compile(
+    r"SOURCE_WRITERS\s+field=(?P<field>\S+)\s+hits=(?P<hits>\d+)"
+)
+_SOURCE_GIT_RE = re.compile(
+    r"SOURCE_GIT\s+file=(?P<file>\S+)\s+range=(?P<range>\S+)"
+)
 
 _GATE_COMPLETION_CRITERIA: dict[str, list[str]] = {
     "register_provenance": [
@@ -356,6 +368,30 @@ def extract_evidence_facts(
     # 源码锚点与命令类型无关：kernel_source 的只读工具同样会产出 SOURCE_REF。
     for ref in _SOURCE_REF_RE.finditer(output):
         facts.add(f"source_ref:{ref.group('file')}:{ref.group('line')}")
+
+    status = _SOURCE_STATUS_RE.search(output)
+    if status is not None:
+        facts.add(f"source_status:configured={status.group('configured')}")
+    for query in _SOURCE_GREP_RE.finditer(output):
+        pattern = query.group("pattern")[:80]
+        hits = int(query.group("hits"))
+        if hits == 0:
+            # 0 命中是"排除性结果"：能证明"这棵树里没有该模式"，但不能作为
+            # 门控证据，也不该被当成"查到了"来记账。
+            facts.add(f"source_negative:grep:{pattern}")
+        else:
+            facts.add(f"source_grep:{pattern}:hits={hits}")
+    for writers in _SOURCE_WRITERS_RE.finditer(output):
+        field = writers.group("field")
+        hits = int(writers.group("hits"))
+        if hits == 0:
+            facts.add(f"source_negative:writers:{field}")
+        else:
+            facts.add(f"source_writers:{field}:hits={hits}")
+    for history in _SOURCE_GIT_RE.finditer(output):
+        facts.add(
+            f"source_git:{history.group('file')}:{history.group('range')}"
+        )
 
     for command in commands:
         # 提取命令的第一个单词（命令名），转为小写以统一匹配
@@ -778,18 +814,30 @@ def _fact_supports_gate(fact: str, gate_name: str) -> bool:
         bool: 如果该事实可作为该门控的证据则返回 True，否则返回 False。
     """
     if gate_name == "register_provenance":
-        return fact.startswith(("rd_word:", "dis_", "sym:", "vtop_"))
+        return fact.startswith(
+            ("rd_word:", "dis_", "sym:", "vtop_", "source_ref:", "source_writers:")
+        )
     if gate_name == "local_corruption_exclusion":
         return fact.startswith(
-            ("dis_", "rd_word:", "rd_ascii:", "vtop_", "kmem_")
+            (
+                "dis_",
+                "rd_word:",
+                "rd_ascii:",
+                "vtop_",
+                "kmem_",
+                "source_ref:",
+                "source_writers:",
+            )
         )
     if gate_name == "field_type_classification":
-        return fact.startswith(("struct_", "sym:"))
+        return fact.startswith(("struct_", "sym:", "source_ref:"))
     if gate_name == "object_lifetime":
         return fact.startswith(("kmem_slab_state:", "rd_word:"))
     if gate_name == "external_corruption_gate":
         return fact.startswith("external_source:")
-    # 兜底：未知门控接受所有已知前缀的事实
+    # 兜底：未知门控接受所有已知前缀的事实。
+    # source_* 事实刻意不在这里：没有执行器闭合规则的门控（warning_site、
+    # lock_holder 等）拿到源码事实只会多出一条 weak_gate_closure 遥测噪音。
     return fact.startswith(
         ("rd_word:", "rd_ascii:", "struct_", "dis_", "sym:", "vtop_", "kmem_")
     )

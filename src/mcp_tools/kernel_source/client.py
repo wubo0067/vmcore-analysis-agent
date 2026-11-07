@@ -10,7 +10,6 @@ this package contains a ``client.py`` exposing the standard provider API.
 from __future__ import annotations
 
 import os
-import shlex
 import sys
 from pathlib import Path
 from typing import Any, List, Optional
@@ -20,14 +19,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from src.utils.logging import logger
 
-# Positional argument order accepted when the model emits a crash-style token
-# list instead of structured ``parameters`` (legacy action shape).
-_POSITIONAL_FIELDS: dict[str, tuple[str, ...]] = {
-    "read_source": ("file", "line", "kver"),
-    "git_history": ("file", "start_line", "end_line"),
-    "list_writers": ("field",),
-    "grep_source": ("pattern",),
-}
+from .arguments import map_positional, split_command
 
 MCP_SERVER_NAME = "kernel_source"
 
@@ -78,38 +70,9 @@ async def initialize_tools() -> List:
 
 
 def _map_positional_command(tool_name: str, command: Any) -> dict[str, object]:
-    """Map a crash-style token list onto the tool's named parameters.
+    """Map a crash-style token list onto the tool's named parameters."""
 
-    The analysis action schema historically renders every non-``run_script``
-    action as ``{"command": "<tokens>"}``.  Kernel-source tools need named
-    arguments, so accept that legacy shape positionally and reject anything that
-    cannot be mapped unambiguously.
-    """
-
-    fields = _POSITIONAL_FIELDS.get(tool_name)
-    if not fields:
-        return {}
-
-    try:
-        tokens = shlex.split(str(command or ""))
-    except ValueError:
-        tokens = str(command or "").split()
-    if not tokens:
-        return {}
-    if len(tokens) > len(fields):
-        raise ValueError(
-            f"{tool_name} accepts at most {len(fields)} positional value(s) "
-            f"({', '.join(fields)}), got {len(tokens)} tokens: {tokens!r}. "
-            "Use structured parameters instead, e.g. "
-            f'{{"command_name": "{tool_name}", "parameters": '
-            f'{{"{fields[0]}": "<value>"}}}}.'
-        )
-
-    mapped: dict[str, object] = {}
-    for name, token in zip(fields, tokens):
-        integer_field = name in {"line", "start_line", "end_line"}
-        mapped[name] = int(token) if integer_field and token.isdigit() else token
-    return mapped
+    return map_positional(tool_name, split_command(command))
 
 
 def build_tool_payload(

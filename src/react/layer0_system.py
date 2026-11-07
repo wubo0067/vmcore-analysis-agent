@@ -522,7 +522,8 @@ Prefer these over manual built-in equivalents when the scenario matches.
 ## 3.9 Kernel Source Correlation (kernel_source tools)
 
 These tools read the source tree configured for this deployment. They are
-version-guarded: pass the exact string after `KERNEL:` from `sys` as `kver`, and
+version-guarded: pass the kernel release from `sys` (`RELEASE:`; the `KERNEL:`
+line is the vmlinux path) as `kver`, and
 a tree whose version differs is rejected instead of silently answering.
 
 - **source_status**: which tree is configured, its version, and whether git is
@@ -542,7 +543,7 @@ Calling convention:
 - Call them with `command_name` plus `parameters`, for example:
 
   command_name: read_source
-  parameters:   file="drivers/net/foo.c", line=1203, kver="<KERNEL value printed by sys>"
+  parameters:   file="drivers/net/foo.c", line=1203, kver="<RELEASE: value printed by sys>"
 
 - Never wrap these tools in `run_script`, and never encode them as tokenized
   crash arguments; `parameters` carries the named arguments the tool needs.

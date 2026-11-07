@@ -163,8 +163,17 @@ def build_command_fingerprint(tool_name: str, args: Any) -> str:
 
     Returns:
         规范化的命令指纹字符串
+
+    说明：
+        crash 工具从命令行提取指纹；结构化参数工具（kernel_source 的
+        read_source / list_writers 等）没有命令行，若直接返回空串会让去重、
+        回放与缓存全部失效，因此退化为排序后的 k=v 序列。
     """
-    return build_fingerprint_from_lines(extract_command_lines(tool_name, args))
+    lines = extract_command_lines(tool_name, args)
+    if not lines and isinstance(args, dict) and args:
+        rendered = " ".join(f"{key}={args[key]}" for key in sorted(args))
+        return f"{tool_name} {rendered}".strip()
+    return build_fingerprint_from_lines(lines)
 
 
 def build_fingerprint_from_lines(lines: Iterable[str]) -> str:

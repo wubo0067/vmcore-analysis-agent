@@ -388,6 +388,112 @@ class DistTagToleranceTests(KernelSourceTestCase):
         self.assertIn("SOURCE_REF: drivers/net/demo.c", output)
 
 
+class ReviewRegressionTests(unittest.TestCase):
+    """Regression tests for the pipeline gaps found in the code review."""
+
+    def test_derive_kver_extracts_version_from_vmlinux_path(self) -> None:
+        from src.mcp_tools.kernel_source.resolver import derive_kver
+
+        self.assertEqual(
+            derive_kver(
+                "/usr/lib/debug/lib/modules/4.18.0-553.22.1.el8_10.x86_64/vmlinux"
+            ),
+            "4.18.0-553.22.1.el8_10.x86_64",
+        )
+
+    def test_source_status_output_yields_evidence_fact(self) -> None:
+        facts = extract_evidence_facts(
+            "source_status", {}, "SOURCE_STATUS configured=true\ntree_version=4.18.0"
+        )
+        self.assertIn("source_status:configured=true", facts)
+
+    def test_zero_hit_grep_is_recorded_as_a_negative_result(self) -> None:
+        facts = extract_evidence_facts(
+            "grep_source",
+            {"pattern": "foo"},
+            "SOURCE_GREP pattern=foo hits=0 truncated=false\n(no match)",
+        )
+        self.assertIn("source_negative:grep:foo", facts)
+        self.assertNotIn("source_grep:foo:hits=0", facts)
+
+    def test_negative_and_status_facts_never_support_a_gate(self) -> None:
+        from src.react.evidence import _fact_supports_gate
+
+        self.assertFalse(_fact_supports_gate("source_negative:grep:foo", "register_provenance"))
+        self.assertFalse(_fact_supports_gate("source_status:configured=true", "register_provenance"))
+        self.assertTrue(_fact_supports_gate("source_writers:sk_state:hits=2", "register_provenance"))
+        # Unknown gates must not accumulate weak_gate_closure telemetry from source facts.
+        self.assertFalse(_fact_supports_gate("source_ref:a.c:3", "warning_site"))
+
+    def test_source_ref_advances_a_gate_goal(self) -> None:
+        from src.react.evidence import facts_support_goal
+
+        self.assertTrue(
+            facts_support_goal(
+                {"source_ref:drivers/net/demo.c:3"},
+                {"gate_name": "register_provenance"},
+            )
+        )
+
+    def test_structured_args_get_a_stable_distinct_fingerprint(self) -> None:
+        from src.react.action_guard import build_command_fingerprint
+
+        first = build_command_fingerprint("read_source", {"file": "a.c", "line": 3})
+        second = build_command_fingerprint("read_source", {"file": "b.c", "line": 3})
+        self.assertTrue(first)
+        self.assertNotEqual(first, second)
+
+    def test_preflight_leaves_non_crash_tools_alone(self) -> None:
+        import types
+        from unittest import mock
+
+        from src.react import output_parser
+        from src.react.schema import ToolCall
+
+        action = ToolCall(command_name="grep_source", parameters={"pattern": "a|b"})
+        step = types.SimpleNamespace(
+            action=action, reasoning="", signature_class=None, additional_notes=None
+        )
+        provider = types.SimpleNamespace(package_name="kernel_source")
+        with mock.patch.object(
+            output_parser, "get_registered_tool_provider", lambda name: provider
+        ):
+            result = output_parser._preflight_action_with_guard(step, {})
+        self.assertEqual(result.action.command_name, "grep_source")
+
+    def test_prompt_history_keeps_structured_parameters(self) -> None:
+        from src.react.prompt_builder import _canonical_commands_from_tool_call
+
+        commands = _canonical_commands_from_tool_call(
+            "read_source", {"file": "a.c", "line": 3}
+        )
+        self.assertIn("file=a.c", commands[0])
+        self.assertIn("line=3", commands[0])
+
+
+def test_run_script_promotion_uses_structured_parameters(self) -> None:
+        import types
+        from unittest import mock
+
+        from src.react import output_parser
+        from src.react.schema import ToolCall
+
+        action = ToolCall(command_name="run_script", arguments=["read_source fs/proc/base.c 3"])
+        step = types.SimpleNamespace(
+            action=action, reasoning="", signature_class=None, additional_notes=None
+        )
+        provider = types.SimpleNamespace(package_name="kernel_source")
+        with mock.patch.object(
+            output_parser, "get_registered_tool_provider", lambda name: provider
+        ):
+            result = output_parser._lift_standalone_mcp_tool_out_of_run_script(step)
+        self.assertEqual(result.action.command_name, "read_source")
+        self.assertEqual(
+            result.action.parameters, {"file": "fs/proc/base.c", "line": 3}
+        )
+        self.assertEqual(result.action.arguments, [])
+
+
 class EvidenceHookTests(unittest.TestCase):
     def test_source_ref_fact_is_extracted_without_command_syntax(self) -> None:
         facts = extract_evidence_facts(

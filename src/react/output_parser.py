@@ -21,6 +21,7 @@ from json_repair import repair_json
 from pydantic import BaseModel
 
 from src.mcp_tools import get_registered_tool_provider
+from src.mcp_tools.kernel_source.arguments import map_positional
 from src.utils.logging import logger
 
 from .action_guard import (
@@ -979,7 +980,22 @@ def _lift_standalone_mcp_tool_out_of_run_script(
     logger.warning("%s%s", prefix, audit_note)
 
     action.command_name = tool_name
-    action.arguments = tokens[1:]
+    if provider.package_name == "kernel_source":
+        # Promote into structured parameters: the token form cannot carry
+        # context/prefix/max_hits, and exceeding the positional limit would only
+        # surface later as a payload ValueError.
+        try:
+            mapped = map_positional(tool_name, tokens[1:])
+        except ValueError as exc:
+            mapped = {}
+            audit_note = f"{audit_note} Positional promotion failed: {exc}"
+        if mapped:
+            action.parameters = mapped
+            action.arguments = []
+        else:
+            action.arguments = tokens[1:]
+    else:
+        action.arguments = tokens[1:]
 
     if audit_note not in analysis_step.reasoning:
         analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
@@ -1002,6 +1018,9 @@ def _reconcile_explicit_action_hint(
 ) -> VMCoreLLMAnalysisStep:
     """对齐 reasoning 中的显式 Action 提示与结构化 action。"""
     if analysis_step.action is None or not analysis_step.reasoning:
+        return analysis_step
+
+    if _is_non_crash_tool(analysis_step.action.command_name):
         return analysis_step
 
     explicit_action = _extract_explicit_action_hint(analysis_step.reasoning)
@@ -1094,6 +1113,10 @@ def _preflight_action_with_guard(
     # ── 第 0 步：快速路径 — 没有 action 则无需预检 ──
     action = analysis_step.action
     if action is None:
+        return analysis_step
+
+    # 非 crash 工具（kernel_source 等）不适用管道改写 / mod -s 前导 / crash 语法校验。
+    if _is_non_crash_tool(action.command_name):
         return analysis_step
 
     prefix = f"{log_prefix}: " if log_prefix else ""
@@ -1254,11 +1277,33 @@ def _extract_explicit_action_hint(reasoning: str) -> str | None:
     return None
 
 
+def _is_non_crash_tool(tool_name: str) -> bool:
+    """True when the tool belongs to an MCP provider other than ``crash``.
+
+    The pipeline after this point (pipeline rewriting, ``mod -s`` prelude,
+    crash-command syntax validation) only applies to crash commands; running it
+    on kernel_source actions turns a legitimate ``grep_source pattern="a|b"``
+    into ``run_script`` and sends it to the crash server.
+    """
+
+    if not tool_name:
+        return False
+    provider = get_registered_tool_provider(tool_name)
+    return provider is not None and provider.package_name != "crash"
+
+
 def _render_structured_action_text(analysis_step: VMCoreLLMAnalysisStep) -> str:
     """将当前结构化 action 渲染为可比较的文本形式。"""
     action = analysis_step.action
     if action is None:
         return ""
+
+    parameters = getattr(action, "parameters", None)
+    if parameters:
+        rendered_parameters = " ".join(
+            f"{key}={parameters[key]}" for key in sorted(parameters)
+        )
+        return f"{action.command_name} {rendered_parameters}".strip()
 
     rendered_args = render_action_arguments(action.arguments)
     if action.command_name == "run_script":
