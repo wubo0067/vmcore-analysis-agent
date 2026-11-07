@@ -110,7 +110,7 @@ KERNEL_SOURCE_ROOT=
 | `REASONING_MODEL` | Yes | Model name used by the service |
 | `REASONING_PARAM_PROFILE` | No | Gateway parameter profile: `deepseek` (default; uses `ChatDeepSeek` and sends the `thinking` extension field) or `openai` (for gateways that strictly validate `/v1/chat/completions`, uses `ChatOpenAI` and omits `thinking`) |
 | `REASONING_THINKING` | No | `enabled` or `disabled`; defaults to `disabled` |
-| `REASONING_EFFORT` | No | Reasoning effort (`minimal`, `low`, `medium`, `high`, or `max` under `deepseek`; `minimal`, `low`, `medium`, or `high` under `openai`); defaults to `max` |
+| `REASONING_EFFORT` | No | Reasoning effort (`minimal`, `low`, `medium`, `high`, or `max` under `deepseek`; `minimal`, `low`, `medium`, `high`, or `xhigh` under `openai`); defaults to `max` |
 | `REASONING_TEMPERATURE` | No | Sampling temperature; defaults to `0.1` |
 | `REASONING_CONTEXT_WINDOW` | No | Context budget; defaults to `524288`. Set it according to the provider's actual limits. |
 | `REASONING_MAX_OUTPUT_TOKENS` | No | Maximum completion budget; defaults to `48000` |
@@ -289,7 +289,7 @@ ai-app-hub/                       # Repository root (contains multiple projects)
 ## Troubleshooting
 
 - **Missing configuration on startup:** Check `REASONING_API_KEY`, `REASONING_BASE_URL`, and `REASONING_MODEL` in `vmcore-analysis-agent/.env` or the process environment.
-- **`400 unsupported_parameter: 'thinking'` from the LLM gateway:** Set `REASONING_PARAM_PROFILE=openai` and choose a standard effort value (`REASONING_EFFORT=high`, `medium`, `low`, or `minimal`) when using gateways that strictly validate `/v1/chat/completions`.
+- **`400 unsupported_parameter: 'thinking'` from the LLM gateway:** Set `REASONING_PARAM_PROFILE=openai` and choose a supported effort value when using gateways that strictly validate `/v1/chat/completions`.
 - **File not found:** API paths are resolved on the server, not on the machine running the CLI.
 - **Unavailable crash command or extension:** Confirm that `crash` is installed on the service host and that symbols match the vmcore; the bundled installer supports x86_64 crash 8.0/9.0 only.
 - **Missing module source/symbol information:** Prepare debug symbols matching the kernel and module; see the appendix below.

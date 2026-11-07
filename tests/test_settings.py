@@ -85,6 +85,19 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(settings.sends_thinking_field)
         self.assertEqual(settings.reasoning_effort, "high")
 
+    def test_openai_profile_accepts_xhigh_effort(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                **_REQUIRED,
+                "REASONING_PARAM_PROFILE": "openai",
+                "REASONING_EFFORT": "xhigh",
+            },
+        ):
+            settings = get_settings()
+
+        self.assertEqual(settings.reasoning_effort, "xhigh")
+
     def test_openai_profile_rejects_deepseek_only_max_effort(self) -> None:
         with patch.dict(
             os.environ,

@@ -110,7 +110,7 @@ KERNEL_SOURCE_ROOT=
 | `REASONING_MODEL` | 是 | 服务端使用的模型名称 |
 | `REASONING_PARAM_PROFILE` | 否 | 网关参数能力档位：`deepseek`（默认，使用 `ChatDeepSeek` 并下发私有 `thinking` 字段）或 `openai`（适用于严格校验 `/v1/chat/completions` 的网关，使用 `ChatOpenAI` 且不发送 `thinking` 字段） |
 | `REASONING_THINKING` | 否 | `enabled` 或 `disabled`，默认 `disabled` |
-| `REASONING_EFFORT` | 否 | 推理强度（`deepseek` 档位支持 `minimal`、`low`、`medium`、`high`、`max`；`openai` 档位支持 `minimal`、`low`、`medium`、`high`），默认 `max` |
+| `REASONING_EFFORT` | 否 | 推理强度（`deepseek` 档位支持 `minimal`、`low`、`medium`、`high`、`max`；`openai` 档位支持 `minimal`、`low`、`medium`、`high`、`xhigh`），默认 `max` |
 | `REASONING_TEMPERATURE` | 否 | 采样温度，默认 `0.1` |
 | `REASONING_CONTEXT_WINDOW` | 否 | 上下文预算，默认 `524288`；应按模型服务商的实际限制设置 |
 | `REASONING_MAX_OUTPUT_TOKENS` | 否 | 最大 completion 预算，默认 `48000` |
@@ -289,7 +289,7 @@ ai-app-hub/                       # 仓库根目录（包含多个项目）
 ## 常见问题
 
 - **服务启动提示缺少配置**：检查 `vmcore-analysis-agent/.env` 或进程环境中是否设置了 `REASONING_API_KEY`、`REASONING_BASE_URL`、`REASONING_MODEL`。
-- **模型网关报错 `400 unsupported_parameter: 'thinking'`**：部分严格校验 `/v1/chat/completions` 的网关不接受 DeepSeek 私有的 `thinking` 字段，请在 `.env` 中设置 `REASONING_PARAM_PROFILE=openai`，并将 `REASONING_EFFORT` 设为标准值（`high`、`medium`、`low` 或 `minimal`）。
+- **模型网关报错 `400 unsupported_parameter: 'thinking'`**：部分严格校验 `/v1/chat/completions` 的网关不接受 DeepSeek 私有的 `thinking` 字段，请在 `.env` 中设置 `REASONING_PARAM_PROFILE=openai`，并将 `REASONING_EFFORT` 设为网关支持的值。
 - **文件不存在**：传给 API 的路径在服务端解析，不是运行 CLI 的客户端本地路径。
 - **crash 命令或扩展不可用**：确认服务主机已安装 `crash`，符号文件与 vmcore 对应；仓库脚本只适用于 x86_64 的 crash 8.0/9.0。
 - **模块缺少源码/符号信息**：为对应内核和模块准备匹配的调试符号；可参考下方附录。

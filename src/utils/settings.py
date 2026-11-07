@@ -32,7 +32,7 @@ _FALSE_VALUES = {"0", "false", "no", "off"}
 #               标准取值。
 PARAM_PROFILES = ("deepseek", "openai")
 _DEEPSEEK_EFFORTS = ("minimal", "low", "medium", "high", "max")
-_STANDARD_EFFORTS = ("minimal", "low", "medium", "high")
+_STANDARD_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 
 def _require(name: str) -> str:
