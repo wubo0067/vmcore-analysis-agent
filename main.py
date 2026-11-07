@@ -21,6 +21,7 @@ from src.react import (
     graph_logging_callback,
 )
 from src.mcp_tools import initialize_all_mcp_tools
+from src.mcp_tools.kernel_source.resolver import find_kernel_trees
 
 # Agent 图最大递归轮次（LangGraph superstep 上限）
 # 注意：每轮可见分析消耗 3 个 superstep：
@@ -51,6 +52,13 @@ class VmcoreAnalysisRequest(BaseModel):
     vmcore_dmesg_path: str = Field(..., description="vmcore-dmesg.txt 文件路径")
     debug_symbol_paths: list[str] = Field(
         default_factory=list, description="额外的调试符号路径列表"
+    )
+    kernel_source_root: str = Field(
+        default="",
+        description=(
+            "内核源码树路径（服务端可见），通常为 rpmbuild -bp kernel.spec 的产物目录。"
+            "为空时回落到服务端 KERNEL_SOURCE_ROOT 配置。"
+        ),
     )
 
 
@@ -96,6 +104,26 @@ def validate_file_paths(request: VmcoreAnalysisRequest) -> Optional[str]:
     for debug_symbol_path in request.debug_symbol_paths:
         if not Path(debug_symbol_path).exists():
             error_msg = f"Debug symbol file not found: {debug_symbol_path}"
+            logger.error(error_msg)
+            return error_msg
+
+    # 检查内核源码树（可选）
+    kernel_source_root = (request.kernel_source_root or "").strip()
+    if kernel_source_root:
+        source_path = Path(kernel_source_root)
+        if not source_path.is_dir():
+            error_msg = (
+                f"kernel source root not found or not a directory: {kernel_source_root}"
+            )
+            logger.error(error_msg)
+            return error_msg
+        if not find_kernel_trees(source_path):
+            error_msg = (
+                "kernel source root does not look like a kernel source tree: "
+                f"{kernel_source_root}. Expected the directory produced by "
+                "'rpmbuild -bp kernel.spec' (containing Makefile plus kernel/ or "
+                "include/linux/)."
+            )
             logger.error(error_msg)
             return error_msg
 
@@ -221,6 +249,9 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             "vmlinux_path": request.vmlinux_path,
             "vmcore_dmesg_path": request.vmcore_dmesg_path,
             "debug_symbol_paths": request.debug_symbol_paths,
+            "kernel_source_root": (
+                request.kernel_source_root or get_settings().kernel_source_root or ""
+            ),
             "report_language": ANALYSIS_LANGUAGE,
             "messages": [],
             "step_count": 0,
@@ -350,6 +381,11 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
                 "vmlinux_path": request.vmlinux_path,
                 "vmcore_dmesg_path": request.vmcore_dmesg_path,
                 "debug_symbol_paths": request.debug_symbol_paths,
+                "kernel_source_root": (
+                    request.kernel_source_root
+                    or get_settings().kernel_source_root
+                    or ""
+                ),
                 "report_language": ANALYSIS_LANGUAGE,
                 "messages": [],
                 "step_count": 0,

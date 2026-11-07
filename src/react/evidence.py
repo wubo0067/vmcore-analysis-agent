@@ -36,6 +36,9 @@ _KMEM_SLAB_SLOT_RE = re.compile(
     r"(?P<free>(?:0x)?[0-9a-fA-F]{8,16}))\s*$"
 )
 _KASAN_UAF_RE = re.compile(r"\bKASAN:\s*(?:slab-)?use-after-free\b", re.IGNORECASE)
+# kernel_source 工具在输出里标注的源码锚点："SOURCE_REF: path/to/file.c:1203"。
+# 该事实只用于审计"源码被真正读过"，不参与门控闭合（闭合仍要求运行时事实）。
+_SOURCE_REF_RE = re.compile(r"SOURCE_REF:\s*(?P<file>[^\s:]+):(?P<line>\d+)")
 
 _GATE_COMPLETION_CRITERIA: dict[str, list[str]] = {
     "register_provenance": [
@@ -340,6 +343,7 @@ def extract_evidence_facts(
         - sym 命令 → "sym:<symbol>@0x<address>:<kind>"
         - kmem -S 命令 → "kmem_slab_state:0x<address>=allocated|free"
         - KASAN UAF 报告 → unbound lifetime signal (telemetry only)
+        - kernel_source 输出中的 SOURCE_REF → "source_ref:<file>:<line>"
 
         如果命令类型不受支持或输出中无有效内容，则返回空集合。
     """
@@ -349,6 +353,9 @@ def extract_evidence_facts(
     facts: set[str] = set()
     if _KASAN_UAF_RE.search(output):
         facts.add("lifetime_signal:kasan_use_after_free_unbound")
+    # 源码锚点与命令类型无关：kernel_source 的只读工具同样会产出 SOURCE_REF。
+    for ref in _SOURCE_REF_RE.finditer(output):
+        facts.add(f"source_ref:{ref.group('file')}:{ref.group('line')}")
 
     for command in commands:
         # 提取命令的第一个单词（命令名），转为小写以统一匹配

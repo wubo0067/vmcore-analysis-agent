@@ -4,6 +4,14 @@
 # Author: CalmWU
 # Created: 2026-03-23
 
+"""解析、校验并修复 VMCore 分析流程中的 LLM 输出。
+
+本模块负责将模型返回的文本整理为符合 Pydantic schema 的结构化分析结果，
+包括选择可用的输出内容、规范化诊断字段，以及修复格式不完整或无效的 JSON。
+解析完成后，还会根据分析结果构造工具调用，并执行与已收集证据相关的一致性审计、
+冲突检查和必要的兜底结论合成，确保后续工作流能够安全、稳定地处理模型输出。
+"""
+
 import json
 import re
 import shlex
@@ -488,7 +496,12 @@ def build_tool_calls(
     tool_name = analysis_result.action.command_name
     logger.info("%sLLM decided to call tool: %s", prefix, tool_name)
 
-    if tool_name == "run_script":
+    if analysis_result.action.parameters:
+        # Standalone MCP tools (kernel_source: read_source, list_writers, ...) take
+        # structured parameters; passing them as one crash-command string would
+        # drop the required fields.
+        tool_args = dict(analysis_result.action.parameters)
+    elif tool_name == "run_script":
         tool_args = {"script": "\n".join(analysis_result.action.arguments)}
     else:
         tool_args = {

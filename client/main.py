@@ -53,6 +53,14 @@ def main():
         help="额外的调试符号路径列表",
     )
     parser.add_argument(
+        "--kernel-source-root",
+        default="",
+        help=(
+            "内核源码树路径（服务端可见），通常为 rpmbuild -bp kernel.spec 的产物目录；"
+            "为空时使用服务端 KERNEL_SOURCE_ROOT 配置"
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=600.0,
@@ -85,6 +93,7 @@ def main():
                 vmlinux_path=args.vmlinux_path,
                 vmcore_dmesg_path=args.vmcore_dmesg_path,
                 debug_symbol_paths=args.debug_symbols,
+                kernel_source_root=args.kernel_source_root,
                 timeout=args.timeout,
             )
         else:
@@ -94,6 +103,7 @@ def main():
                 vmlinux_path=args.vmlinux_path,
                 vmcore_dmesg_path=args.vmcore_dmesg_path,
                 debug_symbol_paths=args.debug_symbols,
+                kernel_source_root=args.kernel_source_root,
                 timeout=args.timeout,
             )
 

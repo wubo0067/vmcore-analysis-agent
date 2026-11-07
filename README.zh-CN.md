@@ -96,6 +96,10 @@ REASONING_MAX_OUTPUT_TOKENS=48000
 REASONING_MIN_THINKING_OUTPUT_TOKENS=40960
 REASONING_HISTORY_KEEP=2
 LANGSMITH_TRACING=false
+
+# 可选：源码级验证使用的内核源码树
+# KERNEL_SOURCE_ROOT=/data/kernel-src/4.18.0-305.130.1.el8_4.x86_64
+KERNEL_SOURCE_ROOT=
 ```
 
 | 变量 | 必需 | 说明 |
@@ -110,6 +114,7 @@ LANGSMITH_TRACING=false
 | `REASONING_MAX_OUTPUT_TOKENS` | 否 | 最大 completion 预算，默认 `48000` |
 | `REASONING_MIN_THINKING_OUTPUT_TOKENS` | 否 | 保持 thinking 模式所需的最低输出预算，默认 `40960` |
 | `REASONING_HISTORY_KEEP` | 否 | 压缩时保留的历史 reasoning 数量，默认 `2` |
+| `KERNEL_SOURCE_ROOT` | 否 | 与本次 dump 匹配的内核源码树（也可指向按版本分目录的根目录）；仅在请求未提供 `kernel_source_root` 时生效。启用 `read_source` / `list_writers` / `git_history`，留空时 agent 会明确说明源码无法核实，而不是凭记忆引用内核代码 |
 | `LANGSMITH_TRACING` | 否 | 是否启用 LangSmith 追踪，默认 `false` |
 
 进程环境变量优先于 `.env`。缺少三个必需模型变量或配置值无效时，服务会在启动阶段报错。不要提交含真实密钥的 `.env` 文件。MCP 工具由代码自动发现，不需要在 `.env` 中填写 MCP 服务路径。
@@ -141,8 +146,11 @@ uv run main.py --url http://localhost:8000 --stream \
   --vmlinux-path /usr/lib/debug/lib/modules/<kernel-version>/vmlinux \
   --vmcore-dmesg-path /data/case/vmcore-dmesg.txt \
   --debug-symbols /data/case/driver.ko \
+  --kernel-source-root /root/kernel-sources/8/4.18.0-553.22.1.el8_10/BUILD/kernel-4.18.0-553.22.1.el8_10/linux-4.18.0-553.22.1.el8_10.x86_64 \
   --output-dir ../reports
 ```
+
+`--kernel-source-root` 是可选的；第 5 步说明如何准备它所指向的源码目录。
 
 主要参数：
 
@@ -155,9 +163,53 @@ uv run main.py --url http://localhost:8000 --stream \
 | `--vmlinux-path` | 匹配的 `vmlinux` 路径 |
 | `--vmcore-dmesg-path` | `vmcore-dmesg.txt` 路径 |
 | `--debug-symbols` | 可选的模块调试符号路径，可提供多个 |
+| `--kernel-source-root` | 服务端可见的内核源码树路径，通常是 `rpmbuild -bp kernel.spec` 的产物目录（含 `Makefile` 与 `kernel/` 或 `include/linux/`）。优先于 `KERNEL_SOURCE_ROOT`；留空时使用服务端默认配置 |
 | `--timeout` | 请求超时秒数，默认 `600` |
 | `--output-dir` | 报告输出目录，默认 `../reports`（相对于 `client` 当前目录） |
 | `--no-save` | 不保存报告文件 |
+
+### 5. 准备内核源码（可选，用于源码级验证）
+
+有匹配的源码树时，agent 可以读取 `dis -s` 给出的 `file:line` 处真实代码、枚举可能写某个字段的代码路径、并确认这棵树里是否已包含修复。没有源码树时，agent 会明确说明"源码无法核实"，而不是凭记忆引用内核代码。
+
+在**服务端**用 [`tools/get-kernel-source.sh`](tools/get-kernel-source.sh) 准备源码：
+
+```bash
+# 1) 使用本地已有的 SRPM
+SRC=$(bash tools/get-kernel-source.sh -s /home/user/Downloads/kernel-4.18.0-553.22.1.el8_10.src.rpm)
+
+# 2) 或按内核版本下载 SRPM（需要已启用 source 仓库）
+SRC=$(bash tools/get-kernel-source.sh 5.14.0-362.24.1.el9_3)
+
+# 3) 或只定位此前已经准备好的源码树
+SRC=$(SKIP_PREPARE=1 bash tools/get-kernel-source.sh 5.14.0-362.24.1.el9_3)
+```
+
+脚本会启用匹配的 source 仓库、把 SRPM 安装到独立的 `_topdir`、执行 `rpmbuild -bp`，并且**只在 stdout 输出**准备好的目录（日志全部走 stderr），所以可以直接用 `SRC=$(...)` 取值。支持 RHEL 7/8/9/10。工作区布局：
+
+```text
+${SOURCE_ROOT:-/root/kernel-sources}/<RHEL大版本>/<内核版本>/BUILD/kernel-<ver>/linux-<ver>.<arch>/
+```
+
+常用参数：`SOURCE_ROOT=/var/lib/kernel-sources` 改变工作区位置，`SKIP_PREPARE=1` 复用已准备的树，`--uninstall` 删除某个工作区。
+
+前置条件与注意事项：
+
+- 脚本需以 root 运行，或使用有权启用仓库、安装 RPM 的账号。
+- **服务进程**必须能读该目录。`/root/kernel-sources` 只有 root 可读；若服务以普通账号运行，请把工作区放到共享路径（如 `SOURCE_ROOT=/var/lib/kernel-sources`）并授予读权限。
+- `rpmbuild` 用**宿主机的** `%{?dist}` 命名源码树，所以在 el9 机器上准备 el8 的 SRPM 会得到 `linux-...el9...` 目录。只要上游内核版本一致，agent 会接受并在工具输出中写一条 `note` 说明。
+
+然后把打印出的目录传给客户端：
+
+```bash
+uv run main.py --url http://localhost:8000 --stream \
+  ... \
+  --kernel-source-root "$SRC"
+```
+
+优先级：请求字段 `kernel_source_root`（`--kernel-source-root`）优先；未提供时使用服务端默认配置 `KERNEL_SOURCE_ROOT`。两者都没有时，源码级验证保持关闭，agent 必须明确说明这一点。
+
+版本匹配：agent 会把源码树版本与 `sys` 报告的内核版本比对。内核版本不同会被拒绝，因此绝不会读错树的代码；只差 `el` 发行标签或架构后缀时会被接受，并附带说明。
 
 ## API 与输出
 
@@ -176,11 +228,12 @@ uv run main.py --url http://localhost:8000 --stream \
   "vmcore_path": "/data/case/vmcore",
   "vmlinux_path": "/data/case/vmlinux",
   "vmcore_dmesg_path": "/data/case/vmcore-dmesg.txt",
-  "debug_symbol_paths": ["/data/case/driver.ko"]
+  "debug_symbol_paths": ["/data/case/driver.ko"],
+  "kernel_source_root": "/root/kernel-sources/8/4.18.0-553.22.1.el8_10/BUILD/kernel-4.18.0-553.22.1.el8_10/linux-4.18.0-553.22.1.el8_10.x86_64"
 }
 ```
 
-前三个字段必需；`debug_symbol_paths` 可省略或传空数组。文件路径由服务端检查。同步响应包含 `success`、`task_id`、`agent_answer`、`token_usage`，以及可选的 `error`、`audit_report`。流式接口以 SSE 事件发送进度，完成事件包含分析结果和审计内容。
+前三个字段必需；`debug_symbol_paths` 可省略或传空数组。`kernel_source_root` 可选，未提供时回落到服务端的 `KERNEL_SOURCE_ROOT`。文件路径由服务端检查。同步响应包含 `success`、`task_id`、`agent_answer`、`token_usage`，以及可选的 `error`、`audit_report`。流式接口以 SSE 事件发送进度，完成事件包含分析结果和审计内容。
 
 ### 报告文件
 

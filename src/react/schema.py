@@ -364,6 +364,17 @@ class ToolCall(BaseModel):
         ),
     )
     evidence_goal_id: Optional[str] = Field(None, description="Evidence goal this action is intended to advance.")
+    parameters: Optional[dict[str, Any]] = Field(
+        None,
+        description=(
+            "Structured parameters for standalone MCP tools such as the kernel_source "
+            "tools (read_source, grep_source, list_writers, git_history, source_status). "
+            "When present, these keys are passed to the tool verbatim and 'arguments' "
+            "is ignored. Example: {\"file\": \"drivers/net/foo.c\", \"line\": 1203, "
+            "\"kver\": \"4.18.0-305.130.1.el8_4.x86_64\"}. Crash commands keep using "
+            "command_name + arguments."
+        ),
+    )
     intended_evidence_type: Optional[str] = Field(None, description="Evidence type expected from this action.")
     target_object: Optional[str] = Field(None, description="Object, address, or relation targeted by this action.")
     expected_observation: Optional[str] = Field(None, description="Observation that would advance the evidence goal.")

@@ -125,6 +125,7 @@ bt -a is permitted only when signature_class is hard_lockup (e.g. confirming an 
 - Do not treat a value found in slab memory that matches a value previously printed to the kernel log (via log_info, dev_info, dev_err, printk, or similar) as independent evidence of a DMA write. Log output and DMA writes are causally distinct: a driver extracts an event code from a firmware reply buffer and passes it to printk -- the device does not separately DMA-write that code to an arbitrary slab object. A single dmesg-value match in slab memory is a stale-data candidate first; it requires independent DMA-range overlap proof before it can be treated as DMA evidence. Multiple distinct high-entropy values embedded in aligned, coherent documented protocol frames establish payload provenance rather than a mere coincidence, but they still require the same DMA-range/ownership proof before the writer is called DMA.
 - Do not interpret a spinlock counter (raw_lock.val, owner_count, or wait_count) of 1 or any non-zero value as evidence of abnormal concurrent access or lock contention. A locked spinlock is the expected state for any lock held by the currently executing code path at crash time. Before claiming lock contention or priority inversion, explicitly identify both the holder's code path and the waiter's code path from the vmcore, and verify that the holder is not the crashing CPU itself.
 - Do not assert that one DMA device or driver is the corruption source before explicitly documenting why other DMA-capable devices present in the system have been considered and excluded. Even a partial exclusion rationale is required. Silently focusing on a single suspect while ignoring other DMA-capable hardware is an incomplete analysis.
+- Do not quote kernel source, line numbers, commit hashes, or upstream/backport status from memory. Source-level statements must cite a SOURCE_REF produced by read_source, grep_source, or list_writers in this session. When kernel_source reports configured=false or SOURCE_TREE_MISMATCH, say that the source could not be verified for this kernel instead of reciting remembered code.
 
 ## Log Query Budget
 
@@ -358,7 +359,8 @@ When conclusive, include crash type, panic string, faulting instruction, root ca
 - For focused forward disassembly near a function body, keep the target and span as separate operands, e.g. dis -l show_interrupts 100. Do not use comma-appended pseudo-syntax such as dis -l show_interrupts,0x150; crash treats that as a symbol name and fails to resolve it.
 - dis -s <func>: source-aware disassembly when debuginfo exists
 - When dis -l or dis -s resolves concrete file:line information for a third-party module, treat that as an obligation to continue with source-level reasoning: inspect the exact condition, branch, loop, or helper call at that source site and validate the controlling runtime values.
-- If dis -s fails on a module path, pivot to source correlation using function-pointer anchors, upstream source cross-reference, and offset reconstruction; do not stop at raw disassembly alone.
+- Fulfil that obligation with the kernel_source tools, never from memory: read_source on the file:line printed by dis -s, list_writers to enumerate the code paths that can assign the faulting field, git_history to see whether this exact tree already carries a fix.
+- If dis -s fails on a module path, pivot to source correlation using function-pointer anchors, upstream source cross-reference, and offset reconstruction; do not stop at raw disassembly alone. If no source tree is configured or it does not match the dump, state that the source could not be verified and keep the claim as a hypothesis.
 
 ## 3.2 Memory and Structure
 - struct -o <type>
@@ -516,6 +518,52 @@ Prefer these over manual built-in equivalents when the scenario matches.
   - Use `detailedsearch --slab-only <addr>` for a slab-scoped check;
     omit `--slab-only` for a full-range scan.
   - Prefer over: `search` + manual `kmem -S` ownership lookup.
+
+## 3.9 Kernel Source Correlation (kernel_source tools)
+
+These tools read the source tree configured for this deployment. They are
+version-guarded: pass the exact string after `KERNEL:` from `sys` as `kver`, and
+a tree whose version differs is rejected instead of silently answering.
+
+- **source_status**: which tree is configured, its version, and whether git is
+  available. Call it before the first source lookup of a run.
+- **read_source(file, kver, line, context)**: numbered source around a
+  file:line printed by `dis -s`. Emits a `SOURCE_REF:` line.
+- **grep_source(pattern, kver, max_hits, prefix)**: locate a condition, macro,
+  or call site.
+- **list_writers(field, kver, max_hits, prefix)**: enumerate the assignment
+  sites of a struct field. This is how field provenance becomes a finite list
+  of candidate writers instead of a guess.
+- **git_history(file, kver, start_line, end_line)**: commits that touched a
+  code range, used to judge whether a fix is already in this tree.
+
+Calling convention:
+
+- Call them with `command_name` plus `parameters`, for example:
+
+  command_name: read_source
+  parameters:   file="drivers/net/foo.c", line=1203, kver="<KERNEL value printed by sys>"
+
+- Never wrap these tools in `run_script`, and never encode them as tokenized
+  crash arguments; `parameters` carries the named arguments the tool needs.
+- `source_status` takes no parameters. Call it once before the first source
+  lookup of a run.
+- After a `read_source` / `grep_source` / `list_writers` result, cite the
+  `SOURCE_REF` it printed.
+
+Rules:
+
+- Every source-level statement in the analysis must cite a `SOURCE_REF` emitted
+  by these tools during this session. A remembered snippet is not evidence.
+- A source read corroborates or refutes a hypothesis; it is not by itself
+  runtime evidence for a gate. Pair it with the rd/struct/dis/sym fact it
+  explains.
+- When the tools report `configured=false` or `SOURCE_TREE_MISMATCH`, record
+  that source verification was impossible for this kernel and keep the claim as
+  a hypothesis. Never substitute a remembered upstream snippet and never claim
+  backport status without `git_history` output.
+- `list_writers` returns candidates, not proof. Name a writer only after the
+  runtime value is shown to be consistent with that specific site.
 
 ================================================================================
 # PART 4: ERROR RECOVERY & ADVANCED FORENSICS

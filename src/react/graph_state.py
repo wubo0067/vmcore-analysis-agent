@@ -50,6 +50,9 @@ class AgentState(MessagesState):
     vmlinux_path: str
     # 第三方内核调试符号路径列表，用于在缺少主符号时补充符号解析能力。
     debug_symbol_paths: Sequence[str]
+    # 本次分析使用的内核源码树路径（通常来自 rpmbuild -bp 的产物）。
+    # 由请求传入；为空时 kernel_source 工具回落到 KERNEL_SOURCE_ROOT 环境变量。
+    kernel_source_root: str
     # 分析报告输出语言："eng"（默认）或 "zh"。
     # 为 "zh" 时在系统提示词中注入中文输出规则，使报告正文为简体中文。
     report_language: str

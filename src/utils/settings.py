@@ -93,6 +93,11 @@ class Settings:
     reasoning_min_thinking_output_tokens: int
     reasoning_history_keep: int
     langsmith_tracing: bool
+    # Optional kernel source tree used by the kernel_source MCP tools.
+    # Empty means source-level verification is unavailable for this deployment.
+    kernel_source_root: str = ""
+    # Optional allowlist for request-supplied source roots (comma separated).
+    kernel_source_allowed_roots: str = ""
 
     def masked_summary(self) -> dict[str, Any]:
         """Return a log-safe view of the settings (never includes the API key)."""
@@ -108,6 +113,8 @@ class Settings:
             "reasoning_min_thinking_output_tokens": self.reasoning_min_thinking_output_tokens,
             "reasoning_history_keep": self.reasoning_history_keep,
             "langsmith_tracing": self.langsmith_tracing,
+            "kernel_source_root": self.kernel_source_root,
+            "kernel_source_allowed_roots": self.kernel_source_allowed_roots,
         }
 
 
@@ -153,4 +160,6 @@ def get_settings() -> Settings:
         reasoning_min_thinking_output_tokens=min_thinking_output_tokens,
         reasoning_history_keep=_parse_int("REASONING_HISTORY_KEEP", 2, 0),
         langsmith_tracing=_parse_bool("LANGSMITH_TRACING", False),
+        kernel_source_root=_optional("KERNEL_SOURCE_ROOT", ""),
+        kernel_source_allowed_roots=_optional("KERNEL_SOURCE_ALLOWED_ROOTS", ""),
     )

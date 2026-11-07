@@ -4,14 +4,13 @@
 # Author: CalmWU
 # Created: 2026-01-09
 
-"""
-VMCore 分析 Agent 节点实现
+"""VMCore 分析 Agent 的节点实现。
 
-此模块定义了 LangGraph 中各个节点的具体执行逻辑。
-包括：
-1. collect_crash_init_data: 收集 vmcore 基础诊断信息
-2. call_llm_analysis: LLM 分析节点
-3. call_crash_tool: 执行 crash 工具调用
+定义 LangGraph 工作流中的节点逻辑，主要负责：
+- ``collect_crash_init_data``：收集 vmcore 初始诊断信息。
+- ``call_crash_tool``：执行 LLM 请求的 crash 工具调用。
+
+LLM 分析节点 ``call_llm_analysis`` 定义于 ``llm_node.py``。
 """
 
 import asyncio

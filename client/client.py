@@ -17,6 +17,7 @@ def analyze_vmcore(
     vmlinux_path: str,
     vmcore_dmesg_path: str,
     debug_symbol_paths: Optional[list[str]] = None,
+    kernel_source_root: str = "",
     timeout: float = 600.0,
 ) -> dict:
     """
@@ -28,6 +29,8 @@ def analyze_vmcore(
         vmlinux_path: vmlinux 调试符号路径
         vmcore_dmesg_path: vmcore-dmesg.txt 文件路径
         debug_symbol_paths: 额外的调试符号路径列表
+        kernel_source_root: 内核源码树路径（服务端可见），通常为
+            rpmbuild -bp kernel.spec 的产物目录
         timeout: 请求超时时间（秒）
 
     Returns:
@@ -39,6 +42,7 @@ def analyze_vmcore(
         "vmlinux_path": vmlinux_path,
         "vmcore_dmesg_path": vmcore_dmesg_path,
         "debug_symbol_paths": debug_symbol_paths or [],
+        "kernel_source_root": kernel_source_root or "",
     }
 
     print(f"🚀 发送分析请求到 {url}")
@@ -46,6 +50,7 @@ def analyze_vmcore(
     print(f"📁 vmlinux_path: {vmlinux_path}")
     print(f"📁 vmcore_dmesg_path: {vmcore_dmesg_path}")
     print(f"📁 debug_symbol_paths: {debug_symbol_paths}")
+    print(f"📁 kernel_source_root: {kernel_source_root or '(未提供)'}")
     print("-" * 60)
 
     with httpx.Client(timeout=timeout) as client:
@@ -60,6 +65,7 @@ def analyze_vmcore_stream(
     vmlinux_path: str,
     vmcore_dmesg_path: str,
     debug_symbol_paths: Optional[list[str]] = None,
+    kernel_source_root: str = "",
     timeout: float = 600.0,
 ) -> dict:
     """
@@ -71,6 +77,8 @@ def analyze_vmcore_stream(
         vmlinux_path: vmlinux 调试符号路径
         vmcore_dmesg_path: vmcore-dmesg.txt 文件路径
         debug_symbol_paths: 额外的调试符号路径列表
+        kernel_source_root: 内核源码树路径（服务端可见），通常为
+            rpmbuild -bp kernel.spec 的产物目录
         timeout: 请求超时时间（秒）
 
     Returns:
@@ -82,6 +90,7 @@ def analyze_vmcore_stream(
         "vmlinux_path": vmlinux_path,
         "vmcore_dmesg_path": vmcore_dmesg_path,
         "debug_symbol_paths": debug_symbol_paths or [],
+        "kernel_source_root": kernel_source_root or "",
     }
 
     print(f"🚀 发送流式分析请求到 {url}")
@@ -89,6 +98,7 @@ def analyze_vmcore_stream(
     print(f"📁 vmlinux_path: {vmlinux_path}")
     print(f"📁 vmcore_dmesg_path: {vmcore_dmesg_path}")
     print(f"📁 debug_symbol_paths: {debug_symbol_paths}")
+    print(f"📁 kernel_source_root: {kernel_source_root or '(未提供)'}")
     print("-" * 60)
 
     final_result = None

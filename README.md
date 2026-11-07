@@ -96,6 +96,10 @@ REASONING_MAX_OUTPUT_TOKENS=48000
 REASONING_MIN_THINKING_OUTPUT_TOKENS=40960
 REASONING_HISTORY_KEEP=2
 LANGSMITH_TRACING=false
+
+# Optional: kernel source tree used for source-level verification.
+# KERNEL_SOURCE_ROOT=/data/kernel-src/4.18.0-305.130.1.el8_4.x86_64
+KERNEL_SOURCE_ROOT=
 ```
 
 | Variable | Required | Description |
@@ -110,6 +114,7 @@ LANGSMITH_TRACING=false
 | `REASONING_MAX_OUTPUT_TOKENS` | No | Maximum completion budget; defaults to `48000` |
 | `REASONING_MIN_THINKING_OUTPUT_TOKENS` | No | Minimum remaining output budget for thinking mode; defaults to `40960` |
 | `REASONING_HISTORY_KEEP` | No | Number of reasoning history items to keep during compression; defaults to `2` |
+| `KERNEL_SOURCE_ROOT` | No | Kernel source tree matching the analysed dump (or a directory of per-version trees). Used only when a request does not carry `kernel_source_root`. Enables `read_source` / `list_writers` / `git_history`; when empty, the agent reports that source could not be verified instead of quoting kernel code from memory |
 | `LANGSMITH_TRACING` | No | Enable LangSmith tracing; defaults to `false` |
 
 Process environment variables take precedence over `.env`. The service fails during startup if a required model variable is missing or a setting is invalid. Do not commit `.env` files containing real credentials. MCP tools are discovered by the code; MCP server paths do not need to be added to `.env`.
@@ -141,8 +146,11 @@ uv run main.py --url http://localhost:8000 --stream \
   --vmlinux-path /usr/lib/debug/lib/modules/<kernel-version>/vmlinux \
   --vmcore-dmesg-path /data/case/vmcore-dmesg.txt \
   --debug-symbols /data/case/driver.ko \
+  --kernel-source-root /root/kernel-sources/8/4.18.0-553.22.1.el8_10/BUILD/kernel-4.18.0-553.22.1.el8_10/linux-4.18.0-553.22.1.el8_10.x86_64 \
   --output-dir ../reports
 ```
+
+`--kernel-source-root` is optional; step 5 shows how to prepare the source directory it points at.
 
 Common CLI options:
 
@@ -155,9 +163,53 @@ Common CLI options:
 | `--vmlinux-path` | Path to the matching `vmlinux` |
 | `--vmcore-dmesg-path` | Path to `vmcore-dmesg.txt` |
 | `--debug-symbols` | Optional module debug-symbol paths; accepts multiple paths |
+| `--kernel-source-root` | Kernel source tree visible on the server, normally the directory produced by `rpmbuild -bp kernel.spec` (containing `Makefile` plus `kernel/` or `include/linux/`). Overrides `KERNEL_SOURCE_ROOT`; when empty, the deployment default is used |
 | `--timeout` | Request timeout in seconds; defaults to `600` |
 | `--output-dir` | Report directory; defaults to `../reports` relative to the current `client` directory |
 | `--no-save` | Do not save report files |
+
+### 5. Prepare the kernel source (optional, enables source-level verification)
+
+With a matching source tree, the agent can read the exact code behind a `file:line` returned by `dis -s`, enumerate the code paths that can write a field, and check whether this tree already carries a fix. Without it, the agent states that the source could not be verified instead of quoting kernel code from memory.
+
+Prepare the tree **on the server host** with [`tools/get-kernel-source.sh`](tools/get-kernel-source.sh):
+
+```bash
+# 1) from a source RPM that is already on disk
+SRC=$(bash tools/get-kernel-source.sh -s /home/user/Downloads/kernel-4.18.0-553.22.1.el8_10.src.rpm)
+
+# 2) or download the source RPM for a kernel version (needs source repositories)
+SRC=$(bash tools/get-kernel-source.sh 5.14.0-362.24.1.el9_3)
+
+# 3) or only locate a tree that was prepared earlier
+SRC=$(SKIP_PREPARE=1 bash tools/get-kernel-source.sh 5.14.0-362.24.1.el9_3)
+```
+
+The script enables the matching source repository, installs the SRPM into an isolated `_topdir`, runs `rpmbuild -bp`, and prints **only** the prepared directory on stdout (all logs go to stderr), so `SRC=$(...)` is safe to script. RHEL 7/8/9/10 are supported. Workspace layout:
+
+```text
+${SOURCE_ROOT:-/root/kernel-sources}/<rhel-major>/<kernel-version>/BUILD/kernel-<ver>/linux-<ver>.<arch>/
+```
+
+Options: `SOURCE_ROOT=/var/lib/kernel-sources` relocates the workspace, `SKIP_PREPARE=1` reuses an existing tree, `--uninstall` removes one.
+
+Requirements and caveats:
+
+- Run the script as root, or as a user allowed to enable repositories and install RPMs.
+- The **server process** must be able to read the tree. `/root/kernel-sources` is readable by root only; if the service runs as an unprivileged user, prepare under a shared path such as `SOURCE_ROOT=/var/lib/kernel-sources` and grant read access.
+- `rpmbuild` names the tree with the **host's** `%{?dist}`, so an el8 SRPM prepared on an el9 host yields a `linux-...el9...` directory. The agent tolerates that as long as the upstream kernel version matches, and records a `note` in the tool output.
+
+Pass the printed directory to the client:
+
+```bash
+uv run main.py --url http://localhost:8000 --stream \
+  ... \
+  --kernel-source-root "$SRC"
+```
+
+Precedence: the request field `kernel_source_root` (`--kernel-source-root`) wins; otherwise the deployment default `KERNEL_SOURCE_ROOT` is used. When neither is set, source-level verification stays disabled and the agent must say so explicitly.
+
+Version safety: the agent compares the tree version with the kernel reported by `sys`. A different kernel release is rejected, so code from the wrong tree is never read; a difference limited to the `el` dist tag or the architecture suffix is accepted with a note.
 
 ## API and outputs
 
@@ -176,11 +228,12 @@ Both analysis endpoints use the same JSON request fields:
   "vmcore_path": "/data/case/vmcore",
   "vmlinux_path": "/data/case/vmlinux",
   "vmcore_dmesg_path": "/data/case/vmcore-dmesg.txt",
-  "debug_symbol_paths": ["/data/case/driver.ko"]
+  "debug_symbol_paths": ["/data/case/driver.ko"],
+  "kernel_source_root": "/root/kernel-sources/8/4.18.0-553.22.1.el8_10/BUILD/kernel-4.18.0-553.22.1.el8_10/linux-4.18.0-553.22.1.el8_10.x86_64"
 }
 ```
 
-The first three fields are required; `debug_symbol_paths` is optional and may be an empty array. Paths are checked by the server. The synchronous response includes `success`, `task_id`, `agent_answer`, and `token_usage`, with optional `error` and `audit_report` fields. The streaming endpoint sends progress over SSE; its completion event includes the analysis and audit content.
+The first three fields are required; `debug_symbol_paths` is optional and may be an empty array. `kernel_source_root` is optional and falls back to the server-side `KERNEL_SOURCE_ROOT`. Paths are checked by the server. The synchronous response includes `success`, `task_id`, `agent_answer`, and `token_usage`, with optional `error` and `audit_report` fields. The streaming endpoint sends progress over SSE; its completion event includes the analysis and audit content.
 
 ### Report files
 
