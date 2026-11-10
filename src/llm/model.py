@@ -5,7 +5,7 @@
 # Created: 2026-01-09
 
 import os
-from typing import Any
+from typing import Any, cast
 from pydantic import SecretStr
 
 from langchain_openai import ChatOpenAI
@@ -77,6 +77,10 @@ def create_reasoning_llm():
     # top_p=1.0     全部词汇       最高          最低          开放式创作
 
     try:
+        endpoint_kwargs: dict[str, Any]
+        # The selected model class differs by endpoint; keep its dynamic
+        # constructor signature from being incorrectly narrowed by type checkers.
+        llm_class: Any
         if settings.sends_thinking_field:
             # deepseek 档位（DeepSeek 官方 / 阿里云 compatible-mode）：
             # 使用 ChatDeepSeek 系列并显式下发私有 thinking 字段；
@@ -112,13 +116,18 @@ def create_reasoning_llm():
                     "temperature": temperature,
                 }
 
-        llm = llm_class(
+        token_limit_kwargs = (
+            {"max_completion_tokens": max_tokens}
+            if llm_class is ChatOpenAI
+            else {"max_tokens": max_tokens}
+        )
+        llm = cast(Any, llm_class)(
             api_key=SecretStr(str(api_key)),
             model=model_name,
-            max_tokens=max_tokens,
             timeout=300,  # 5 分钟超时，后期步骤对话历史很长，LLM 推理耗时较久
             max_retries=3,  # 遇到连接超时等瞬态错误时自动重试
             **endpoint_kwargs,
+            **token_limit_kwargs,
             **llm_kwargs,
         )
         logger.info(
