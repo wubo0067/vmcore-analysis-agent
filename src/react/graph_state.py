@@ -99,6 +99,12 @@ class AgentState(MessagesState):
     # 取值级矛盾事实（内存内容与结构体布局不符），格式见 consistency.py。
     # 与 evidence_facts 分开保存：它属于派生关系，不参与门控证据统计。
     value_conflicts: list[str]
+    # 执行了但没有任何可用输出的动作（空输出 / 仅 echo / 报错）。
+    # 空输出不等于验证通过；这些条目会阻止在未重跑成功前宣布定论。
+    unanswered_actions: list[dict[str, object]]
+    # 已过期（3 步内未成功重跑）的未闭环动作。它们不再阻塞结论，但必须作为
+    # caveat 写进报告——过期只能"解除阻塞"，不能"静默遗忘"。
+    expired_unresolved: list[dict[str, object]]
     # 每条 value_conflict 已累计处理的次数，用于超限后降噪并保留 residual caveat。
     value_conflict_audit_counts: dict[str, int]
     replan_required: bool

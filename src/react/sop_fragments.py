@@ -312,7 +312,33 @@ be downgraded from medium to low until device-specific DMA remapping exclusion i
 confirm whether the suspect device belongs to a passthrough domain or a translated domain
 before concluding that a stray DMA write could reach an arbitrary physical page.
 
+Unobservable reconstructions are hypotheses, never evidence. If the current DMA mapping does
+not cover the corrupted page, the correct statement is exactly that; a story about a pool that
+"was freed and recycled" cannot be listed under evidence, cannot be used to close an ownership
+question, and must be labelled as an unverified hypothesis when it is mentioned at all.
+
+### Reverse-Pointer Search (bounded)
+To find who still holds a pointer to the corrupted page, use the bounded search form.
+`search -k` and `search -p` are forbidden in this project (unbounded, floods memory and
+times out); the bounded form answers the same question:
+
+  search -s <start> -e <end> <page_address>
+
+- `<page_address>` is the kernel virtual address of the page (from vtop/ptov or
+  page_address), not the raw physical address.
+- `<start>` and `<end>` come from kmem -v or the direct-map bounds; keep the window as
+  small as the question allows.
+- A hit identifies a live holder of that page and is direct ownership evidence for a
+  writer candidate. Quote the hit and the searched range.
+- No hit is a negative result: it does not prove the page was never a DMA buffer, and it
+  must be reported as "no live holder found in the searched range", not as "never held".
+
 ### Step 2: Device DMA Configuration
+Multi-instance rule: when the driver has several peer instances (for example four
+HBAs), an ownership test on one instance cannot support a global claim such as
+"no controller's DMA range covers this page". Enumerate every instance whose DMA
+window can contain the suspect physical address, or state explicitly which
+instances were not checked and bound the claim to the instance actually tested.
 Sub-step A: inspect adjacent pages first when the target page is reserved or unreadable.
 - Use ptov and vtop on neighboring pages.
 - If readable, dump both hex and ASCII and look for device fingerprints such as Ethernet headers, mlx5 CQE blocks, NVMe CQE or SQE patterns, or qla2xxx IOCB signatures.

@@ -609,6 +609,15 @@ def apply_executor_consistency_audit(
         analysis_step,
         log_prefix=log_prefix,
     )
+    analysis_step = _audit_suspect_code_consistency(
+        analysis_step,
+        log_prefix=log_prefix,
+    )
+    analysis_step = _audit_open_action_closure(
+        analysis_step,
+        state,
+        log_prefix=log_prefix,
+    )
 
     # ------------------------------------------------------------
     # 阶段 4：x86 页面错误访问类型矛盾检测
@@ -793,6 +802,13 @@ def _audit_dma_promotion_gate(
     return analysis_step
 
 
+_NEGATION_RE = re.compile(
+    r"\b(?:missing|cannot|can't|couldn't|unable|not|never|no|lack|lacking|"
+    r"without|absent|unverified|isn't|aren't|wasn't|weren't)\b",
+    re.IGNORECASE,
+)
+
+
 def _collect_dma_evidence_families(lowered_text: str) -> set[str]:
     """提取 DMA 结论中已经满足的独立设备侧证据族。"""
     family_markers: dict[str, tuple[str, ...]] = {
@@ -821,6 +837,11 @@ def _collect_dma_evidence_families(lowered_text: str) -> set[str]:
             "descriptor decode",
             "descriptor bit layout",
             "decoded sub-field",
+            "mpi2 layout",
+            "mpi2 reply layout",
+            "iocstatus",
+            "iocloginfo",
+            "documented protocol layout",
         ),
         "pci_ownership": (
             "pci ownership",
@@ -852,26 +873,138 @@ def _collect_dma_evidence_families(lowered_text: str) -> set[str]:
             window_start = max(0, index - 48)
             window_end = min(len(lowered_text), index + len(marker) + 48)
             context = lowered_text[window_start:window_end]
-            if any(
-                negation in context
-                for negation in (
-                    "missing",
-                    "cannot verify",
-                    "could not verify",
-                    "unverified",
-                    "not verified",
-                    "no ",
-                    "lack ",
-                    "lacking",
-                    "without ",
-                    "absent",
-                )
-            ):
+            if _NEGATION_RE.search(context):
                 continue
             matched.add(family)
             break
 
     return matched
+
+
+_NO_CHANGE_NEEDED_RE = re.compile(
+    r"no change(?:s)? (?:is|are) needed (?:in|to) ([^\s,;:)]+)", re.IGNORECASE
+)
+
+
+def _audit_suspect_code_consistency(
+    analysis_step: VMCoreLLMAnalysisStep,
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """Reject a suspect_code that the report itself says needs no change.
+
+    Reports sometimes point ``suspect_code`` at the crash site (a victim) while
+    the fix section says that file needs no change. Downstream tooling routes
+    work by this field, so such a combination must not survive.
+    """
+
+    diagnosis = analysis_step.final_diagnosis
+    if diagnosis is None:
+        return analysis_step
+
+    suspect = getattr(diagnosis, "suspect_code", None)
+    if suspect is None or not getattr(suspect, "file", ""):
+        return analysis_step
+
+    haystack = f"{diagnosis.fix_suggestion or ''}\n{diagnosis.detailed_analysis or ''}"
+    exempt_files = {
+        match.group(1).strip("`\"'").rstrip(".").lower()
+        for match in _NO_CHANGE_NEEDED_RE.finditer(haystack)
+    }
+    if not exempt_files:
+        return analysis_step
+
+    suspect_file = suspect.file.strip().strip("`\"'").lower()
+    if not any(
+        suspect_file == path or suspect_file.endswith("/" + path)
+        for path in exempt_files
+    ):
+        return analysis_step
+
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    audit_note = (
+        "Executor audit: suspect_code pointed at "
+        f"{suspect.file}, but the fix section states no change is needed there. "
+        "That file is the victim (crash site), not the corrupting writer; the "
+        "suspect code location was reset to indeterminate."
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    diagnosis.suspect_code = SuspectCode(
+        file="indeterminate", function="indeterminate", line="indeterminate"
+    )
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+    analysis_step.additional_notes = (
+        f"{analysis_step.additional_notes} {audit_note}".strip()
+        if analysis_step.additional_notes
+        else audit_note
+    )
+    return analysis_step
+
+
+def _audit_open_action_closure(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """Block a conclusion while an action still has no usable output.
+
+    An empty or error-only tool result is not verification. Until that action
+    is re-executed successfully (or ages out), the analysis cannot be declared
+    conclusive.
+    """
+
+    open_actions = state.get("unanswered_actions") or []
+    expired_unresolved = state.get("expired_unresolved") or []
+    prefix = f"{log_prefix}: " if log_prefix else ""
+
+    # 过期条目不阻塞结论，但必须留痕：写进 additional_notes，最终渲染为报告的
+    # 「附加说明」。否则一次失败只是被时间洗白，正是 R3 的失败模式。
+    if expired_unresolved:
+        expired_lines = "; ".join(
+            f"{entry.get('display', '')} (step {entry.get('step', '?')})"
+            for entry in expired_unresolved[:5]
+            if entry.get("display")
+        )
+        if expired_lines:
+            caveat = (
+                "Executor caveat: these commands never produced a usable result and were "
+                f"not retried before the analysis moved on: {expired_lines}."
+            )
+            if caveat not in (analysis_step.additional_notes or ""):
+                analysis_step.additional_notes = (
+                    f"{analysis_step.additional_notes} {caveat}".strip()
+                    if analysis_step.additional_notes
+                    else caveat
+                )
+
+    if not open_actions or not analysis_step.is_conclusive:
+        return analysis_step
+
+    details = "; ".join(
+        str(item.get("display", "")) for item in open_actions[:3] if item.get("display")
+    )
+    audit_note = (
+        "Executor audit: conclusion blocked because these actions failed or returned no "
+        f"usable output and were never re-executed successfully: {details}. Re-run them "
+        "with corrected syntax, or state explicitly that the check is unavailable in this "
+        "dump."
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    analysis_step.is_conclusive = False
+    if analysis_step.confidence not in {None, "low"}:
+        analysis_step.confidence = "low"
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+    analysis_step.additional_notes = (
+        f"{analysis_step.additional_notes} {audit_note}".strip()
+        if analysis_step.additional_notes
+        else audit_note
+    )
+    return analysis_step
 
 
 def _collect_analysis_text_for_oob_audit(analysis_step: VMCoreLLMAnalysisStep) -> str:

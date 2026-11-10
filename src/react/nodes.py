@@ -87,6 +87,123 @@ def _has_non_echo_output(content: str) -> bool:
     return False
 
 
+# crash 明确报告"这条命令没跑成"的标记。"没有匹配"不算失败，但"地址无效"、
+# "符号不存在"这类必须计入未闭环动作。
+_HARD_FAILURE_MARKERS = (
+    "invalid kernel virtual address",
+    "invalid address",
+    "no symbol",
+    "symbol not found",
+    "command not found",
+    "not a valid",
+    "unable to find",
+)
+
+# "查不到就是结论"的命令形态：grep / search 无匹配属于合法的否定性证据，
+# 不能因为输出为空就把整个分析卡住（R3 的 caveat 依赖日志里"没有"某些行）。
+_ABSENCE_MEANINGFUL_RE = re.compile(r"\b(grep|search)\b", re.IGNORECASE)
+
+
+def _classify_tool_output(content: str, display: str) -> str:
+    """把一次工具执行归类为 ok / negative / failed / empty。
+
+    - failed：crash 明确报了地址/符号错误，命令没有真正执行成功；
+    - ok：有 echo 之外的实质输出；
+    - negative：空输出，但命令本身是 grep/search（"没匹配"就是结论）；
+    - empty：空输出且不属于否定性检索，说明命令可能没跑成。
+    """
+
+    lowered = content.lower()
+    if any(marker in lowered for marker in _HARD_FAILURE_MARKERS):
+        return "failed"
+    if _has_non_echo_output(content):
+        return "ok"
+    if _ABSENCE_MEANINGFUL_RE.search(display or ""):
+        return "negative"
+    return "empty"
+
+
+def _update_open_actions(
+    open_actions: list[dict[str, object]],
+    *,
+    fingerprint: str,
+    display: str,
+    content: str,
+    step_index: int,
+) -> list[dict[str, object]]:
+    """登记/清除"未闭环动作"。
+
+    失败或空输出登记；同一指纹成功（含合法的否定性检索）后清除。同指纹只保留
+    一条，避免同一失败命令重复执行时刷屏。
+    """
+
+    if not fingerprint:
+        return open_actions
+
+    outcome = _classify_tool_output(content, display)
+    others = [entry for entry in open_actions if entry.get("fingerprint") != fingerprint]
+
+    if outcome in {"failed", "empty"}:
+        others.append(
+            {
+                "fingerprint": fingerprint,
+                "display": display,
+                "reason": outcome,
+                "step": step_index,
+            }
+        )
+        return others
+    return others
+
+
+def _expire_open_actions(
+    open_actions: list[dict[str, object]], step_index: int, *, max_age: int = 3
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """把过期条目移出阻塞列表，并单独返回，交给调用方留痕。
+
+    返回 (仍有效, 本次过期)。过期不等于"问题解决了"：调用方必须把它移入
+    expired_unresolved，让报告里出现一条 caveat，否则就是静默擦除。
+    """
+
+    fresh: list[dict[str, object]] = []
+    expired: list[dict[str, object]] = []
+    for entry in open_actions:
+        entry_step = entry.get("step", step_index)
+        if not isinstance(entry_step, int):
+            entry_step = step_index
+        if step_index - entry_step <= max_age:
+            fresh.append(entry)
+        else:
+            expired.append(entry)
+    return fresh[-5:], expired
+
+
+def _merge_expired(
+    expired_unresolved: list[dict[str, object]],
+    newly_expired: list[dict[str, object]],
+    resolved_fingerprints: set[str],
+    step_index: int,
+    *,
+    cap: int = 5,
+) -> list[dict[str, object]]:
+    """合并过期条目；已被成功重跑覆盖的指纹不再保留。"""
+
+    merged = [
+        dict(entry)
+        for entry in expired_unresolved
+        if entry.get("fingerprint") not in resolved_fingerprints
+    ]
+    known = {entry.get("fingerprint") for entry in merged}
+    for entry in newly_expired:
+        if entry.get("fingerprint") in resolved_fingerprints:
+            continue
+        if entry.get("fingerprint") in known:
+            continue
+        merged.append({**entry, "expired_at": step_index})
+        known.add(entry.get("fingerprint"))
+    return merged[-cap:]
+
+
 # L2：收敛护栏阈值 CONVERGENCE_GUARD_STREAK_THRESHOLD 定义在 graph_state.py
 #（nodes.py 与 prompt_builder.py 共同的叶子依赖），两条收敛通道共用同一判据。
 
@@ -585,6 +702,15 @@ async def call_crash_tool(state: AgentState) -> dict:
     # 本步首次回放的指纹，写入 replayed_fingerprints 供后续步骤判定"第二次索取"
     new_replayed_fingerprints: list[str] = []
     current_fingerprints: list[str] = []
+    # 本步及最近几步里"执行了但没有任何可用输出"的动作。空输出不等于验证通过：
+    # 这些动作会一直留在这里，直到同一指纹成功产出内容，或在 3 步后过期。
+    step_index = int(state.get("step_count", 0))
+    open_actions: list[dict[str, object]] = [
+        dict(item) for item in (state.get("unanswered_actions") or [])
+    ]
+    # 本步被成功重跑（有输出或合法否定性结果）覆盖的指纹：
+    # 既用于清除阻塞列表，也用于清除已经过期的留痕条目。
+    resolved_fingerprints: set[str] = set()
     rejected_count = 0
 
     try:
@@ -822,6 +948,19 @@ async def call_crash_tool(state: AgentState) -> dict:
                                 content = f"[error] Execution failed: {r_output}"
                             if not content.startswith(("[error]", "[TIMEOUT]")) and _has_non_echo_output(content):
                                 observed_nonempty_output = True
+                            if fingerprint:
+                                open_actions = _update_open_actions(
+                                    open_actions,
+                                    fingerprint=fingerprint,
+                                    display=original_cmd,
+                                    content=content,
+                                    step_index=step_index,
+                                )
+                                if _classify_tool_output(content, original_cmd) in {
+                                    "ok",
+                                    "negative",
+                                }:
+                                    resolved_fingerprints.add(fingerprint)
                             tool_messages.append(
                                 ToolMessage(
                                     content=content,
@@ -926,6 +1065,15 @@ async def call_crash_tool(state: AgentState) -> dict:
     goal_advanced = facts_support_goal(
         evidence_delta, state.get("current_evidence_goal")
     )
+    # 过期清理：超过 3 步仍未重跑成功的失败/空输出动作不再阻塞结论，
+# 但必须转入 expired_unresolved 留痕，由审计写进报告的附加说明。
+    open_actions, newly_expired = _expire_open_actions(open_actions, step_index)
+    expired_unresolved = _merge_expired(
+        [dict(entry) for entry in (state.get("expired_unresolved") or [])],
+        newly_expired,
+        resolved_fingerprints,
+        step_index,
+    )
     return {
         "step_count": 1,
         "messages": tool_messages,
@@ -942,6 +1090,8 @@ async def call_crash_tool(state: AgentState) -> dict:
         "evidence_delta": evidence_delta,
         "evidence_facts": evidence_facts,
         "value_conflicts": value_conflicts,
+        "unanswered_actions": open_actions,
+        "expired_unresolved": expired_unresolved,
         "replan_required": all_duplicate
         or (bool(commands_to_run) and not evidence_delta)
         # C1：DEDUP-BLOCKED（无证据的重复命令）走 rejected 分支，
