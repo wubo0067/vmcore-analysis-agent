@@ -332,7 +332,7 @@ def calibrate_chars_per_token(prompt_chars: int, prompt_tokens: int) -> None:
     if prompt_chars <= 0 or prompt_tokens <= 0:
         return
     observed = prompt_chars / prompt_tokens
-    if not 1.0 <= observed <= 3.0:
+    if not 1.0 <= observed <= 4.5:
         return
     _CHARS_PER_TOKEN = 0.7 * _CHARS_PER_TOKEN + 0.3 * observed
 

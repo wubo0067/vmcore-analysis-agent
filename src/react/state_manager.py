@@ -359,6 +359,9 @@ def _build_managed_gates(
         - external_corruption_gate 的状态依赖于 local_corruption_exclusion 的状态。
     """
     # 未注册签名没有可授权的门控状态，避免旧签名门控为当前结论背书
+    if signature_class is None:
+        return None
+
     required = required_gates_for(signature_class)
     if required is None:
         return None
@@ -405,12 +408,14 @@ def _build_managed_gates(
                 status="blocked",  # 初始阻塞，等待本地破坏排除
                 prerequisite="local_corruption_exclusion",
                 evidence="Managed by executor state: waiting for local_corruption_exclusion to close.",
+                closure_basis=None,  # 终态关闭依据由 executor 独占，初始默认实例不得预设
             )
         elif gate_name == "field_type_classification":
             managed[gate_name] = GateEntry(
                 required_for=[signature_class],
                 status="open",  # 初始开放，等待类型推断结果
                 prerequisite=None,
+                closure_basis=None,
                 evidence=(
                     "Managed by executor state: awaiting source-level field typing via "
                     "function-pointer anchoring, source cross-reference, or defensible offset inference."
@@ -421,6 +426,7 @@ def _build_managed_gates(
                 required_for=[signature_class],
                 status="open",
                 prerequisite=None,
+                closure_basis=None,
                 evidence=(
                     "Managed by executor state: identify the exact bad operand source by closing the "
                     "faulting-register chain back to a concrete source object and field/offset. This gate "
@@ -433,6 +439,7 @@ def _build_managed_gates(
                 required_for=[signature_class],
                 status="open",
                 prerequisite=None,
+                closure_basis=None,
                 evidence="Managed by executor state: awaiting deterministic evidence.",
             )
 
@@ -454,6 +461,7 @@ def _build_managed_gates(
                 required_for=external_gate.required_for,
                 status="blocked",
                 prerequisite="local_corruption_exclusion",
+                closure_basis=None,  # 终态关闭依据由 executor 独占，此处不得预设
                 evidence=external_gate.evidence
                 or "Managed by executor state: waiting for local_corruption_exclusion to close.",
             )
@@ -463,6 +471,7 @@ def _build_managed_gates(
                 required_for=external_gate.required_for,
                 status="open",  # 解除阻塞，转为开放等待证据
                 prerequisite="local_corruption_exclusion",
+                closure_basis=None,  # 终态关闭依据由 executor 独占，此处不得预设
                 evidence="Managed by executor state: prerequisite satisfied; awaiting deterministic evidence.",
             )
     return managed

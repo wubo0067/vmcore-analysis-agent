@@ -7,6 +7,7 @@
 from langchain_core.callbacks import BaseCallbackHandler
 from typing import Any, Dict, List, Optional
 import asyncio
+import openai
 from src.utils.logging import logger
 
 
@@ -144,8 +145,14 @@ class GraphLoggingCallback(BaseCallbackHandler):
 
     @staticmethod
     def _is_recoverable_output_parsing_error(error: BaseException) -> bool:
+        if isinstance(error, openai.LengthFinishReasonError):
+            return True
         message = str(error)
-        return "Invalid json output" in message or "OUTPUT_PARSING_FAILURE" in message
+        return (
+            "Invalid json output" in message
+            or "OUTPUT_PARSING_FAILURE" in message
+            or "length limit was reached" in message
+        )
 
 
 # 全局回调处理器实例

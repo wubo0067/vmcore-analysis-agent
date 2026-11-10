@@ -17,16 +17,25 @@ react_pkg = types.ModuleType("src.react")
 react_pkg.__path__ = [str(root / "src" / "react")]
 sys.modules.setdefault("src.react", react_pkg)
 
-from src.react.llm_node import _build_structured_chain
+from src.react.llm_node import (
+    _LENGTH_RECOVERY_DIRECTIVE,
+    _build_structured_chain,
+    call_llm_analysis,
+)
+from src.react.logging_callback import GraphLoggingCallback
+import src.react.llm_runtime as llm_runtime_mod
 from src.react.llm_runtime import (
     ContextBudgetError,
+    INITIAL_CHARS_PER_TOKEN,
     LLMBudgetConfig,
     OutputBudget,
     ainvoke_with_retry,
+    calibrate_chars_per_token,
     compress_messages_for_llm,
     plan_output_budget,
     prepare_messages_for_llm,
 )
+from src.react.schema import ToolCall, VMCoreLLMAnalysisStep
 from src.llm.model import ChatDeepSeekReasoner
 
 
@@ -239,6 +248,125 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
             await ainvoke_with_retry(chain, [], max_retries=3, base_delay=0)
 
         self.assertEqual(chain.calls, 1)
+
+    def test_calibrate_chars_per_token_accepts_english_hex_ratio_above_three(
+        self,
+    ) -> None:
+        original = llm_runtime_mod._CHARS_PER_TOKEN
+        try:
+            llm_runtime_mod._CHARS_PER_TOKEN = INITIAL_CHARS_PER_TOKEN
+            calibrate_chars_per_token(665_547, 203_311)  # ~3.2735 chars/token
+            self.assertGreater(llm_runtime_mod._CHARS_PER_TOKEN, 2.0)
+
+            calibrated = llm_runtime_mod._CHARS_PER_TOKEN
+            calibrate_chars_per_token(600_000, 100_000)  # 6.0 -> out of range
+            self.assertEqual(llm_runtime_mod._CHARS_PER_TOKEN, calibrated)
+        finally:
+            llm_runtime_mod._CHARS_PER_TOKEN = original
+
+    def test_logging_callback_treats_length_finish_reason_as_recoverable(self) -> None:
+        exc = openai.LengthFinishReasonError.__new__(openai.LengthFinishReasonError)
+        Exception.__init__(
+            exc,
+            "Could not parse response content as the length limit was reached",
+        )
+        self.assertTrue(
+            GraphLoggingCallback._is_recoverable_output_parsing_error(exc)
+        )
+        self.assertTrue(
+            GraphLoggingCallback._is_recoverable_output_parsing_error(
+                RuntimeError(
+                    "Could not parse response content as the length limit was reached"
+                )
+            )
+        )
+
+    async def test_call_llm_analysis_length_fallback_injects_directive_and_calibrates(
+        self,
+    ) -> None:
+        sent_batches: list[list] = []
+
+        class _FallbackChain:
+            async def ainvoke(self, messages, config=None):
+                sent_batches.append(list(messages))
+                if len(sent_batches) == 1:
+                    exc = openai.LengthFinishReasonError.__new__(
+                        openai.LengthFinishReasonError
+                    )
+                    Exception.__init__(
+                        exc,
+                        "Could not parse response content as the length limit was reached",
+                    )
+                    exc.completion = types.SimpleNamespace(
+                        usage=types.SimpleNamespace(prompt_tokens=39_000)
+                    )
+                    raise exc
+                parsed = VMCoreLLMAnalysisStep(
+                    step_id=1,
+                    reasoning="concise reasoning",
+                    action=ToolCall(command_name="bt", arguments=["-a"]),
+                    is_conclusive=False,
+                )
+                raw = AIMessage(
+                    content=parsed.model_dump_json(),
+                    usage_metadata={
+                        "input_tokens": 39_000,
+                        "output_tokens": 200,
+                        "total_tokens": 39_200,
+                    },
+                )
+                return {"parsed": parsed, "raw": raw}
+
+        class _DummyLLM:
+            def with_structured_output(self, *args, **kwargs):
+                return _FallbackChain()
+
+        state = {
+            "step_count": 1,
+            "messages": [
+                HumanMessage(content="init"),
+                AIMessage(
+                    content='{"step_id": 0, "reasoning": "start"}',
+                    tool_calls=[{"id": "tc1", "name": "sys", "args": {}}],
+                ),
+                ToolMessage(
+                    content="X" * 6_000,
+                    name="sys",
+                    tool_call_id="tc1",
+                ),
+                ToolMessage(
+                    content="Y" * 1_000,
+                    name="bt",
+                    tool_call_id="tc2",
+                ),
+                ToolMessage(
+                    content="Z" * 1_000,
+                    name="bt",
+                    tool_call_id="tc3",
+                ),
+            ],
+        }
+
+        original = llm_runtime_mod._CHARS_PER_TOKEN
+        try:
+            llm_runtime_mod._CHARS_PER_TOKEN = INITIAL_CHARS_PER_TOKEN
+            result = await call_llm_analysis(state, _DummyLLM())
+            self.assertIsNone(result["error"])
+            self.assertEqual(len(sent_batches), 2)
+            first_sys = sent_batches[0][0].content
+            second_sys = sent_batches[1][0].content
+            self.assertNotIn(_LENGTH_RECOVERY_DIRECTIVE, first_sys)
+            self.assertIn(_LENGTH_RECOVERY_DIRECTIVE, second_sys)
+            # Older ToolMessage is truncated once on both calls, never double-truncated
+            self.assertEqual(sent_batches[0][3].content, sent_batches[1][3].content)
+            self.assertEqual(
+                sent_batches[1][3].content.count("[SYSTEM LOG:"), 1
+            )
+            self.assertGreater(
+                llm_runtime_mod._CHARS_PER_TOKEN, INITIAL_CHARS_PER_TOKEN
+            )
+        finally:
+            llm_runtime_mod._CHARS_PER_TOKEN = original
 
 
 if __name__ == "__main__":

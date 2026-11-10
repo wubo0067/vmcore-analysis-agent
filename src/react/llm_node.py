@@ -79,6 +79,16 @@ def _build_structured_chain(
     )
 
 
+_LENGTH_RECOVERY_DIRECTIVE = (
+    "\n\n## CRITICAL OUTPUT LENGTH LIMIT RECOVERY\n"
+    "Your previous response was terminated because the structured JSON output "
+    "exceeded the maximum completion token limit (LengthFinishReasonError). "
+    "Do NOT repeat sentences, paragraphs, or raw command dumps. "
+    "Keep `reasoning` under 300 words, `detailed_analysis` under 500 words, "
+    "and cite only compact key addresses/lines in `evidence` and `root_cause`."
+)
+
+
 def _reasoning_signals_convergence(reasoning: str) -> bool:
     lowered = (reasoning or "").lower()
     return any(
@@ -186,6 +196,7 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
     # 这段代码既不是单纯让 LLM 终止推理，也不是单纯让它继续推理。它的真实作用是防止 agent 空转，并根据 is_last_step 决定：
     # is_last_step=false：优先推动继续诊断，必要时允许有边界地收口
     # is_last_step=true：强制停止继续查工具，要求输出终态结果
+    extra_tail_messages: list = []
     last_msg = messages_to_send[-1] if messages_to_send else None
     if isinstance(last_msg, AIMessage) and not last_msg.tool_calls:
         last_step = None
@@ -202,31 +213,31 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
         logger.warning(
             "Last message was an AIMessage without tool calls. Injecting HumanMessage to force progress."
         )
-        messages_to_send.append(
-            HumanMessage(
-                content=(
-                    (
-                        "Your previous response already states that the evidence is sufficient to conclude. "
-                        "Do NOT request more tools. Convert the current evidence into a final structured conclusion now. "
-                        "If your remaining blocker is only gate bookkeeping, emit the specific gate updates needed to close the required gates, set action=null, set is_conclusive=true, and provide final_diagnosis. "
-                        if last_step is not None
-                        and last_step.root_cause_class not in {None, "unknown"}
-                        and _reasoning_signals_convergence(last_step.reasoning)
-                        else "Your previous response neither invoked any tools nor provided a valid terminal state. "
-                        "You cannot remain in this state. "
-                    )
-                    + (
-                        "This is the last step: do not call tools; either return a conclusive result with final_diagnosis, "
-                        "or return a bounded non-conclusive result with action=null and explicit verification gaps."
-                        if effective_last_step
-                        else "Please EITHER call a compliant tool out of the available options to gather more information, "
-                        "OR, if no further tool can reduce uncertainty, return a bounded non-conclusive result with "
-                        "action=null and explicit verification gaps. Set 'is_conclusive'=true with final_diagnosis "
-                        "ONLY if the convergence criteria are actually satisfied."
-                    )
+        progress_msg = HumanMessage(
+            content=(
+                (
+                    "Your previous response already states that the evidence is sufficient to conclude. "
+                    "Do NOT request more tools. Convert the current evidence into a final structured conclusion now. "
+                    "If your remaining blocker is only gate bookkeeping, emit the specific gate updates needed to close the required gates, set action=null, set is_conclusive=true, and provide final_diagnosis. "
+                    if last_step is not None
+                    and last_step.root_cause_class not in {None, "unknown"}
+                    and _reasoning_signals_convergence(last_step.reasoning)
+                    else "Your previous response neither invoked any tools nor provided a valid terminal state. "
+                    "You cannot remain in this state. "
+                )
+                + (
+                    "This is the last step: do not call tools; either return a conclusive result with final_diagnosis, "
+                    "or return a bounded non-conclusive result with action=null and explicit verification gaps."
+                    if effective_last_step
+                    else "Please EITHER call a compliant tool out of the available options to gather more information, "
+                    "OR, if no further tool can reduce uncertainty, return a bounded non-conclusive result with "
+                    "action=null and explicit verification gaps. Set 'is_conclusive'=true with final_diagnosis "
+                    "ONLY if the convergence criteria are actually satisfied."
                 )
             )
         )
+        extra_tail_messages.append(progress_msg)
+        messages_to_send.append(progress_msg)
 
     audit_counts = dict(state.get("value_conflict_audit_counts") or {})
 
@@ -272,6 +283,11 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
             logger.warning(
                 f"LLM output hit max_tokens (completion budget exhausted): {exc}"
             )
+            exc_usage = getattr(getattr(exc, "completion", None), "usage", None)
+            exc_prompt_tokens = getattr(exc_usage, "prompt_tokens", None)
+            if isinstance(exc_prompt_tokens, int) and exc_prompt_tokens > 0:
+                calibrate_chars_per_token(budget.prompt_chars, exc_prompt_tokens)
+
             if not budget.thinking:
                 raise ContextBudgetError(
                     f"LLM output hit max_tokens with thinking disabled; "
@@ -279,15 +295,19 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
                     f"max_tokens={budget.max_tokens}"
                 ) from exc
 
-            # thinking 吃掉了输出预算：关闭 thinking，压缩后只再给一次机会。
+            # 输出预算耗尽（可能是 thinking 或正文复读过长）：关闭 thinking 并注入精简指令，
+            # 基于原始未压缩历史重新准备消息，避免二次截断 ToolMessage。
+            fallback_system_message = SystemMessage(
+                content=system_message + _LENGTH_RECOVERY_DIRECTIVE
+            )
             fallback_config = replace(budget_config, thinking_enabled=False)
             fallback_messages, budget = prepare_messages_for_llm(
-                system_message_obj,
-                messages_to_send[1:],
+                fallback_system_message,
+                [*state["messages"], *extra_tail_messages],
                 fallback_config,
             )
             compressed_messages = fallback_messages
-            messages_to_send = [system_message_obj, *compressed_messages]
+            messages_to_send = [fallback_system_message, *compressed_messages]
             llm_analysis = _build_structured_chain(
                 llm,
                 budget,

@@ -2,6 +2,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from typing import Any, cast
 
 root = Path(__file__).resolve().parents[1]
 src_pkg = types.ModuleType("src")
@@ -20,6 +21,7 @@ from src.react.nodes import (
     _only_read_only_value_probes,
 )
 from src.react.graph_state import (
+    AgentState,
     CONVERGENCE_GUARD_STREAK_THRESHOLD,
     has_committed_root_cause,
 )
@@ -36,7 +38,9 @@ CLOSED_GATES = {
         status="closed",
         evidence="rd+dis+struct",
         required_for=["pointer_corruption"],
+        prerequisite=None,
         closure_basis="executor_evidence",
+        completion_criteria=[],
     )
     for name in (
         "register_provenance",
@@ -47,7 +51,12 @@ CLOSED_GATES = {
 OPEN_GATES = {
     **CLOSED_GATES,
     "object_lifetime": GateEntry(
-        status="open", evidence="pending", required_for=["pointer_corruption"]
+        status="open",
+        evidence="pending",
+        required_for=["pointer_corruption"],
+        prerequisite=None,
+        closure_basis=None,
+        completion_criteria=[],
     ),
 }
 
@@ -64,7 +73,7 @@ Kernel panic - not syncing: Fatal exception
 """
 
 
-def _converged_state(**overrides: object) -> dict:
+def _converged_state_data(**overrides: object) -> dict[str, Any]:
     state = {
         "report_language": "eng",
         "current_signature_class": "pointer_corruption",
@@ -78,12 +87,17 @@ def _converged_state(**overrides: object) -> dict:
     return state
 
 
+def _converged_state(**overrides: object) -> AgentState:
+    return cast(AgentState, _converged_state_data(**overrides))
+
+
 class ConvergenceGuardTests(unittest.TestCase):
     """L2：结论已成立时掐断只读取值类探测，避免收尾轮被探测占掉。"""
 
     def test_blocks_read_only_probe_when_converged(self) -> None:
         reason = _convergence_guard_error(_converged_state(), RUN_D_PROBE)
-        self.assertIsNotNone(reason)
+        self.assertIsInstance(reason, str)
+        assert isinstance(reason, str)
         self.assertIn("pointer_corruption", reason)
         self.assertIn("Emit the final JSON conclusion now", reason)
 
@@ -101,11 +115,19 @@ class ConvergenceGuardTests(unittest.TestCase):
         真值判断会把 `bool("unknown")` 当成"根因已提交"，让本通道在错误前提
         上掐断取证；同时也会让 terminate_only 提示词谎称结论已成立。
         """
-        self.assertFalse(has_committed_root_cause({"current_root_cause_class": "unknown"}))
-        self.assertFalse(has_committed_root_cause({"current_root_cause_class": None}))
-        self.assertFalse(has_committed_root_cause({}))
+        self.assertFalse(
+            has_committed_root_cause(
+                cast(AgentState, {"current_root_cause_class": "unknown"})
+            )
+        )
+        self.assertFalse(
+            has_committed_root_cause(cast(AgentState, {"current_root_cause_class": None}))
+        )
+        self.assertFalse(has_committed_root_cause(cast(AgentState, {})))
         self.assertTrue(
-            has_committed_root_cause({"current_root_cause_class": "use_after_free"})
+            has_committed_root_cause(
+                cast(AgentState, {"current_root_cause_class": "use_after_free"})
+            )
         )
         state = _converged_state(current_root_cause_class="unknown")
         self.assertIsNone(_convergence_guard_error(state, RUN_D_PROBE))
@@ -151,18 +173,19 @@ class NoNewEvidenceDirectiveTests(unittest.TestCase):
     前提，就等于没有第二条通道。
     """
 
-    def _spin_state(self, **overrides: object) -> dict:
+    def _spin_state(self, **overrides: object) -> AgentState:
         state = {
             "current_root_cause_class": None,
             "managed_gates": None,
             "no_progress_streak": CONVERGENCE_GUARD_STREAK_THRESHOLD,
         }
         state.update(overrides)
-        return state
+        return cast(AgentState, state)
 
     def test_fires_without_root_cause_and_without_gates(self) -> None:
         reason = _no_new_evidence_directive(self._spin_state(), RUN_D_PROBE)
-        self.assertIsNotNone(reason)
+        self.assertIsInstance(reason, str)
+        assert isinstance(reason, str)
         self.assertIn("COMMIT A CONCLUSION", reason)
         self.assertIn("DECLARE A NEW EVIDENCE TARGET", reason)
         self.assertIn("not \"unknown\"", reason)
@@ -199,6 +222,9 @@ class GateClosureHelperTests(unittest.TestCase):
                 status="open",
                 evidence="optional evidence path",
                 required_for=["pointer_corruption"],
+                prerequisite=None,
+                closure_basis=None,
+                completion_criteria=[],
             ),
         }
         self.assertTrue(_gates_all_closed(gates, "pointer_corruption"))
@@ -209,6 +235,10 @@ class GateClosureHelperTests(unittest.TestCase):
             "external_corruption_gate": GateEntry(
                 status="open",
                 required_for=["pointer_corruption"],
+                prerequisite=None,
+                evidence=None,
+                closure_basis=None,
+                completion_criteria=[],
             ),
         }
         step = VMCoreAnalysisStep.model_validate(
@@ -269,15 +299,20 @@ class FallbackSynthesisTests(unittest.TestCase):
         return VMCoreAnalysisStep.model_validate(payload)
 
     def test_synthesizes_conclusion_from_closed_gates(self) -> None:
-        out = apply_fallback_conclusion_synthesis(self._step(), _converged_state())
+        out = apply_fallback_conclusion_synthesis(
+            self._step(), _converged_state_data()
+        )
         self.assertTrue(out.is_conclusive)
         self.assertIsNone(out.action)
         self.assertEqual(out.confidence, "low")
         diagnosis = out.final_diagnosis
         self.assertIsNotNone(diagnosis)
+        assert diagnosis is not None
         self.assertEqual(diagnosis.suspect_code.function, "show_interrupts")
         self.assertIn("show_interrupts+640", diagnosis.faulting_instruction)
         self.assertTrue(any("gate register_provenance" in item for item in diagnosis.evidence))
+        self.assertIsNotNone(out.additional_notes)
+        assert out.additional_notes is not None
         self.assertIn("Executor fallback", out.additional_notes)
 
     def test_fallback_ignores_unverified_optional_gate(self) -> None:
@@ -286,30 +321,37 @@ class FallbackSynthesisTests(unittest.TestCase):
             "external_corruption_gate": GateEntry(
                 status="open",
                 required_for=["pointer_corruption"],
+                prerequisite=None,
+                evidence=None,
+                closure_basis=None,
+                completion_criteria=[],
             ),
         }
         out = apply_fallback_conclusion_synthesis(
-            self._step(gates=gates), _converged_state(managed_gates=gates)
+            self._step(gates=gates),
+            _converged_state_data(managed_gates=gates),
         )
         self.assertTrue(out.is_conclusive)
 
     def test_synthesized_result_survives_message_revalidation(self) -> None:
         """报告侧重新校验序列化 JSON，合成结果必须自洽否则又被降级。"""
-        out = apply_fallback_conclusion_synthesis(self._step(), _converged_state())
+        out = apply_fallback_conclusion_synthesis(
+            self._step(), _converged_state_data()
+        )
         revalidated = VMCoreAnalysisStep.model_validate_json(out.model_dump_json())
         self.assertTrue(revalidated.is_conclusive)
         self.assertIsNotNone(revalidated.final_diagnosis)
 
     def test_skipped_when_gate_unresolved(self) -> None:
         out = apply_fallback_conclusion_synthesis(
-            self._step(gates=OPEN_GATES), _converged_state()
+            self._step(gates=OPEN_GATES), _converged_state_data()
         )
         self.assertFalse(out.is_conclusive)
         self.assertIsNone(out.final_diagnosis)
 
     def test_skipped_without_root_cause_class(self) -> None:
         out = apply_fallback_conclusion_synthesis(
-            self._step(root_cause_class=None), _converged_state()
+            self._step(root_cause_class=None), _converged_state_data()
         )
         self.assertFalse(out.is_conclusive)
         self.assertIsNone(out.final_diagnosis)
@@ -322,7 +364,9 @@ class FallbackSynthesisTests(unittest.TestCase):
                     gates=None,
                     root_cause_class="pointer_corruption",
                 )
-                out = apply_fallback_conclusion_synthesis(step, _converged_state())
+                out = apply_fallback_conclusion_synthesis(
+                    step, _converged_state_data()
+                )
                 self.assertFalse(out.is_conclusive)
                 self.assertIsNone(out.final_diagnosis)
 
@@ -338,14 +382,20 @@ class FallbackSynthesisTests(unittest.TestCase):
         self.assertFalse(_gates_all_closed(unverified, "pointer_corruption"))
 
     def test_idempotent_when_already_conclusive(self) -> None:
-        once = apply_fallback_conclusion_synthesis(self._step(), _converged_state())
+        once = apply_fallback_conclusion_synthesis(
+            self._step(), _converged_state_data()
+        )
         self.assertTrue(once.is_conclusive)
-        self.assertIs(apply_fallback_conclusion_synthesis(once, _converged_state()), once)
+        self.assertIs(
+            apply_fallback_conclusion_synthesis(once, _converged_state_data()), once
+        )
 
     def test_chinese_report_language(self) -> None:
         out = apply_fallback_conclusion_synthesis(
-            self._step(), _converged_state(report_language="zh")
+            self._step(), _converged_state_data(report_language="zh")
         )
+        self.assertIsNotNone(out.additional_notes)
+        assert out.additional_notes is not None
         self.assertIn("执行器补全", out.additional_notes)
 
 
