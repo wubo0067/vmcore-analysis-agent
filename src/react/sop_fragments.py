@@ -280,35 +280,37 @@ Before treating a suspicious value found in slab memory as proof of DMA origin:
    and require validated DMA range overlap (Step 2) before elevating confidence.
 
 ### Step 1: Confirm IOMMU Mode
-- Check vmcore-dmesg first for iommu, dmar, passthrough, translation, smmu patterns.
-- Prefer p saved_command_line over log-based command-line recovery.
-- Do not claim passthrough unless iommu=pt, default domain type identity, or equivalent runtime evidence is explicit.
-- If IOMMU mode cannot be proven from logs, probe runtime kernel variables when available and cap DMA confidence if still unverifiable.
-- On x86, if no Intel IOMMU or equivalent remapping evidence is present, you may treat DMA-address-equals-physical-address only as a conditional working assumption, not as a proven fact.
+- Confirm a symbol exists with `sym <name>` before reading it; a "No symbol" error is not
+  evidence about the feature, and must not by itself push the analysis to "unconfirmed".
+- Read the runtime flag first; it is decisive and does not depend on how much log survives:
+  - `p intel_iommu_enabled` on Intel VT-d: 0 means DMA remapping is disabled, so device DMA addresses are physical addresses.
+  - AMD-Vi has no `amd_iommu_enabled` symbol; `amd_iommu_disabled` is __initdata and may already be freed. On AMD use `struct device.iommu_group` on the suspect device and the iommu= value from `p saved_command_line`.
+- `p saved_command_line` recovers the boot command line even after the log ring buffer wrapped; prefer it over log-based recovery.
+- Treat dmesg as secondary: "DMAR: IOMMU enabled", "Intel-IOMMU: enabled", "iommu: Default domain type: Translated".
+- Do not claim passthrough unless iommu=pt, default domain type identity, or equivalent explicit evidence is present.
+- If the Intel flag reads 0, DMA translation is off: state "device DMA reaches physical memory directly" as a confirmed fact for this dump, not as an inference from missing log lines.
+- On a non-Intel platform, or when the Intel flag reads 1, the decisive check is the device that
+  issues the DMA: read `struct device.iommu_group` on the suspect writer (the HBA, NIC, or other
+  DMA-capable device), not only on the victim. NULL means that device belongs to no IOMMU group,
+  i.e. its DMA is not remapped.
+- Inspect the victim device's group as well, but only to compare containment or when the writer is
+  still unidentified; a stale DMA write is contained by the *writer's* domain, not the victim's.
 - Before labeling a value physical or DMA-backed, validate it against sys -m or kmem -i style memory-range evidence when available.
 
-**Strong IOMMU-enabled indicators (any one is sufficient to conclude IOMMU is operational):**
-- dmesg contains "DMAR: IOMMU enabled", "Intel-IOMMU: enabled", or "iommu: Default domain
-  type: Translated" -- these are conclusive.
-- The loaded module list contains vfio_iommu_type1 or vfio_iommu_type1_nesting -- VFIO
-  requires a functional IOMMU; its presence implies translation is active for at least the
-  passthrough devices. If the suspect device is NOT a VFIO-assigned device, check whether
-  the non-VFIO devices share the same IOMMU group or use a separate identity/passthrough
-  domain before concluding IOMMU covers the suspect device's DMA.
-- For MSI or MSI-X interrupts: examine the msi_desc for the relevant IRQ. If
-  msi_desc.msg.arch_addr_lo.dmar_format == 1 (VT-d remapping format), the interrupt is
-  routed through the DMAR remapping unit, which is strong evidence that VT-d is operational
-  on this platform. Note: interrupt remapping being active does NOT by itself prove DMA
-  remapping is enabled for the suspect device -- these are separate VT-d features -- but it
-  is a strong environmental signal that IOMMU is enabled system-wide.
-- struct device.iommu_group != NULL for the suspect PCI device confirms it is assigned to
-  an IOMMU group and subject to DMA remapping.
+**Do not treat these as IOMMU-enabled evidence (common wrong inferences):**
+- The module list containing vfio_iommu_type1 or vfio_iommu_type1_nesting. The module can be
+  loaded, or used in no-IOMMU mode, while DMA remapping is disabled; module presence proves
+  nothing about translation and must never be cited as such.
+- `msi_desc.msg.arch_addr_lo.dmar_format == 1`. That is the VT-d interrupt-remapping message
+  format. Interrupt remapping (visible as a pci_msi_ir_controller chip) and DMA remapping are
+  switched independently, so this is routinely 1 while `intel_iommu_enabled` is 0 and says
+  nothing about DMA translation.
+- A kernel-version-based default assumption.
 
-**If any strong IOMMU-enabled indicator is present**, DMA corruption confidence MUST be
-downgraded from medium to low until device-specific DMA remapping exclusion is completed:
-specifically, you must confirm whether the suspect device's IOMMU group uses a passthrough
-domain or a translated domain before concluding that a stray DMA write could reach an
-arbitrary physical page.
+**If translation is confirmed for the suspect device's domain**, DMA corruption confidence MUST
+be downgraded from medium to low until device-specific DMA remapping exclusion is completed:
+confirm whether the suspect device belongs to a passthrough domain or a translated domain
+before concluding that a stray DMA write could reach an arbitrary physical page.
 
 ### Step 2: Device DMA Configuration
 Sub-step A: inspect adjacent pages first when the target page is reserved or unreadable.
