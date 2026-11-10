@@ -82,31 +82,35 @@ class OpenActionClosureTests(unittest.TestCase):
 class SuspectCodeAuditTests(unittest.TestCase):
     def test_victim_file_is_reset_to_indeterminate(self) -> None:
         diagnosis = types.SimpleNamespace(
-            fix_suggestion=(
-                "treat /proc/interrupts readers as victims only - no change is "
-                "needed in kernel/irq/proc.c."
-            ),
             detailed_analysis="",
             suspect_code=types.SimpleNamespace(
                 file="kernel/irq/proc.c", function="show_interrupts", line="516"
             ),
         )
         step = types.SimpleNamespace(
-            final_diagnosis=diagnosis, reasoning="", additional_notes=None
+            final_diagnosis=diagnosis,
+            fix_suggestion=(
+                "treat /proc/interrupts readers as victims only - no change is "
+                "needed in kernel/irq/proc.c."
+            ),
+            reasoning="",
+            additional_notes=None,
         )
         result = _audit_suspect_code_consistency(step)
         self.assertEqual(result.final_diagnosis.suspect_code.file, "indeterminate")
 
     def test_unrelated_fix_text_is_left_alone(self) -> None:
         diagnosis = types.SimpleNamespace(
-            fix_suggestion="no change is needed in kernel/irq/proc.c",
             detailed_analysis="",
             suspect_code=types.SimpleNamespace(
                 file="drivers/scsi/mpt3sas/mpt3sas_base.c", function="x", line="1"
             ),
         )
         step = types.SimpleNamespace(
-            final_diagnosis=diagnosis, reasoning="", additional_notes=None
+            final_diagnosis=diagnosis,
+            fix_suggestion="no change is needed in kernel/irq/proc.c",
+            reasoning="",
+            additional_notes=None,
         )
         result = _audit_suspect_code_consistency(step)
         self.assertEqual(

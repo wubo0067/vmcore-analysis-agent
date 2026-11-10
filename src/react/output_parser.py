@@ -906,7 +906,10 @@ def _audit_suspect_code_consistency(
     if suspect is None or not getattr(suspect, "file", ""):
         return analysis_step
 
-    haystack = f"{diagnosis.fix_suggestion or ''}\n{diagnosis.detailed_analysis or ''}"
+    haystack = (
+        f"{analysis_step.fix_suggestion or ''}\n"
+        f"{diagnosis.detailed_analysis or ''}"
+    )
     exempt_files = {
         match.group(1).strip("`\"'").rstrip(".").lower()
         for match in _NO_CHANGE_NEEDED_RE.finditer(haystack)
