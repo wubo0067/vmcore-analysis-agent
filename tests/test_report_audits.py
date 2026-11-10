@@ -289,6 +289,41 @@ class LengthFailureDegradeTests(unittest.TestCase):
         self.assertEqual(config.max_output_tokens, 16_000)
         self.assertEqual(config.reasoning_effort, "low")
 
+    def test_threshold_zero_disables_the_breaker(self) -> None:
+        from src.react.llm_node import _budget_config_for_length_failures
+        from src.react.llm_runtime import LLMBudgetConfig
+
+        config = _budget_config_for_length_failures(
+            LLMBudgetConfig(), 10, threshold=0
+        )
+        self.assertTrue(config.thinking_enabled)
+        self.assertEqual(config.max_output_tokens, 48_000)
+        self.assertEqual(config.reasoning_effort, "max")
+
+    def test_custom_threshold_and_degraded_budget(self) -> None:
+        from src.react.llm_node import _budget_config_for_length_failures
+        from src.react.llm_runtime import LLMBudgetConfig
+
+        config = _budget_config_for_length_failures(
+            LLMBudgetConfig(),
+            1,
+            threshold=1,
+            max_output_tokens=8_000,
+            reasoning_effort="medium",
+            thinking=False,
+        )
+        self.assertEqual(config.max_output_tokens, 8_000)
+        self.assertEqual(config.reasoning_effort, "medium")
+
+    def test_degraded_budget_never_exceeds_configured_max(self) -> None:
+        from src.react.llm_node import _budget_config_for_length_failures
+        from src.react.llm_runtime import LLMBudgetConfig
+
+        config = _budget_config_for_length_failures(
+            LLMBudgetConfig(max_output_tokens=4_000), 2, max_output_tokens=16_000
+        )
+        self.assertEqual(config.max_output_tokens, 4_000)
+
     def test_truncated_log_handles_missing_completion(self) -> None:
         from src.react.llm_node import _log_truncated_completion
 

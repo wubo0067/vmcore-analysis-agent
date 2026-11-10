@@ -94,22 +94,31 @@ _LENGTH_FAILURE_DEGRADE_THRESHOLD = 2
 
 
 def _budget_config_for_length_failures(
-    config: LLMBudgetConfig, streak: int
+    config: LLMBudgetConfig,
+    streak: int,
+    *,
+    threshold: int = _LENGTH_FAILURE_DEGRADE_THRESHOLD,
+    max_output_tokens: int = _DEGRADED_MAX_OUTPUT_TOKENS,
+    reasoning_effort: str = "low",
+    thinking: bool = False,
 ) -> LLMBudgetConfig:
     """连续 length 失败达到阈值后，预先把本步降级。
 
     日志显示：命中 48K 的请求要烧 200 秒以上，而关闭 thinking 后同一提示
     7-15 秒就能返回。因此阈值之后本 run 剩余步骤保持降级（不因单次成功而
     回到可能再次爆炸的预算），代价是后续分析质量下降，换来不再反复空烧。
+
+    ``threshold <= 0`` 关闭熔断，始终返回原配置。阈值、降级预算与 effort
+    由 settings 注入，便于按部署策略调整。
     """
 
-    if streak < _LENGTH_FAILURE_DEGRADE_THRESHOLD:
+    if threshold <= 0 or streak < threshold:
         return config
     return replace(
         config,
-        thinking_enabled=False,
-        max_output_tokens=min(config.max_output_tokens, _DEGRADED_MAX_OUTPUT_TOKENS),
-        reasoning_effort="low",
+        thinking_enabled=thinking,
+        max_output_tokens=min(config.max_output_tokens, max_output_tokens),
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -224,13 +233,25 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
     # 本 run 内连续命中 max_tokens 的次数。达到阈值后预先把后续步骤降级，
     # 避免每次都先烧 200 秒才发现输出再次爆炸。
     length_failures = int(state.get("length_failure_streak", 0) or 0)
-    budget_config = _budget_config_for_length_failures(budget_config, length_failures)
-    if length_failures >= _LENGTH_FAILURE_DEGRADE_THRESHOLD:
+    budget_config = _budget_config_for_length_failures(
+        budget_config,
+        length_failures,
+        threshold=settings.reasoning_length_failure_threshold,
+        max_output_tokens=settings.reasoning_degraded_max_output_tokens,
+        reasoning_effort=settings.reasoning_degraded_reasoning_effort,
+        thinking=settings.reasoning_degraded_thinking,
+    )
+    if (
+        settings.reasoning_length_failure_threshold > 0
+        and length_failures >= settings.reasoning_length_failure_threshold
+    ):
         logger.warning(
-            "length_failure_streak=%s: running this step with thinking disabled, "
-            "max_tokens<=%s, effort=low.",
+            "length_failure_streak=%s: degraded budget active "
+            "(thinking=%s, max_tokens<=%s, effort=%s).",
             length_failures,
-            _DEGRADED_MAX_OUTPUT_TOKENS,
+            settings.reasoning_degraded_thinking,
+            settings.reasoning_degraded_max_output_tokens,
+            settings.reasoning_degraded_reasoning_effort,
         )
     system_message_obj = SystemMessage(content=system_message)
     try:

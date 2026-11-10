@@ -119,6 +119,8 @@ KERNEL_SOURCE_ROOT=
 | `KERNEL_SOURCE_ROOT` | No | Kernel source tree matching the analysed dump (or a directory of per-version trees). Used only when a request does not carry `kernel_source_root`. Enables `read_source` / `list_writers` / `git_history`; when empty, the agent reports that source could not be verified instead of quoting kernel code from memory |
 | `LANGSMITH_TRACING` | No | Enable LangSmith tracing; defaults to `false` |
 
+The length-failure circuit breaker is configurable: `REASONING_LENGTH_FAILURE_THRESHOLD` (default `2`; `0` disables it), `REASONING_DEGRADED_MAX_OUTPUT_TOKENS` (default `16000`), `REASONING_DEGRADED_REASONING_EFFORT` (default `low`) and `REASONING_DEGRADED_THINKING` (default `false`). Once the threshold is reached, later calls in the same run use the degraded budget, so an output rejected for length is not retried at full cost.
+
 Process environment variables take precedence over `.env`. The service fails during startup if a required model variable is missing or a setting is invalid. Do not commit `.env` files containing real credentials. MCP tools are discovered by the code; MCP server paths do not need to be added to `.env`.
 
 ### 3. Start the service

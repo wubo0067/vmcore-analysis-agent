@@ -105,6 +105,13 @@ class Settings:
     reasoning_min_thinking_output_tokens: int
     reasoning_history_keep: int
     langsmith_tracing: bool
+    # 连续 length 失败达到该次数后，本 run 剩余调用改用降级预算。
+    # 0 表示关闭熔断（始终使用常规预算）。
+    reasoning_length_failure_threshold: int = 2
+    # 降级预算：输出上限、reasoning effort、是否保留 thinking。
+    reasoning_degraded_max_output_tokens: int = 16_000
+    reasoning_degraded_reasoning_effort: str = "low"
+    reasoning_degraded_thinking: bool = False
     # Optional kernel source tree used by the kernel_source MCP tools.
     # Empty means source-level verification is unavailable for this deployment.
     kernel_source_root: str = ""
@@ -146,6 +153,10 @@ class Settings:
             "reasoning_min_thinking_output_tokens": self.reasoning_min_thinking_output_tokens,
             "reasoning_history_keep": self.reasoning_history_keep,
             "langsmith_tracing": self.langsmith_tracing,
+            "reasoning_length_failure_threshold": self.reasoning_length_failure_threshold,
+            "reasoning_degraded_max_output_tokens": self.reasoning_degraded_max_output_tokens,
+            "reasoning_degraded_reasoning_effort": self.reasoning_degraded_reasoning_effort,
+            "reasoning_degraded_thinking": self.reasoning_degraded_thinking,
             "kernel_source_root": self.kernel_source_root,
             "kernel_source_allowed_roots": self.kernel_source_allowed_roots,
         }
@@ -212,6 +223,16 @@ def get_settings() -> Settings:
         reasoning_min_thinking_output_tokens=min_thinking_output_tokens,
         reasoning_history_keep=_parse_int("REASONING_HISTORY_KEEP", 2, 0),
         langsmith_tracing=_parse_bool("LANGSMITH_TRACING", False),
+        reasoning_length_failure_threshold=_parse_int(
+            "REASONING_LENGTH_FAILURE_THRESHOLD", 2, 0
+        ),
+        reasoning_degraded_max_output_tokens=_parse_int(
+            "REASONING_DEGRADED_MAX_OUTPUT_TOKENS", 16_000, 1
+        ),
+        reasoning_degraded_reasoning_effort=_optional(
+            "REASONING_DEGRADED_REASONING_EFFORT", "low"
+        ).lower(),
+        reasoning_degraded_thinking=_parse_bool("REASONING_DEGRADED_THINKING", False),
         kernel_source_root=_optional("KERNEL_SOURCE_ROOT", ""),
         kernel_source_allowed_roots=_optional("KERNEL_SOURCE_ALLOWED_ROOTS", ""),
     )
