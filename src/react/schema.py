@@ -261,6 +261,27 @@ _SIGNATURE_CLASS_ALIASES: dict[str, str] = {
 }
 
 
+def _coerce_partial_dump(data: Any) -> Any:
+    """把 partial_dump 的 null/空串/未知值统一归一化为 "unknown"。
+
+    模型常用 null 表示"尚未判定"，而该字段是 Literal["full","partial","unknown"]。
+    显式 null 会让整条结构化响应（连同其中合法的 action）一起校验失败，日志中
+    step 45 的 12 条有效命令就是这样丢掉的。
+    """
+
+    if not isinstance(data, dict) or "partial_dump" not in data:
+        return data
+
+    allowed = set(get_partial_dump_values())
+    value = data.get("partial_dump")
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        data["partial_dump"] = lowered if lowered in allowed else "unknown"
+    else:
+        data["partial_dump"] = "unknown"
+    return data
+
+
 def _coerce_signature_class(data: Any) -> Any:
     """对 signature_class 做有边界的容错归一化，防止 LLM 未知值中断管线。"""
     if not isinstance(data, dict):
@@ -597,6 +618,7 @@ class VMCoreLLMAnalysisStep(BaseModel):
         data = _coerce_signature_class(data)
         data = _coerce_root_cause_class(data)
         data = _coerce_corruption_mechanism(data, root_cause_field="root_cause_class")
+        data = _coerce_partial_dump(data)
         return _coerce_confidence(data)
 
 
@@ -892,6 +914,7 @@ class VMCoreAnalysisStep(BaseModel):
             legacy_value = data.get("crash_class")
             if legacy_value is not None:
                 data["signature_class"] = legacy_value
+        data = _coerce_partial_dump(data)
         return _coerce_confidence(data)
 
     reasoning: str = Field(

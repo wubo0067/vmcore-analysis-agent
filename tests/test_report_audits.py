@@ -204,5 +204,121 @@ class OpenActionLifecycleTests(unittest.TestCase):
         self.assertEqual(merged[0]["expired_at"], 10)
 
 
+class SchemaToleranceTests(unittest.TestCase):
+    """A null optional-enum must not discard an otherwise valid action."""
+
+    def _payload(self, partial_dump: object) -> dict:
+        return {
+            "step_id": 45,
+            "reasoning": "batch plan",
+            "action": {
+                "command_name": "run_script",
+                "arguments": ["p/x ((struct A *)0x1)->x", "p/x ((struct A *)0x2)->x"],
+            },
+            "is_conclusive": False,
+            "signature_class": "pointer_corruption",
+            "partial_dump": partial_dump,
+        }
+
+    def test_null_partial_dump_keeps_the_action(self) -> None:
+        from src.react.schema import VMCoreLLMAnalysisStep
+
+        step = VMCoreLLMAnalysisStep.model_validate(self._payload(None))
+        self.assertEqual(step.partial_dump, "unknown")
+        self.assertIsNotNone(step.action)
+        self.assertEqual(len(step.action.arguments), 2)
+
+    def test_unknown_partial_dump_string_is_normalized(self) -> None:
+        from src.react.schema import VMCoreLLMAnalysisStep
+
+        step = VMCoreLLMAnalysisStep.model_validate(self._payload("banana"))
+        self.assertEqual(step.partial_dump, "unknown")
+
+    def test_valid_partial_dump_is_preserved(self) -> None:
+        from src.react.schema import VMCoreLLMAnalysisStep
+
+        step = VMCoreLLMAnalysisStep.model_validate(self._payload("partial"))
+        self.assertEqual(step.partial_dump, "partial")
+
+
+class ShellSyntaxRejectionTests(unittest.TestCase):
+    def test_shell_loop_with_variable_is_rejected_with_guidance(self) -> None:
+        from src.react.action_guard import validate_tool_call_request
+
+        message = validate_tool_call_request(
+            "run_script", {"script": "for a in 0x1 0x2; do p $a; done"}
+        )
+        self.assertIsNotNone(message)
+        self.assertIn("one crash command per line", message)
+
+    def test_shell_loop_without_variable_is_rejected(self) -> None:
+        from src.react.action_guard import validate_tool_call_request
+
+        message = validate_tool_call_request(
+            "run_script", {"script": "for a in 1 2; do p a; done"}
+        )
+        self.assertIsNotNone(message)
+        self.assertIn("one crash command per line", message)
+
+    def test_structure_prompt_forbids_shell_syntax(self) -> None:
+        from src.react.prompts import simplified_structure_reasoning_prompt
+
+        text = simplified_structure_reasoning_prompt()
+        self.assertIn("Never emit shell syntax", text)
+        self.assertIn("2>/dev/null", text)
+
+
+class LengthFailureDegradeTests(unittest.TestCase):
+    """A repeated 48K blow-up must degrade preemptively instead of burning 200s."""
+
+    def test_single_failure_keeps_normal_budget(self) -> None:
+        from src.react.llm_node import _budget_config_for_length_failures
+        from src.react.llm_runtime import LLMBudgetConfig
+
+        config = _budget_config_for_length_failures(LLMBudgetConfig(), 1)
+        self.assertTrue(config.thinking_enabled)
+        self.assertEqual(config.max_output_tokens, 48_000)
+        self.assertEqual(config.reasoning_effort, "max")
+
+    def test_second_failure_degrades(self) -> None:
+        from src.react.llm_node import _budget_config_for_length_failures
+        from src.react.llm_runtime import LLMBudgetConfig
+
+        config = _budget_config_for_length_failures(LLMBudgetConfig(), 2)
+        self.assertFalse(config.thinking_enabled)
+        self.assertEqual(config.max_output_tokens, 16_000)
+        self.assertEqual(config.reasoning_effort, "low")
+
+    def test_truncated_log_handles_missing_completion(self) -> None:
+        from src.react.llm_node import _log_truncated_completion
+
+        _log_truncated_completion(ValueError("no completion here"))
+
+    def test_truncated_log_handles_empty_choices(self) -> None:
+        import types
+
+        from src.react.llm_node import _log_truncated_completion
+
+        _log_truncated_completion(
+            types.SimpleNamespace(completion=types.SimpleNamespace(choices=[]))
+        )
+
+    def test_truncated_log_reads_content_and_reasoning(self) -> None:
+        import types
+
+        from src.react.llm_node import _log_truncated_completion
+
+        message = types.SimpleNamespace(
+            content='{"step_id": 1, "reasoning": "x"}', reasoning_content="thinking"
+        )
+        _log_truncated_completion(
+            types.SimpleNamespace(
+                completion=types.SimpleNamespace(
+                    choices=[types.SimpleNamespace(message=message)]
+                )
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

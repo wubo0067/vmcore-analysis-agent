@@ -105,6 +105,9 @@ class AgentState(MessagesState):
     # 已过期（3 步内未成功重跑）的未闭环动作。它们不再阻塞结论，但必须作为
     # caveat 写进报告——过期只能"解除阻塞"，不能"静默遗忘"。
     expired_unresolved: list[dict[str, object]]
+    # 本 run 内连续命中 max_tokens 的次数。达到阈值后后续步骤预先降级为
+    # thinking 关闭 + 小输出预算，避免每次先烧 200 秒才发现输出再次爆炸。
+    length_failure_streak: int
     # 每条 value_conflict 已累计处理的次数，用于超限后降噪并保留 residual caveat。
     value_conflict_audit_counts: dict[str, int]
     replan_required: bool

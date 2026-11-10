@@ -146,6 +146,10 @@ def simplified_structure_reasoning_prompt() -> str:
         '{{"command_name": "list_writers", "parameters": {{"field": "sk_state"}}}}, '
         'or {{"command_name": "resolve_stack_canary_slot", "arguments": ["search_module_extables"]}}. '
         "For read_source / grep_source / list_writers / git_history / source_status always use 'parameters', never 'arguments'. "
+        "For 'run_script', each element of 'arguments' must be exactly ONE crash command line. "
+        "Never emit shell syntax inside it: no for/while/if constructs, no ';' command separators, "
+        "no '&&' or '||', no redirection such as 2>/dev/null, and no shell variables. "
+        "To run several commands, list each one as its own separate element.\n"
         "Otherwise set it to null. Do NOT return action as a string.\n"
         "4. 'is_conclusive': Set to true ONLY if the reasoning explicitly states a final conclusion with root cause. "
         "Otherwise set to false.\n"

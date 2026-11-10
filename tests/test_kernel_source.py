@@ -494,6 +494,58 @@ def test_run_script_promotion_uses_structured_parameters(self) -> None:
         self.assertEqual(result.action.arguments, [])
 
 
+class FindStructTests(KernelSourceTestCase):
+    def _write_header(self) -> Path:
+        header = self.tree / "drivers" / "net" / "demo.h"
+        header.write_text(
+            "struct demo {\n"
+            "\tint a;\n"
+            "\tint b;\n"
+            "\tstruct {\n"
+            "\t\tint c;\n"
+            "\t} inner;\n"
+            "};\n",
+            encoding="utf-8",
+        )
+        return header
+
+    def test_returns_definition_and_source_ref(self) -> None:
+        self._write_header()
+        with self._env(self.tree):
+            output = tools.find_struct_impl("demo")
+        self.assertIn("SOURCE_STRUCT type=demo", output)
+        self.assertIn("int b;", output)
+        self.assertIn("} inner;", output)
+        self.assertIn("SOURCE_REF: drivers/net/demo.h:1", output)
+
+    def test_comment_braces_do_not_end_the_definition(self) -> None:
+        header = self.tree / "drivers" / "net" / "demo.h"
+        header.write_text(
+            "struct demo {\n"
+            "\tint a; /* brace in comment: } */\n"
+            "\tchar *s; /* string brace: \"}\" */\n"
+            "\tint last;\n"
+            "};\n",
+            encoding="utf-8",
+        )
+        with self._env(self.tree):
+            output = tools.find_struct_impl("demo")
+        self.assertIn("int last;", output)
+        self.assertIn("};", output)
+        self.assertNotIn("truncated", output)
+
+    def test_unknown_type_is_reported(self) -> None:
+        with self._env(self.tree):
+            output = tools.find_struct_impl("no_such_struct")
+        self.assertIn("SOURCE_ERROR", output)
+        self.assertIn("not found", output)
+
+    def test_invalid_type_name_is_rejected(self) -> None:
+        with self._env(self.tree):
+            output = tools.find_struct_impl("../etc/passwd")
+        self.assertIn("SOURCE_ERROR", output)
+
+
 class EvidenceHookTests(unittest.TestCase):
     def test_source_ref_fact_is_extracted_without_command_syntax(self) -> None:
         facts = extract_evidence_facts(

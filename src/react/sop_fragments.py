@@ -339,6 +339,10 @@ HBAs), an ownership test on one instance cannot support a global claim such as
 "no controller's DMA range covers this page". Enumerate every instance whose DMA
 window can contain the suspect physical address, or state explicitly which
 instances were not checked and bound the claim to the instance actually tested.
+Batch the reads: once the instance list is known, read the same field for every
+instance in ONE run_script (one crash command per line), not one step per
+instance. A per-instance step is acceptable only while the instance list itself
+is still being discovered.
 Sub-step A: inspect adjacent pages first when the target page is reserved or unreadable.
 - Use ptov and vtop on neighboring pages.
 - If readable, dump both hex and ASCII and look for device fingerprints such as Ethernet headers, mlx5 CQE blocks, NVMe CQE or SQE patterns, or qla2xxx IOCB signatures.

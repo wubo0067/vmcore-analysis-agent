@@ -89,6 +89,63 @@ _LENGTH_RECOVERY_DIRECTIVE = (
 )
 
 
+_DEGRADED_MAX_OUTPUT_TOKENS = 16_000
+_LENGTH_FAILURE_DEGRADE_THRESHOLD = 2
+
+
+def _budget_config_for_length_failures(
+    config: LLMBudgetConfig, streak: int
+) -> LLMBudgetConfig:
+    """连续 length 失败达到阈值后，预先把本步降级。
+
+    日志显示：命中 48K 的请求要烧 200 秒以上，而关闭 thinking 后同一提示
+    7-15 秒就能返回。因此阈值之后本 run 剩余步骤保持降级（不因单次成功而
+    回到可能再次爆炸的预算），代价是后续分析质量下降，换来不再反复空烧。
+    """
+
+    if streak < _LENGTH_FAILURE_DEGRADE_THRESHOLD:
+        return config
+    return replace(
+        config,
+        thinking_enabled=False,
+        max_output_tokens=min(config.max_output_tokens, _DEGRADED_MAX_OUTPUT_TOKENS),
+        reasoning_effort="low",
+    )
+
+
+def _log_truncated_completion(exc: object) -> None:
+    """记录 length 失败响应的首尾片段，用于区分 JSON 复读与正文膨胀。
+
+    completion / choices / message 都可能缺失（上游网关或 SDK 版本差异），
+    因此逐层判空；否则宽泛的 except 会把整个日志功能静默变成空内容。
+    """
+
+    completion = getattr(exc, "completion", None)
+    choices = getattr(completion, "choices", None) or []
+    content = ""
+    reasoning = ""
+    if choices:
+        message = getattr(choices[0], "message", None)
+        raw_content = getattr(message, "content", None)
+        if isinstance(raw_content, str):
+            content = raw_content
+        elif raw_content is not None:
+            content = str(raw_content)
+        raw_reasoning = getattr(message, "reasoning_content", None)
+        if isinstance(raw_reasoning, str):
+            reasoning = raw_reasoning
+
+    head = content[:2000]
+    tail = content[-2000:] if len(content) > 2000 else ""
+    logger.error(
+        "Length-limit partial content (%s chars, reasoning %s chars) head=%r tail=%r",
+        len(content),
+        len(reasoning),
+        head,
+        tail,
+    )
+
+
 def _reasoning_signals_convergence(reasoning: str) -> bool:
     lowered = (reasoning or "").lower()
     return any(
@@ -164,6 +221,17 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
         reasoning_effort=settings.reasoning_effort,
         reasoning_history_keep=settings.reasoning_history_keep,
     )
+    # 本 run 内连续命中 max_tokens 的次数。达到阈值后预先把后续步骤降级，
+    # 避免每次都先烧 200 秒才发现输出再次爆炸。
+    length_failures = int(state.get("length_failure_streak", 0) or 0)
+    budget_config = _budget_config_for_length_failures(budget_config, length_failures)
+    if length_failures >= _LENGTH_FAILURE_DEGRADE_THRESHOLD:
+        logger.warning(
+            "length_failure_streak=%s: running this step with thinking disabled, "
+            "max_tokens<=%s, effort=low.",
+            length_failures,
+            _DEGRADED_MAX_OUTPUT_TOKENS,
+        )
     system_message_obj = SystemMessage(content=system_message)
     try:
         compressed_messages, budget = prepare_messages_for_llm(
@@ -176,6 +244,7 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
         return {
             "step_count": 1,
             "token_usage": 0,
+            "length_failure_streak": length_failures,
             "error": {
                 "message": str(exc),
                 "node": llm_analysis_node,
@@ -283,6 +352,8 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
             logger.warning(
                 f"LLM output hit max_tokens (completion budget exhausted): {exc}"
             )
+            length_failures += 1
+            _log_truncated_completion(exc)
             exc_usage = getattr(getattr(exc, "completion", None), "usage", None)
             exc_prompt_tokens = getattr(exc_usage, "prompt_tokens", None)
             if isinstance(exc_prompt_tokens, int) and exc_prompt_tokens > 0:
@@ -503,6 +574,7 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
         return {
             "step_count": 1,
             "token_usage": curr_token_usage,
+            "length_failure_streak": length_failures,
             "error": {
                 "message": str(e),
                 "node": llm_analysis_node,
@@ -515,6 +587,7 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
         "token_usage": curr_token_usage,
         "messages": [response],
         **managed_updates,
+        "length_failure_streak": length_failures,
         # 模型已显式核对的取值级矛盾不再保留在状态中（见 unresolved_value_conflicts）。
         "value_conflicts": remaining_value_conflicts,
         "value_conflict_audit_counts": audit_counts,

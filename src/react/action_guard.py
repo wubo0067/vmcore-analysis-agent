@@ -390,7 +390,21 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
 
     # 检查是否包含禁止的表达式（shell 变量、寄存器等）
     if _FORBIDDEN_EXPR_RE.search(normalized):
-        return f"forbidden shell/register expression in crash command: {normalized}"
+        return (
+            "forbidden shell/register expression in crash command: "
+            f"{normalized}. run_script executes each argument as ONE crash command; "
+            "emit one crash command per line and do not use for/while/if, ';', "
+            "'&&', redirection (2>/dev/null) or shell variables."
+        )
+
+    if re.match(r"^\s*(?:for|while|if)\b", normalized) or re.search(
+        r";\s*(?:for|while|if)\b", normalized
+    ):
+        return (
+            "shell control flow is not executable by crash: "
+            f"{normalized}. run_script runs each argument as one crash command; "
+            "expand the loop yourself and emit one crash command per line."
+        )
 
     # 地址算术只检查首个 pipe 之前的 crash 命令主体，避免把 grep tail
     # 中的选项或模式误判成 "identifier - identifier" 一类算术表达式。

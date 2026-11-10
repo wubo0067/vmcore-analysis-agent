@@ -406,3 +406,164 @@ def git_history_impl(
     if len(output) > MAX_OUTPUT_CHARS:
         output = output[:MAX_OUTPUT_CHARS] + "\n[truncated]"
     return f"{header}\n{output}"
+
+
+_STRUCT_DECL_RE = re.compile(r"^\s*struct\s+(?P<name>[A-Za-z_]\w*)\b")
+
+
+def _code_without_comments(line: str, in_block_comment: bool) -> tuple[str, bool]:
+    """Strip C comments and string/char literals from one line.
+
+    Brace counting on raw text ends the definition early at a ``}`` inside a
+    comment or a string literal. Only code braces may affect nesting depth.
+    """
+
+    out: list[str] = []
+    index = 0
+    length = len(line)
+    in_string = False
+    in_char = False
+
+    while index < length:
+        char = line[index]
+        following = line[index + 1] if index + 1 < length else ""
+
+        if in_block_comment:
+            if char == "*" and following == "/":
+                in_block_comment = False
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if in_string:
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if in_char:
+            if char == "\\":
+                index += 2
+                continue
+            if char == "'":
+                in_char = False
+            index += 1
+            continue
+
+        if char == "/" and following == "*":
+            in_block_comment = True
+            index += 2
+            continue
+        if char == "/" and following == "/":
+            break
+        if char == '"':
+            in_string = True
+            index += 1
+            continue
+        if char == "'":
+            in_char = True
+            index += 1
+            continue
+
+        out.append(char)
+        index += 1
+
+    return "".join(out), in_block_comment
+
+
+def find_struct_impl(
+    type_name: str,
+    kver: str = "",
+    prefix: str = "",
+    source_root: str = "",
+    max_lines: int = 120,
+) -> str:
+    """Return the full definition body of one struct type in a single hop.
+
+    Looking up a member name normally costs a grep followed by a read; the
+    definition itself answers every member question at once, so this tool
+    exists to remove that alternation.
+    """
+
+    name = str(type_name or "").strip().strip("'\"")
+    if not re.fullmatch(r"[A-Za-z_]\w*", name):
+        return f"SOURCE_ERROR invalid struct type name: {type_name!r}"
+
+    tree, error = _tree_or_error(kver, source_root)
+    if tree is None:
+        return f"SOURCE_ERROR {error}"
+
+    limit = max(10, min(int(max_lines or 120), 400))
+    needle = name.encode()
+
+    def _scan(path: Path) -> Optional[str]:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        if needle not in raw or not _is_probably_text(raw):
+            return None
+
+        lines = raw.decode("utf-8", errors="replace").splitlines()
+        for index, line in enumerate(lines):
+            decl = _STRUCT_DECL_RE.match(line)
+            if decl is None or decl.group("name") != name:
+                continue
+            # The opening brace may sit on the next line (kernel style allows both).
+            # Detect it on comment-stripped code so a "{ /* } */" comment cannot
+            # masquerade as the body.
+            code_line, decl_block = _code_without_comments(line, False)
+            if "{" in code_line:
+                brace_index = index
+                start_in_block = False
+            elif index + 1 < len(lines) and "{" in _code_without_comments(
+                lines[index + 1], decl_block
+            )[0]:
+                brace_index = index + 1
+                start_in_block = decl_block
+            else:
+                continue
+
+            body: list[str] = []
+            depth = 0
+            in_block_comment = start_in_block
+            for offset in range(brace_index, min(len(lines), brace_index + limit)):
+                current = lines[offset]
+                code, in_block_comment = _code_without_comments(
+                    current, in_block_comment
+                )
+                depth += code.count("{") - code.count("}")
+                body.append(f"{offset + 1:6d}| {current}")
+                if depth <= 0:
+                    break
+
+            rel = relative_name(tree, path)
+            header = (
+                f"{_status_block(tree)}\n"
+                f"SOURCE_STRUCT type={name} file={rel} "
+                f"lines={brace_index + 1}-{brace_index + len(body)}\n"
+                f"SOURCE_REF: {rel}:{index + 1}\n"
+            )
+            output = header + "\n".join(body)
+            if len(body) >= limit:
+                output += "\n[truncated: definition longer than max_lines]"
+            return output
+        return None
+
+    # Headers first: almost every kernel struct is defined in a .h file.
+    for wanted in ({".h"}, {".c", ".cc", ".S"}):
+        for path in _iter_source_files(tree, prefix):
+            if path.suffix not in wanted:
+                continue
+            found = _scan(path)
+            if found is not None:
+                return found
+
+    return (
+        f"SOURCE_ERROR struct {name} not found in the configured tree; "
+        "try grep_source with the member name or a broader prefix"
+    )

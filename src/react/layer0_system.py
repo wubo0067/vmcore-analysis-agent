@@ -537,6 +537,9 @@ a tree whose version differs is rejected instead of silently answering.
   of candidate writers instead of a guess.
 - **git_history(file, kver, start_line, end_line)**: commits that touched a
   code range, used to judge whether a fix is already in this tree.
+- **find_struct(type_name, kver, prefix)**: return one struct's full definition
+  body. Use it whenever you need a member name: one call replaces the
+  grep-then-read alternation.
 
 Calling convention:
 
@@ -565,6 +568,10 @@ Rules:
   backport status without `git_history` output.
 - `list_writers` returns candidates, not proof. Name a writer only after the
   runtime value is shown to be consistent with that specific site.
+- Looking up a struct member name is ONE hop, not a grep/read alternation: call
+  `find_struct` for the type, or one `grep_source` whose regex covers the
+  plausible member names over the driver directory. Never spend a step per
+  guessed member name; if the type is module-private, load its debuginfo first.
 
 ================================================================================
 # PART 4: ERROR RECOVERY & ADVANCED FORENSICS

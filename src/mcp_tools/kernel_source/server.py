@@ -12,6 +12,7 @@ from __future__ import annotations
 from fastmcp import FastMCP
 
 from .tools import (
+    find_struct_impl,
     git_history_impl,
     grep_source_impl,
     list_writers_impl,
@@ -145,6 +146,32 @@ def git_history(
         end_line=end_line,
         max_commits=max_commits,
         source_root=source_root,
+    )
+
+
+@kernel_source_server.tool()
+def find_struct(
+    type_name: str,
+    kver: str = "",
+    prefix: str = "",
+    source_root: str = "",
+    max_lines: int = 120,
+) -> str:
+    """Return a struct's full definition body in ONE call.
+
+    Use this instead of alternating grep_source and read_source when you need a
+    member name: the definition answers every member question at once.
+    `prefix` narrows the search (e.g. drivers/scsi/mpt3sas); headers are searched
+    first. Emits a SOURCE_REF line.
+    `source_root` is injected by the runtime; do not set it yourself.
+    """
+
+    return find_struct_impl(
+        type_name=type_name,
+        kver=kver,
+        prefix=prefix,
+        source_root=source_root,
+        max_lines=max_lines,
     )
 
 
