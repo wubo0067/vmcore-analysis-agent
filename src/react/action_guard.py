@@ -655,6 +655,64 @@ def build_mod_s_prelude(debug_symbol_paths: Optional[Iterable[str]]) -> list[str
     ]
 
 
+_MODULE_TYPE_RE = re.compile(r"\bstruct\s+(?P<type>[A-Za-z_]\w*)")
+
+
+def detect_module_types(lines: Iterable[str]) -> set[str]:
+    """收集一段脚本里被引用的结构体类型名（``struct X`` / ``((struct X *)``）。"""
+
+    types: set[str] = set()
+    for line in lines:
+        for match in _MODULE_TYPE_RE.finditer(str(line)):
+            types.add(match.group("type"))
+    return types
+
+
+def module_candidates_for_type(
+    type_name: str, loaded_modules: Optional[Iterable[str]]
+) -> list[str]:
+    """按"模块名出现在类型名里"匹配已加载模块，最长匹配优先。
+
+    ``MPT3SAS_ADAPTER`` -> ``mpt3sas``，``mlx5_core_dev`` -> ``mlx5_core``（而不是 ``mlx5``）。
+    """
+
+    lowered = str(type_name or "").lower()
+    if not lowered:
+        return []
+    matches = [
+        str(module)
+        for module in (loaded_modules or [])
+        if str(module) and str(module).lower() in lowered
+    ]
+    matches.sort(key=len, reverse=True)
+    return matches
+
+
+def missing_module_preludes(
+    lines: Iterable[str], loaded_modules: Optional[Iterable[str]]
+) -> list[str]:
+    """返回脚本引用、但脚本自身没有 ``mod -s`` 前导的已加载模块。
+
+    只在能确定模块归属时返回；无法匹配到已加载模块的类型（例如内核核心
+    ``struct irq_desc``）不会触发，避免给正常脚本强加无意义的 ``mod -s``。
+    """
+
+    script_lines = [str(line) for line in lines]
+    if not script_lines or not loaded_modules:
+        return []
+
+    script_text = "\n".join(script_lines).lower()
+    needed: list[str] = []
+    for type_name in sorted(detect_module_types(script_lines)):
+        for module in module_candidates_for_type(type_name, loaded_modules):
+            if f"mod -s {module.lower()}" in script_text:
+                break  # 已有该模块的前导
+            if module not in needed:
+                needed.append(module)
+            break  # 最长匹配就是最佳候选
+    return needed
+
+
 def _uses_module_specific_symbol(
     lines: Iterable[str], *, debug_symbol_paths: Optional[Iterable[str]] = None
 ) -> bool:

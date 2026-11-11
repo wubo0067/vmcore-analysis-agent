@@ -73,6 +73,182 @@ _GATE_COMPLETION_CRITERIA: dict[str, list[str]] = {
     ],
 }
 
+MAX_GATE_EVIDENCE_FACTS_PER_CATEGORY = 8
+
+_EVIDENCE_SUMMARY_LINE_RE = re.compile(
+    r"^(?P<marker>\[(?:executor-evidence|evidence-delta)\] )"
+    r"(?P<category>[a-z0-9_]+): \.\.\. \(\+(?P<count>\d+) more\)$"
+)
+_EVIDENCE_FACT_LINE_RE = re.compile(
+    r"^(?P<marker>\[(?:executor-evidence|evidence-delta)\] )"
+    r"(?P<fact>(?P<category>[a-z0-9_]+):.+)$"
+)
+
+
+_PINNED_ADDRESS_RE = re.compile(r"\b(?:0[xX])?[0-9a-fA-F]{8,16}\b")
+
+
+def extract_pinned_addresses(state: Mapping[str, Any] | None) -> list[str]:
+    """从 state 的 current_evidence_goal / current_action_intent 的 target_object 提取十六进制目标地址（支持带或不带 0x/0X 前缀，过滤 <8 位的短偏移并按出现顺序去重）。"""
+    if not state:
+        return []
+    target_object_str = " ".join(
+        str(val)
+        for val in (
+            (state.get("current_evidence_goal") or {}).get("target_object"),
+            (state.get("current_action_intent") or {}).get("target_object"),
+        )
+        if val
+    )
+    seen: set[str] = set()
+    result: list[str] = []
+    for tok in _PINNED_ADDRESS_RE.findall(target_object_str):
+        key = tok.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(tok)
+    return result
+
+
+def _closure_pinned_addresses(
+    gate_name: str,
+    facts: Iterable[str],
+) -> set[str]:
+    """提取触发 object_lifetime 门控闭合的交集地址，以便在截断时作为 pinned 地址优先保留。"""
+    if gate_name != "object_lifetime":
+        return set()
+    fact_list = list(facts)
+    kmem_addrs = {
+        fact.split(":", 1)[1].split("=", 1)[0]
+        for fact in fact_list
+        if fact.startswith("kmem_slab_state:") and "=" in fact
+    }
+    rd_addrs = {
+        fact.split(":", 1)[1].split("=", 1)[0]
+        for fact in fact_list
+        if fact.startswith("rd_word:") and "=" in fact
+    }
+    return kmem_addrs & rd_addrs
+
+
+def _display_order(facts: list[str], pinned: set[str]) -> list[str]:
+    """将匹配当前证据目标地址（pinned）的事实排到桶尾，使截断时优先保留（按十六进制词边界精确匹配，兼容带/不带 0x）。"""
+    if not pinned:
+        return sorted(facts)
+    hex_tokens = [
+        addr[2:] if addr.lower().startswith("0x") else addr
+        for addr in sorted(pinned)
+        if addr
+    ]
+    if not hex_tokens:
+        return sorted(facts)
+    pinned_re = re.compile(
+        rf"(?<![0-9a-f])(?:0x)?(?:{'|'.join(re.escape(tok) for tok in hex_tokens)})(?![0-9a-f])",
+        re.IGNORECASE,
+    )
+    return sorted(
+        facts,
+        key=lambda f: (bool(pinned_re.search(f)), f),
+    )
+
+
+def _append_bounded_gate_evidence(
+    existing_evidence: str | None,
+    new_facts: Iterable[str],
+    *,
+    marker: str,
+    max_per_category: int = MAX_GATE_EVIDENCE_FACTS_PER_CATEGORY,
+    pinned: Iterable[str] = (),
+) -> str:
+    """仅在展示层对 gate.evidence 按事实类别截断，保留每类最多 N 条（优先保留目标地址与闭合交集）并重算 (+K more)。"""
+    plain_lines: list[str] = []
+    buckets: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for line in (existing_evidence or "").splitlines():
+        if not line.strip():
+            continue
+        summary_match = _EVIDENCE_SUMMARY_LINE_RE.match(line)
+        if summary_match:
+            key = (summary_match.group("marker"), summary_match.group("category"))
+            bucket = buckets.setdefault(
+                key,
+                {
+                    "facts": [],
+                    "seen": set(),
+                    "existing_facts": [],
+                    "incoming_seen": set(),
+                    "omitted_seed": 0,
+                },
+            )
+            bucket["omitted_seed"] += int(summary_match.group("count"))
+            continue
+
+        fact_match = _EVIDENCE_FACT_LINE_RE.match(line)
+        if fact_match:
+            key = (fact_match.group("marker"), fact_match.group("category"))
+            bucket = buckets.setdefault(
+                key,
+                {
+                    "facts": [],
+                    "seen": set(),
+                    "existing_facts": [],
+                    "incoming_seen": set(),
+                    "omitted_seed": 0,
+                },
+            )
+            fact = fact_match.group("fact")
+            if fact not in bucket["seen"]:
+                bucket["seen"].add(fact)
+                bucket["facts"].append(fact)
+                bucket["existing_facts"].append(fact)
+            continue
+
+        plain_lines.append(line)
+
+    for fact in new_facts:
+        category = fact.split(":", 1)[0] if ":" in fact else "misc"
+        key = (marker, category)
+        bucket = buckets.setdefault(
+            key,
+            {
+                "facts": [],
+                "seen": set(),
+                "existing_facts": [],
+                "incoming_seen": set(),
+                "omitted_seed": 0,
+            },
+        )
+        bucket["incoming_seen"].add(fact)
+        if fact not in bucket["seen"]:
+            bucket["seen"].add(fact)
+            bucket["facts"].append(fact)
+
+    pinned_set = {
+        str(addr).strip().lower() for addr in (pinned or ()) if str(addr).strip()
+    }
+    rendered_lines = list(plain_lines)
+    for (line_marker, category), bucket in buckets.items():
+        ordered = _display_order(bucket["facts"], pinned_set)
+        display = ordered[-max_per_category:]
+        existing_facts: list[str] = bucket["existing_facts"]
+        incoming_seen: set[str] = bucket["incoming_seen"]
+        omitted_seed: int = bucket["omitted_seed"]
+        # 仅用于同一批次幂等重放时避免将已省略项重复计入 omitted_seed；
+        # 生产路径每次只传增量 evidence_delta，不会命中该重置分支。
+        if (
+            omitted_seed > 0
+            and existing_facts
+            and set(existing_facts).issubset(incoming_seen)
+            and len(incoming_seen) == len(existing_facts) + omitted_seed
+        ):
+            omitted_seed = 0
+        omitted = omitted_seed + max(0, len(ordered) - len(display))
+        rendered_lines.extend(f"{line_marker}{fact}" for fact in display)
+        if omitted > 0:
+            rendered_lines.append(f"{line_marker}{category}: ... (+{omitted} more)")
+
+    return "\n".join(rendered_lines).strip()
+
 
 def gate_completion_criteria(
     gate_name: str, required_for: Iterable[str] = ()
@@ -153,6 +329,15 @@ def evaluate_gate_closures(
         gate.completion_criteria = gate_completion_criteria(
             gate_name, required_for
         )  # 设置该门控的完成准则
+        gate_fact_count: int | None = None
+
+        def _get_gate_fact_count() -> int:
+            nonlocal gate_fact_count
+            if gate_fact_count is None:
+                gate_fact_count = sum(
+                    1 for fact in fact_set if _fact_supports_gate(fact, gate_name)
+                )
+            return gate_fact_count
 
         if prior_status == "closed" and prior_basis == "executor_evidence":
             gate.status = prior_status
@@ -165,12 +350,16 @@ def evaluate_gate_closures(
         ):
             gate.status = "closed"
             gate.closure_basis = "executor_evidence"
-            executor_facts = sorted(
+            gate_facts = [
                 fact for fact in fact_set if _fact_supports_gate(fact, gate_name)
-            )
-            if executor_facts:
-                gate.evidence = "\n".join(
-                    f"[executor-evidence] {fact}" for fact in executor_facts
+            ]
+            gate_fact_count = len(gate_facts)
+            if gate_facts:
+                gate.evidence = _append_bounded_gate_evidence(
+                    None,
+                    gate_facts,
+                    marker="[executor-evidence] ",
+                    pinned=_closure_pinned_addresses(gate_name, gate_facts),
                 )
         else:
             gate.status = (
@@ -188,14 +377,12 @@ def evaluate_gate_closures(
                         "reason": "completion criteria not satisfied by structured evidence",
                         "requested_status": requested_status,
                         "requested_evidence": requested_evidence,
-                        "evidence_facts": sorted(fact_set),
+                        "evidence_fact_count": _get_gate_fact_count(),
                     }
                 )
             elif not has_executor_closure_rule(
                 gate_name, required_for
-            ) and any(
-                _fact_supports_gate(fact, gate_name) for fact in fact_set
-            ):
+            ) and _get_gate_fact_count() > 0:
                 transitions.append(
                     {
                         "gate_name": gate_name,
@@ -203,7 +390,7 @@ def evaluate_gate_closures(
                         "to_status": gate.status,
                         "event": "weak_gate_closure",
                         "reason": "structured facts are telemetry only; no executor closure rule is defined",
-                        "evidence_facts": sorted(fact_set),
+                        "evidence_fact_count": _get_gate_fact_count(),
                     }
                 )
         if requested_status == "n/a" and not (
@@ -218,7 +405,7 @@ def evaluate_gate_closures(
                     "reason": "not-applicable status requires an executor-owned rule",
                     "requested_status": requested_status,
                     "requested_evidence": requested_evidence,
-                    "evidence_facts": sorted(fact_set),
+                    "evidence_fact_count": _get_gate_fact_count(),
                 }
             )
         evaluated[gate_name] = gate  # 将评估后的门控存入结果字典
@@ -233,7 +420,7 @@ def evaluate_gate_closures(
                     "to_status": current_status,
                     "event": "gate_transition",
                     "reason": "executor evidence rule satisfied",
-                    "evidence_facts": sorted(fact_set),
+                    "evidence_fact_count": _get_gate_fact_count(),
                 }
             )
 
@@ -419,6 +606,8 @@ def extract_evidence_facts(
 def update_gate_evidence(
     gates: Mapping[str, Any] | None,
     facts: Iterable[str],
+    *,
+    pinned_addresses: Iterable[str] = (),
 ) -> dict[str, Any] | None:
     """
     将新发现的事实（facts）附加到相关的门控（gates）证据中，但不允许事实直接关闭门控。
@@ -431,6 +620,7 @@ def update_gate_evidence(
         gates: 一个映射，键为门控名称，值为门控对象（通常是 Pydantic 模型或类字典对象）。
                如果为 None，则返回 None。
         facts: 一个可迭代的事实字符串集合。
+        pinned_addresses: 当前证据目标关联的地址集合，展示截断时优先保留。
 
     Returns:
         包含更新后门控对象的字典，或者如果输入 gates 为 None 则返回 None。
@@ -458,21 +648,13 @@ def update_gate_evidence(
         relevant = [fact for fact in fact_list if _fact_supports_gate(fact, gate_name)]
 
         if relevant:
-            # 获取现有的证据内容，如果不存在则初始化为空字符串
             evidence = getattr(gate, "evidence", None) or ""
-            marker = "[evidence-delta] "
-            existing = set(evidence.splitlines())
-
-            # 构造新的证据行，并过滤掉已经存在的证据，防止重复添加
-            additions = [
-                f"{marker}{fact}"
-                for fact in relevant
-                if f"{marker}{fact}" not in existing
-            ]
-
-            if additions:
-                # 将新证据追加到现有证据末尾，并去除首尾空格
-                gate.evidence = "\n".join([evidence, *additions]).strip()
+            gate.evidence = _append_bounded_gate_evidence(
+                evidence,
+                relevant,
+                marker="[evidence-delta] ",
+                pinned=pinned_addresses,
+            )
 
         updated[gate_name] = gate
 

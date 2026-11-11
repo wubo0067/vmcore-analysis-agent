@@ -35,7 +35,8 @@ from src.react.llm_runtime import (
     plan_output_budget,
     prepare_messages_for_llm,
 )
-from src.react.schema import ToolCall, VMCoreLLMAnalysisStep
+from src.react.evidence import MAX_GATE_EVIDENCE_FACTS_PER_CATEGORY
+from src.react.schema import GateEntry, ToolCall, VMCoreAnalysisStep, VMCoreLLMAnalysisStep
 from src.llm.model import ChatDeepSeekReasoner
 
 
@@ -367,6 +368,66 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             llm_runtime_mod._CHARS_PER_TOKEN = original
+
+    async def test_call_llm_analysis_stores_slim_gates_in_ai_message_while_keeping_managed_gates(
+        self,
+    ) -> None:
+        class _Chain:
+            async def ainvoke(self, messages, config=None):
+                parsed = VMCoreLLMAnalysisStep(
+                    step_id=2,
+                    reasoning="checking pointer corruption gates",
+                    action=ToolCall(command_name="rd", arguments=["-x", "ffff0000", "2"]),
+                    is_conclusive=False,
+                    signature_class="pointer_corruption",
+                    partial_dump="partial",
+                )
+                raw = AIMessage(
+                    content=parsed.model_dump_json(),
+                    usage_metadata={
+                        "input_tokens": 1_000,
+                        "output_tokens": 100,
+                        "total_tokens": 1_100,
+                    },
+                )
+                return {"parsed": parsed, "raw": raw}
+
+        class _DummyLLM:
+            def with_structured_output(self, *args, **kwargs):
+                return _Chain()
+
+        state = {
+            "step_count": 2,
+            "current_signature_class": "pointer_corruption",
+            "evidence_facts": [
+                "rd_word:0xffff0000=0x10",
+                "dis_instruction:0xffff1000=mov",
+            ],
+            "messages": [HumanMessage(content="init")],
+        }
+
+        result = await call_llm_analysis(state, _DummyLLM())
+        self.assertIsNone(result.get("error"))
+        # managed_gates in state keeps gate evidence, capped per category
+        managed_reg_gate = result["managed_gates"]["register_provenance"]
+        self.assertEqual(managed_reg_gate.status, "closed")
+        self.assertIsNotNone(managed_reg_gate.evidence)
+        lines = (managed_reg_gate.evidence or "").splitlines()
+        self.assertLessEqual(
+            sum(1 for l in lines if l.startswith("[executor-evidence]")),
+            MAX_GATE_EVIDENCE_FACTS_PER_CATEGORY * 4,
+        )
+        self.assertTrue(len(managed_reg_gate.completion_criteria) > 0)
+
+        # AIMessage.content stores slimmed gates without evidence or completion_criteria
+        ai_msg = result["messages"][0]
+        restored = VMCoreAnalysisStep.model_validate_json(ai_msg.content)
+        self.assertIsNotNone(restored.gates)
+        msg_reg_gate = restored.gates["register_provenance"]
+        self.assertEqual(msg_reg_gate.status, "closed")
+        self.assertEqual(msg_reg_gate.closure_basis, "executor_evidence")
+        self.assertIsNone(msg_reg_gate.evidence)
+        self.assertEqual(msg_reg_gate.completion_criteria, [])
 
 
 if __name__ == "__main__":

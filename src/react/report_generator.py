@@ -624,8 +624,12 @@ def generate_gate_audit_report(state: AgentState) -> str:
                 lines.append(f"  - {criterion}")
             evidence = _gate_field(raw_gate, "evidence", None)
             if evidence:
-                lines.append("- **审核证据**:")
-                for item in str(evidence).splitlines():
+                evidence_str = str(evidence)
+                if "(+" in evidence_str:
+                    lines.append("- **审核证据**（按类别最多保留 8 条，其余合并计数）:")
+                else:
+                    lines.append("- **审核证据**:")
+                for item in evidence_str.splitlines():
                     lines.append(f"  - {item}")
             lines.append("")
 

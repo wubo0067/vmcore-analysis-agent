@@ -170,6 +170,19 @@ def _reasoning_signals_convergence(reasoning: str) -> bool:
     )
 
 
+def _serialize_step_for_message(step: VMCoreAnalysisStep) -> str:
+    """将分析步骤序列化为 AIMessage.content，仅保留精简版 gate 状态（不携带 evidence 与 completion_criteria）。"""
+    if not step.gates:
+        return step.model_dump_json()
+    slim_gates = {
+        name: gate.model_copy(
+            update={"evidence": None, "completion_criteria": []}
+        )
+        for name, gate in step.gates.items()
+    }
+    return step.model_copy(update={"gates": slim_gates}).model_dump_json()
+
+
 async def call_llm_analysis(state: AgentState, llm) -> dict:
     """
     调用 LLM 分析节点，根据收集到的 vmcore 信息进行智能分析。
@@ -585,7 +598,7 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
             )
 
         response = AIMessage(
-            content=analysis_result.model_dump_json(),
+            content=_serialize_step_for_message(analysis_result),
             tool_calls=tool_calls,
             additional_kwargs=raw_message.additional_kwargs.copy(),
         )
@@ -805,7 +818,7 @@ async def structure_reasoning_content(state: AgentState, llm) -> dict:
         # 使用原始的 additional_kwargs（含 reasoning_content）以确保
         # 下一轮 DeepSeek-Reasoner 调用时 assistant 消息包含 reasoning_content
         response = AIMessage(
-            content=analysis_result.model_dump_json(),
+            content=_serialize_step_for_message(analysis_result),
             tool_calls=tool_calls,
             additional_kwargs=original_kwargs,
         )

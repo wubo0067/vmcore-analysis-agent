@@ -12,15 +12,16 @@ react_pkg.__path__ = [str(root / "src" / "react")]
 sys.modules.setdefault("src.react", react_pkg)
 
 from src.react.evidence import (
+    MAX_GATE_EVIDENCE_FACTS_PER_CATEGORY,
     evaluate_gate_closures,
     extract_evidence_facts,
+    extract_pinned_addresses,
     facts_support_goal,
     gate_completion_criteria,
     has_executor_closure_rule,
+    update_gate_evidence,
 )
-from src.react.schema import GateEntry
-from src.react.evidence import update_gate_evidence
-from src.react.schema import VMCoreLLMAnalysisStep
+from src.react.schema import GateEntry, VMCoreLLMAnalysisStep
 from src.react.state_manager import _build_evidence_goal, project_managed_analysis_step
 
 
@@ -578,6 +579,297 @@ class EvidenceExtractionTests(unittest.TestCase):
         self.assertEqual(
             updates["managed_gates"]["object_lifetime"].required_for,
             ["page_not_present"],
+        )
+
+    def test_update_gate_evidence_caps_per_category_and_accumulates_omitted_count(
+        self,
+    ) -> None:
+        gates = {
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"], status="open"
+            )
+        }
+        first_batch = {
+            f"kmem_slab_state:0xffff0000{i:04x}=allocated" for i in range(12)
+        }
+        updated_once = update_gate_evidence(gates, first_batch)
+        ev1 = updated_once["object_lifetime"].evidence or ""
+        kmem_lines_1 = [
+            line
+            for line in ev1.splitlines()
+            if line.startswith("[evidence-delta] kmem_slab_state:")
+            and not line.endswith("more)")
+        ]
+        self.assertEqual(len(kmem_lines_1), MAX_GATE_EVIDENCE_FACTS_PER_CATEGORY)
+        self.assertIn(
+            "[evidence-delta] kmem_slab_state: ... (+4 more)", ev1.splitlines()
+        )
+
+        second_batch = {
+            f"kmem_slab_state:0xffff0000{i:04x}=allocated" for i in range(10, 20)
+        }
+        updated_twice = update_gate_evidence(updated_once, second_batch)
+        ev2 = updated_twice["object_lifetime"].evidence or ""
+        kmem_lines_2 = [
+            line
+            for line in ev2.splitlines()
+            if line.startswith("[evidence-delta] kmem_slab_state:")
+            and not line.endswith("more)")
+        ]
+        self.assertEqual(len(kmem_lines_2), MAX_GATE_EVIDENCE_FACTS_PER_CATEGORY)
+        # 12 initial + 8 new distinct (12..19) = 20 total -> 8 retained + 12 omitted
+        self.assertIn(
+            "[evidence-delta] kmem_slab_state: ... (+12 more)", ev2.splitlines()
+        )
+        self.assertIn(
+            "[evidence-delta] kmem_slab_state:0xffff00000013=allocated",
+            kmem_lines_2,
+        )
+
+    def test_evaluate_gate_closures_prioritizes_intersecting_address_under_truncation(
+        self,
+    ) -> None:
+        gates = {
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"], status="open"
+            )
+        }
+        facts = {
+            f"kmem_slab_state:0xffff9999{i:04x}=allocated" for i in range(25)
+        }
+        # Smallest address is the only one intersecting with rd_word
+        facts.add("kmem_slab_state:0xffff00000001=allocated")
+        facts.add("rd_word:0xffff00000001=0xdeadbeef")
+
+        evaluated, _ = evaluate_gate_closures(gates, facts, gates)
+        gate = evaluated["object_lifetime"]
+        self.assertEqual(gate.status, "closed")
+        self.assertIsNotNone(gate.evidence)
+        lines = (gate.evidence or "").splitlines()
+        self.assertIn(
+            "[executor-evidence] kmem_slab_state:0xffff00000001=allocated", lines
+        )
+        self.assertIn(
+            "[executor-evidence] rd_word:0xffff00000001=0xdeadbeef", lines
+        )
+        self.assertIn(
+            "[executor-evidence] kmem_slab_state: ... (+18 more)", lines
+        )
+
+    def test_transitions_do_not_embed_full_fact_set(self) -> None:
+        gates = {
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"],
+                status="closed",
+                evidence="LLM requests closure prematurely",
+            )
+        }
+        prior_gates = {
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"],
+                status="open",
+            )
+        }
+        # Mixed 500 facts: 400 non-supporting struct_field/dis_instruction + 100 supporting kmem_slab_state
+        facts = {f"struct_field:foo+{i}=bar" for i in range(200)}
+        facts |= {f"dis_instruction:0xffff1000{i:04x}=mov" for i in range(200)}
+        facts |= {
+            f"kmem_slab_state:0xffff0000{i:04x}=allocated" for i in range(100)
+        }
+        _, transitions = evaluate_gate_closures(gates, facts, prior_gates)
+        rejected = [
+            item for item in transitions if item["event"] == "llm_close_rejected"
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertNotIn("evidence_facts", rejected[0])
+        self.assertEqual(rejected[0]["evidence_fact_count"], 100)
+
+        # Now add an intersecting rd_word so gate_transition is emitted and verify its count
+        facts_closing = set(facts) | {"rd_word:0xffff00000000=0x1"}
+        open_gates = {
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"],
+                status="open",
+            )
+        }
+        _, close_transitions = evaluate_gate_closures(
+            open_gates, facts_closing, prior_gates
+        )
+        closed_events = [
+            item
+            for item in close_transitions
+            if item["event"] == "gate_transition"
+        ]
+        self.assertEqual(len(closed_events), 1)
+        self.assertNotIn("evidence_facts", closed_events[0])
+        self.assertEqual(closed_events[0]["evidence_fact_count"], 101)
+
+    def test_update_gate_evidence_keeps_pinned_target_address(self) -> None:
+        gates = {
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"], status="open"
+            )
+        }
+        facts = {
+            f"kmem_slab_state:0xffff9999{i:04x}=allocated" for i in range(30)
+        }
+        facts.add("kmem_slab_state:0x12e124000=allocated")
+        # Superstring address with extra trailing 0 must not falsely match 0x12e124000
+        facts.add("kmem_slab_state:0x12e1240000=allocated")
+
+        updated = update_gate_evidence(
+            gates,
+            facts,
+            pinned_addresses=["0x12e124000"],
+        )
+        ev = updated["object_lifetime"].evidence or ""
+        lines = ev.splitlines()
+        self.assertIn(
+            "[evidence-delta] kmem_slab_state:0x12e124000=allocated", lines
+        )
+        self.assertNotIn(
+            "[evidence-delta] kmem_slab_state:0x12e1240000=allocated", lines
+        )
+        self.assertIn(
+            "[evidence-delta] kmem_slab_state: ... (+24 more)", lines
+        )
+
+    def test_extract_pinned_addresses_supports_bare_and_prefixed_hex(self) -> None:
+        state = {
+            "current_evidence_goal": {
+                "target_object": "mpt3sas adapters ff292192012c0a58 and ff2922870f930a58"
+            },
+            "current_action_intent": {
+                "target_object": "reply_dma=0x12e124000"
+            },
+        }
+        pinned = extract_pinned_addresses(state)
+        self.assertEqual(
+            pinned,
+            ["ff292192012c0a58", "ff2922870f930a58", "0x12e124000"],
+        )
+
+        gates = {
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"], status="open"
+            )
+        }
+        facts = {
+            f"kmem_slab_state:0xffff9999{i:04x}=allocated" for i in range(30)
+        }
+        facts.add("kmem_slab_state:0xff292192012c0a58=allocated")
+        facts.add("kmem_slab_state:0xff2922870f930a58=allocated")
+        updated = update_gate_evidence(gates, facts, pinned_addresses=pinned)
+        lines = (updated["object_lifetime"].evidence or "").splitlines()
+        self.assertIn(
+            "[evidence-delta] kmem_slab_state:0xff292192012c0a58=allocated",
+            lines,
+        )
+        self.assertIn(
+            "[evidence-delta] kmem_slab_state:0xff2922870f930a58=allocated",
+            lines,
+        )
+
+    def test_extract_pinned_addresses_ignores_short_offsets(self) -> None:
+        state = {
+            "current_evidence_goal": {
+                "target_object": "desc+0xf8, next at 0x18, addr ff292192012c0a58"
+            }
+        }
+        self.assertEqual(
+            extract_pinned_addresses(state),
+            ["ff292192012c0a58"],
+        )
+
+    def test_extract_pinned_addresses_deduplicates_in_order(self) -> None:
+        state = {
+            "current_evidence_goal": {
+                "target_object": "adapter ff292192012c0a58 and 0x12e124000"
+            },
+            "current_action_intent": {
+                "target_object": "check FF292192012C0A58 and 0X12E124000 then ff2922870f930a58"
+            },
+        }
+        self.assertEqual(
+            extract_pinned_addresses(state),
+            ["ff292192012c0a58", "0x12e124000", "ff2922870f930a58"],
+        )
+
+    def test_extract_pinned_addresses_supports_uppercase_0x_prefix(self) -> None:
+        state = {
+            "current_evidence_goal": {
+                "target_object": "reply_dma=0X12E124000"
+            }
+        }
+        pinned = extract_pinned_addresses(state)
+        self.assertEqual(pinned, ["0X12E124000"])
+
+        gates = {
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"], status="open"
+            )
+        }
+        facts = {
+            f"kmem_slab_state:0xffff9999{i:04x}=allocated" for i in range(30)
+        }
+        facts.add("kmem_slab_state:0x12e124000=allocated")
+        updated = update_gate_evidence(gates, facts, pinned_addresses=pinned)
+        lines = (updated["object_lifetime"].evidence or "").splitlines()
+        self.assertIn(
+            "[evidence-delta] kmem_slab_state:0x12e124000=allocated",
+            lines,
+        )
+
+    def test_truncation_summary_is_idempotent(self) -> None:
+        gates = {
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"], status="open"
+            )
+        }
+        batch = {
+            f"kmem_slab_state:0xffff0000{i:04x}=allocated" for i in range(12)
+        }
+        updated_once = update_gate_evidence(gates, batch)
+        updated_twice = update_gate_evidence(updated_once, batch)
+        self.assertEqual(
+            updated_once["object_lifetime"].evidence,
+            updated_twice["object_lifetime"].evidence,
+        )
+        self.assertIn(
+            "[evidence-delta] kmem_slab_state: ... (+4 more)",
+            (updated_twice["object_lifetime"].evidence or "").splitlines(),
+        )
+
+        updated_plus_one = update_gate_evidence(
+            updated_twice,
+            {"kmem_slab_state:0xffff00000099=allocated"},
+        )
+        self.assertIn(
+            "[evidence-delta] kmem_slab_state: ... (+5 more)",
+            (updated_plus_one["object_lifetime"].evidence or "").splitlines(),
+        )
+
+    def test_large_fact_set_closure_deduplication_is_bounded(self) -> None:
+        gates = {
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"], status="open"
+            )
+        }
+        facts = {
+            f"kmem_slab_state:0xffff8888{i:04x}=allocated" for i in range(5_000)
+        }
+        facts.add("rd_word:0xffff88880000=0x1")
+        evaluated, _ = evaluate_gate_closures(gates, facts, gates)
+        gate = evaluated["object_lifetime"]
+        self.assertEqual(gate.status, "closed")
+        lines = (gate.evidence or "").splitlines()
+        self.assertIn(
+            "[executor-evidence] kmem_slab_state:0xffff88880000=allocated",
+            lines,
+        )
+        self.assertIn(
+            "[executor-evidence] kmem_slab_state: ... (+4992 more)",
+            lines,
         )
 
 

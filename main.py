@@ -249,6 +249,7 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             "vmlinux_path": request.vmlinux_path,
             "vmcore_dmesg_path": request.vmcore_dmesg_path,
             "debug_symbol_paths": request.debug_symbol_paths,
+            "loaded_modules": [],
             "kernel_source_root": (
                 request.kernel_source_root or get_settings().kernel_source_root or ""
             ),
@@ -384,6 +385,7 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
                 "vmlinux_path": request.vmlinux_path,
                 "vmcore_dmesg_path": request.vmcore_dmesg_path,
                 "debug_symbol_paths": request.debug_symbol_paths,
+                "loaded_modules": [],
                 "kernel_source_root": (
                     request.kernel_source_root
                     or get_settings().kernel_source_root

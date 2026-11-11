@@ -27,6 +27,7 @@ from src.utils.logging import logger
 from .action_guard import (
     build_mod_s_prelude,
     canonicalize_command_line,
+    missing_module_preludes,
     validate_tool_call_request,
 )
 from .consistency import (
@@ -1332,6 +1333,34 @@ def _preflight_action_with_guard(
                     ).strip()
             else:
                 analysis_step.additional_notes = audit_note
+
+    # ── 第 2b 步：模块符号前导（不依赖 debug_symbol_paths）──
+    # 场景：脚本引用了内核已加载模块的私有类型（如 struct MPT3SAS_ADAPTER），
+    #       但 crash 每次 run_script 都是新进程，上一轮 mod -s 不会保留。
+    #       依据启动阶段采集的 loaded_modules 自动补齐前导。
+    if action.command_name == "run_script" and action.arguments:
+        missing_modules = missing_module_preludes(
+            [str(line) for line in action.arguments],
+            state.get("loaded_modules") or [],
+        )
+        if missing_modules:
+            module_prelude = [f"mod -s {module}" for module in missing_modules]
+            action.arguments = [*module_prelude, *action.arguments]
+            audit_note = (
+                "Executor audit: run_script referenced module-private types without a "
+                f"mod -s prelude; inserted {', '.join(module_prelude)} because crash "
+                "sessions do not persist across actions."
+            )
+            logger.warning("%s%s", prefix, audit_note)
+            if audit_note not in analysis_step.reasoning:
+                analysis_step.reasoning = (
+                    f"{audit_note} {analysis_step.reasoning}".strip()
+                )
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}".strip()
+                if analysis_step.additional_notes
+                else audit_note
+            )
 
     # ── 第 3 步：调用 action_guard 的完整命令验证 ──
     # 根据命令类型构造不同的参数字典格式：

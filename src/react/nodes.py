@@ -34,15 +34,19 @@ from .prompts import crash_init_data_prompt
 from .prompt_phrases import FORCED_CHOICE_CONVERGENCE_RULE
 from .action_guard import (
     build_command_fingerprint,
+    canonicalize_command_line,
+    detect_module_types,
     extract_crash_path_struct_offsets,
     build_fingerprint_from_lines,
     extract_struct_layouts,
     extract_command_lines,
     maybe_rewrite_module_symbol_tool_call,
+    module_candidates_for_type,
     validate_tool_call_request,
 )
 from .evidence import (
     extract_evidence_facts,
+    extract_pinned_addresses,
     facts_support_goal,
     update_gate_evidence,
 )
@@ -102,6 +106,51 @@ _HARD_FAILURE_MARKERS = (
 # "查不到就是结论"的命令形态：grep / search 无匹配属于合法的否定性证据，
 # 不能因为输出为空就把整个分析卡住（R3 的 caveat 依赖日志里"没有"某些行）。
 _ABSENCE_MEANINGFUL_RE = re.compile(r"\b(grep|search)\b", re.IGNORECASE)
+
+
+_MODULE_TABLE_ROW_RE = re.compile(
+    r"^\s*(?P<base>[0-9a-fA-F]{8,})\s+(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\s"
+)
+
+_MISSING_MODULE_MARKERS = (
+    "gdb request failed",
+    "invalid data structure reference",
+)
+
+
+def _parse_module_names(output: str) -> list[str]:
+    """从 crash `mod` 输出中提取已加载模块名（首列地址 + 次列名字）。"""
+
+    names: set[str] = set()
+    for line in str(output or "").splitlines():
+        match = _MODULE_TABLE_ROW_RE.match(line)
+        if match is not None:
+            names.add(match.group("name"))
+    return sorted(names)
+
+
+def _module_session_hint(
+    content: str, args: Any, loaded_modules: Optional[list[str]]
+) -> str:
+    """输出像"模块符号未加载"且脚本漏了 mod -s 时，追加可执行的提示。"""
+
+    lowered = str(content or "").lower()
+    if not any(marker in lowered for marker in _MISSING_MODULE_MARKERS):
+        return ""
+    script = args.get("script", "") if isinstance(args, dict) else ""
+    lines = [line for line in str(script or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    if any(canonicalize_command_line(line).startswith("mod -s") for line in lines):
+        return ""
+    for type_name in detect_module_types(lines):
+        if module_candidates_for_type(type_name, loaded_modules):
+            return (
+                "\n[hint] Module symbols are per-session: each run_script starts a new "
+                "crash process, so `mod -s <module>` must be repeated in the same script "
+                "that reads module-private types."
+            )
+    return ""
 
 
 def _classify_tool_output(content: str, display: str) -> str:
@@ -330,6 +379,9 @@ DEFAULT_CRASH_COMMANDS: list[str] = [
     "sys",  # 系统信息
     "sys -t",  # 内核的 taint 状态（kernel taint flags
     "bt",  # 所有线程的堆栈回溯
+    # "mod" 用于采集已加载模块名：crash 的 mod -s 只在当前进程内有效，
+    # 执行器据此为"引用模块私有类型但漏写 mod -s"的脚本自动补前导。
+    "mod",
     # "ps -a",  # 进程列表
     # "runq",  # 运行队列
     # "dev -i",  # 设备信息
@@ -514,6 +566,8 @@ async def collect_crash_init_data(state: AgentState) -> dict:
     cpu = 0
     command = ""
     found_panic_task = False
+    # 已加载模块名：用于给"引用模块私有类型但漏写 mod -s"的脚本自动补前导。
+    loaded_modules: List[str] = []
 
     try:
         # 委托给 dispatch_crash_commands 处理工具加载和执行
@@ -529,6 +583,13 @@ async def collect_crash_init_data(state: AgentState) -> dict:
                     continue
 
                 # 从 bt 输出中提取 vmcore-dmesg.txt 的查找特征
+                if cmd.strip() == "mod":
+                    loaded_modules = _parse_module_names(output)
+                    logger.info(
+                        "Loaded %d kernel module names from 'mod'.",
+                        len(loaded_modules),
+                    )
+
                 if cmd.startswith("bt") and not found_panic_task:
                     for line in output.splitlines():
                         if line.startswith("PID:"):
@@ -642,6 +703,7 @@ async def collect_crash_init_data(state: AgentState) -> dict:
         "messages": [HumanMessage(content=prompt)],
         "error": None,
         "step_count": 1,
+        "loaded_modules": loaded_modules,
     }
 
 
@@ -946,6 +1008,13 @@ async def call_crash_tool(state: AgentState) -> dict:
                             content = str(r_output)
                             if isinstance(r_output, Exception):
                                 content = f"[error] Execution failed: {r_output}"
+                            hint = _module_session_hint(
+                                content,
+                                _raw_args,
+                                state.get("loaded_modules") or [],
+                            )
+                            if hint and hint not in content:
+                                content = f"{content}{hint}"
                             if not content.startswith(("[error]", "[TIMEOUT]")) and _has_non_echo_output(content):
                                 observed_nonempty_output = True
                             if fingerprint:
@@ -1061,7 +1130,12 @@ async def call_crash_tool(state: AgentState) -> dict:
             + detect_value_conflicts(observed_memory_reads, struct_layout_cache)
         )
     )
-    managed_gates = update_gate_evidence(state.get("managed_gates"), evidence_delta)
+    pinned_addresses = extract_pinned_addresses(state)
+    managed_gates = update_gate_evidence(
+        state.get("managed_gates"),
+        evidence_delta,
+        pinned_addresses=pinned_addresses,
+    )
     goal_advanced = facts_support_goal(
         evidence_delta, state.get("current_evidence_goal")
     )

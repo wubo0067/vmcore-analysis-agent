@@ -355,5 +355,101 @@ class LengthFailureDegradeTests(unittest.TestCase):
         )
 
 
+class ModuleSessionTests(unittest.TestCase):
+    """Crash sessions are per-action; module symbols must be reloaded per script."""
+
+    def test_parse_module_names_from_mod_output(self) -> None:
+        from src.react.nodes import _parse_module_names
+
+        output = (
+            "     MODULE       NAME              BASE            SIZE  OBJECT FILE\n"
+            " ffffffffc0a1a000  mpt3sas   ffffffffc0a00000   0x2a000  (not loaded)\n"
+            " ffffffffc0b2c000  mlx5_core ffffffffc0b2a000   0x9a000  (not loaded)\n"
+        )
+        self.assertEqual(
+            _parse_module_names(output), ["mlx5_core", "mpt3sas"]
+        )
+
+    def test_missing_preludes_detected_for_module_type(self) -> None:
+        from src.react.action_guard import missing_module_preludes
+
+        lines = ["p/x ((struct MPT3SAS_ADAPTER *)0x1)->reply"]
+        self.assertEqual(missing_module_preludes(lines, ["mpt3sas"]), ["mpt3sas"])
+
+    def test_prelude_already_present_is_not_duplicated(self) -> None:
+        from src.react.action_guard import missing_module_preludes
+
+        lines = [
+            "mod -s mpt3sas",
+            "p/x ((struct MPT3SAS_ADAPTER *)0x1)->reply",
+        ]
+        self.assertEqual(missing_module_preludes(lines, ["mpt3sas"]), [])
+
+    def test_core_type_does_not_trigger_a_prelude(self) -> None:
+        from src.react.action_guard import missing_module_preludes
+
+        self.assertEqual(missing_module_preludes(["struct irq_desc 0x1"], ["mpt3sas"]), [])
+
+    def test_preflight_injects_module_prelude(self) -> None:
+        import types
+
+        from src.react import output_parser
+        from src.react.schema import ToolCall
+
+        action = ToolCall(
+            command_name="run_script",
+            arguments=[
+                "p/x ((struct MPT3SAS_ADAPTER *)0xff00)->reply",
+                "p/x ((struct MPT3SAS_ADAPTER *)0xff00)->reply_dma",
+            ],
+        )
+        step = types.SimpleNamespace(
+            action=action, reasoning="r", signature_class=None, additional_notes=None
+        )
+        state = {
+            "loaded_modules": ["mpt3sas"],
+            "debug_symbol_paths": [],
+            "crash_path_struct_offsets": None,
+            "struct_layout_cache": {},
+        }
+        result = output_parser._preflight_action_with_guard(step, state)
+        self.assertEqual(result.action.arguments[0], "mod -s mpt3sas")
+
+    def test_hint_when_gdb_failure_and_no_mod_s(self) -> None:
+        from src.react.nodes import _module_session_hint
+
+        hint = _module_session_hint(
+            "gdb: gdb request failed: p/x ...",
+            {"script": "p/x ((struct MPT3SAS_ADAPTER *)0x1)->reply"},
+            ["mpt3sas"],
+        )
+        self.assertIn("per-session", hint)
+
+    def test_no_hint_when_mod_s_present(self) -> None:
+        from src.react.nodes import _module_session_hint
+
+        hint = _module_session_hint(
+            "gdb: gdb request failed",
+            {
+                "script": (
+                    "mod -s mpt3sas\n"
+                    "p/x ((struct MPT3SAS_ADAPTER *)0x1)->reply"
+                )
+            },
+            ["mpt3sas"],
+        )
+        self.assertEqual(hint, "")
+
+    def test_no_hint_for_core_type(self) -> None:
+        from src.react.nodes import _module_session_hint
+
+        hint = _module_session_hint(
+            "gdb: gdb request failed",
+            {"script": "p/x ((struct irq_desc *)0x1)->action"},
+            ["mpt3sas"],
+        )
+        self.assertEqual(hint, "")
+
+
 if __name__ == "__main__":
     unittest.main()

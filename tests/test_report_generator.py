@@ -305,6 +305,27 @@ class GateAuditReportTests(unittest.TestCase):
     def test_audit_report_empty_without_gates(self) -> None:
         self.assertEqual(generate_gate_audit_report(_base_state()), "")
 
+    def test_audit_report_notes_truncated_evidence_when_summary_present(self) -> None:
+        audit = generate_gate_audit_report(
+            _base_state(
+                managed_gates={
+                    "object_lifetime": GateEntry(
+                        required_for=["pointer_corruption"],
+                        status="closed",
+                        closure_basis="executor_evidence",
+                        evidence=(
+                            "[executor-evidence] kmem_slab_state:0xffff0001=allocated\n"
+                            "[executor-evidence] kmem_slab_state: ... (+18 more)"
+                        ),
+                    )
+                },
+                gate_transition_history=[],
+            )
+        )
+        self.assertIn(
+            "- **审核证据**（按类别最多保留 8 条，其余合并计数）:", audit
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
