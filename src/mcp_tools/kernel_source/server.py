@@ -155,14 +155,16 @@ def find_struct(
     kver: str = "",
     prefix: str = "",
     source_root: str = "",
-    max_lines: int = 120,
+    max_lines: int = 350,
+    field_filter: str = "",
 ) -> str:
     """Return a struct's full definition body in ONE call.
 
     Use this instead of alternating grep_source and read_source when you need a
     member name: the definition answers every member question at once.
     `prefix` narrows the search (e.g. drivers/scsi/mpt3sas); headers are searched
-    first. Emits a SOURCE_REF line.
+    first. `field_filter` optionally filters member lines by regex for huge structs.
+    Emits a SOURCE_REF line.
     `source_root` is injected by the runtime; do not set it yourself.
     """
 
@@ -172,6 +174,7 @@ def find_struct(
         prefix=prefix,
         source_root=source_root,
         max_lines=max_lines,
+        field_filter=field_filter,
     )
 
 

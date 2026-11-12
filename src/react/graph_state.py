@@ -143,6 +143,9 @@ class AgentState(MessagesState):
     # 结构体布局缓存。
     # key 通常为结构体名称，value 为该结构体字段布局、偏移等解析结果，避免重复计算。
     struct_layout_cache: dict[str, dict[str, object]]
+    # 历史工具输出的 rd 解析缓存：sha1(output) -> list[MemoryRead]。
+    # 长分析链路中每步都要用历史 rd 块做跨步关联，避免每步全量重解析。
+    memory_reads_cache: dict[str, list[object]]
     # Agent 当前错误状态。
     # 当某个节点执行失败或出现不可恢复问题时，会在此记录结构化错误信息。
     error: Optional[AgentError]

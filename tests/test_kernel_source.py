@@ -545,6 +545,84 @@ class FindStructTests(KernelSourceTestCase):
             output = tools.find_struct_impl("../etc/passwd")
         self.assertIn("SOURCE_ERROR", output)
 
+    def test_find_struct_field_filter_returns_matching_members(self) -> None:
+        header = self.tree / "drivers" / "net" / "demo.h"
+        fields = "\n".join(f"\tint field_{i};" for i in range(220))
+        header.write_text(
+            f"struct big_adapter {{\n{fields}\n\tvoid *reply_post_free;\n}};\n",
+            encoding="utf-8",
+        )
+        with self._env(self.tree):
+            output = tools.find_struct_impl("big_adapter", field_filter="reply_post")
+        self.assertIn("reply_post_free", output)
+        self.assertNotIn("field_10;", output)
+
+    def test_field_filter_keeps_nested_struct_context(self) -> None:
+        header = self.tree / "drivers" / "net" / "demo.h"
+        header.write_text(
+            "struct outer {\n"
+            "\tint a;\n"
+            "\tstruct {\n"
+            "\t\tint inner_keep;\n"
+            "\t\tint inner_drop;\n"
+            "\t} sub;\n"
+            "\tunion {\n"
+            "\t\tint u1;\n"
+            "\t} un;\n"
+            "};\n",
+            encoding="utf-8",
+        )
+        with self._env(self.tree):
+            output = tools.find_struct_impl("outer", field_filter="inner_keep")
+        self.assertIn("inner_keep", output)
+        self.assertNotIn("inner_drop", output)
+        # 嵌套子结构的开闭行必须保留，否则筛选结果缺少归属上下文。
+        self.assertIn("struct {", output)
+        self.assertIn("} sub;", output)
+        self.assertIn("union {", output)
+
+    def test_read_source_appends_macro_constants_footer(self) -> None:
+        header = self.tree / "drivers" / "net" / "demo.h"
+        header.write_text(
+            "#define MPI2_FUNCTION_SCSI_IO_REQUEST (0x00)\n"
+            "#define DEMO_MAGIC_FLAG 0x1234\n",
+            encoding="utf-8",
+        )
+        (self.tree / "drivers" / "net" / "demo.c").write_text(
+            "int check_req(int fn)\n"
+            "{\n"
+            "\tif (fn == MPI2_FUNCTION_SCSI_IO_REQUEST)\n"
+            "\t\treturn DEMO_MAGIC_FLAG;\n"
+            "\treturn 0;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        with self._env(self.tree):
+            output = tools.read_source_impl("drivers/net/demo.c", line=3, context=3)
+        self.assertIn("[macro-constants]", output)
+        self.assertIn("MPI2_FUNCTION_SCSI_IO_REQUEST = (0x00)", output)
+        self.assertIn("DEMO_MAGIC_FLAG = 0x1234", output)
+
+    def test_read_source_resolves_macros_from_include_tree(self) -> None:
+        include_dir = self.tree / "include" / "linux"
+        include_dir.mkdir(parents=True, exist_ok=True)
+        (include_dir / "demo_macros.h").write_text(
+            "#define DEMO_CROSS_DIR_MACRO 0x5150\n",
+            encoding="utf-8",
+        )
+        (self.tree / "drivers" / "net" / "demo_cross.c").write_text(
+            "int check_cross(int v)\n"
+            "{\n"
+            "\treturn v == DEMO_CROSS_DIR_MACRO;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        with self._env(self.tree):
+            output = tools.read_source_impl(
+                "drivers/net/demo_cross.c", line=3, context=3
+            )
+        self.assertIn("DEMO_CROSS_DIR_MACRO = 0x5150", output)
+
 
 class EvidenceHookTests(unittest.TestCase):
     def test_source_ref_fact_is_extracted_without_command_syntax(self) -> None:

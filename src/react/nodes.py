@@ -14,10 +14,11 @@ LLM 分析节点 ``call_llm_analysis`` 定义于 ``llm_node.py``。
 """
 
 import asyncio
+import hashlib
 import json
 import re
 from contextlib import AsyncExitStack
-from typing import Any, List, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple, cast
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -29,7 +30,13 @@ from .graph_state import (
     has_committed_root_cause,
 )
 from .schema import GateEntry, gate_resolution_state
-from .consistency import MemoryRead, detect_value_conflicts, parse_memory_reads
+from .consistency import (
+    MemoryRead,
+    detect_memory_block_correlations,
+    detect_value_conflicts,
+    format_mechanical_analysis_summary,
+    parse_memory_reads,
+)
 from .prompts import crash_init_data_prompt
 from .prompt_phrases import FORCED_CHOICE_CONVERGENCE_RULE
 from .action_guard import (
@@ -151,6 +158,66 @@ def _module_session_hint(
                 "that reads module-private types."
             )
     return ""
+
+
+_MEMORY_CANDIDATE_PAIR_RE = re.compile(
+    r"memory_copy_candidate:\s*0x([0-9a-fA-F]+)\s*<->\s*0x([0-9a-fA-F]+)"
+)
+
+
+def _cross_step_candidate_lines(content: str, summary: str) -> list[str]:
+    """返回 summary 中尚未在 content 出现的候选关联行。
+
+    按地址对去重而不是整行文本：复合工具可能使用非 128B 的 stride，同一对
+    地址的 ``spans ...x64B`` 与 ``x128B`` 文本不同，但仍是同一条关联。
+    """
+
+    seen = {
+        (int(match.group(1), 16), int(match.group(2), 16))
+        for match in _MEMORY_CANDIDATE_PAIR_RE.finditer(content)
+    }
+    lines: list[str] = []
+    for line in summary.splitlines():
+        match = _MEMORY_CANDIDATE_PAIR_RE.search(line)
+        if match is None:
+            continue
+        pair = (int(match.group(1), 16), int(match.group(2), 16))
+        if pair in seen:
+            continue
+        seen.add(pair)
+        lines.append(line)
+    return lines
+
+
+def _historical_memory_reads(
+    prior_tool_outputs: Mapping[str, str],
+    cache: Optional[Mapping[str, list[MemoryRead]]],
+) -> tuple[list[MemoryRead], dict[str, list[MemoryRead]]]:
+    """Parse historical ``rd`` blocks with a per-output incremental cache.
+
+    Long analyses re-read every cached tool output on every step; hashing the
+    output once and caching its parsed reads keeps that cost linear.
+    """
+
+    read_cache = dict(cache or {})
+    historical: list[MemoryRead] = []
+    new_cache: dict[str, list[MemoryRead]] = {}
+    for cached_output in prior_tool_outputs.values():
+        if not isinstance(cached_output, str) or not cached_output:
+            continue
+        digest = hashlib.sha1(
+            cached_output.encode("utf-8", "replace")
+        ).hexdigest()
+        reads = read_cache.get(digest)
+        if reads is None:
+            reads = parse_memory_reads(cached_output)
+        new_cache[digest] = reads
+        historical.extend(reads)
+    # 长分析链路里 output cache 只增不减时，给解析缓存一个硬上限。
+    if len(new_cache) > 512:
+        for stale_key in list(new_cache)[:-512]:
+            del new_cache[stale_key]
+    return historical, new_cache
 
 
 def _classify_tool_output(content: str, display: str) -> str:
@@ -749,10 +816,16 @@ async def call_crash_tool(state: AgentState) -> dict:
     prior_evidence_facts = set(state.get("evidence_facts", []))
     observed_evidence_facts: set[str] = set()
     observed_nonempty_output = False
-    # 本步读到的内存快照，用于与已缓存的结构体布局做取值级一致性检查。
-    # 局限：只检查“本步新读到”的内存。若某次 rd 早于对应 struct -o 布局查询，
-    # 该次读取不会被回溯检查（需要跨步保留内存读取历史才能覆盖，属后续增强）。
+    # 本步读到的内存快照，用于与已缓存的结构体布局做取值级一致性检查，
+    # 并与历史缓存中的内存读取合并以执行跨步内存拷贝/偏移关联计算。
     observed_memory_reads: list[MemoryRead] = []
+    historical_memory_reads, new_reads_cache = _historical_memory_reads(
+        prior_tool_outputs,
+        cast(
+            Optional[Mapping[str, list[MemoryRead]]],
+            state.get("memory_reads_cache") or {},
+        ),
+    )
 
     # 提取所有工具调用的命令，准备批量执行
     # 为了后续能将结果匹配回 tool_call_id，我们需要维护一个映射或顺序
@@ -1015,6 +1088,37 @@ async def call_crash_tool(state: AgentState) -> dict:
                             )
                             if hint and hint not in content:
                                 content = f"{content}{hint}"
+                            current_step_reads = parse_memory_reads(content)
+                            observed_memory_reads.extend(current_step_reads)
+                            if current_step_reads:
+                                all_reads_so_far = (
+                                    historical_memory_reads + observed_memory_reads
+                                )
+                                # 只算一次关联：summary 与证据消费同一结果，避免每步
+                                # 在 summary / facts / _parse_rd 中重复做 O(块²) 配对。
+                                correlations = detect_memory_block_correlations(
+                                    all_reads_so_far
+                                )
+                                mech_summary = format_mechanical_analysis_summary(
+                                    content,
+                                    all_reads_so_far,
+                                    correlations=correlations,
+                                )
+                                if mech_summary:
+                                    if "[mechanical-analysis]" in content:
+                                        # 复合工具已带单次输出的 summary；这里只补
+                                        # 它与历史 rd 块之间的跨步候选关联，避免重复。
+                                        cross_lines = _cross_step_candidate_lines(
+                                            content, mech_summary
+                                        )
+                                        if cross_lines:
+                                            content = (
+                                                f"{content.rstrip()}\n\n"
+                                                "[mechanical-analysis-cross-step]\n"
+                                                + "\n".join(cross_lines)
+                                            )
+                                    else:
+                                        content = f"{content.rstrip()}\n\n{mech_summary}"
                             if not content.startswith(("[error]", "[TIMEOUT]")) and _has_non_echo_output(content):
                                 observed_nonempty_output = True
                             if fingerprint:
@@ -1053,7 +1157,6 @@ async def call_crash_tool(state: AgentState) -> dict:
                             discovered_layouts = extract_struct_layouts(content)
                             if discovered_layouts:
                                 struct_layout_cache.update(discovered_layouts)
-                            observed_memory_reads.extend(parse_memory_reads(content))
                             observed_evidence_facts.update(
                                 extract_evidence_facts(tool_name, _raw_args, content)
                             )
@@ -1157,6 +1260,7 @@ async def call_crash_tool(state: AgentState) -> dict:
             **state.get("tool_output_cache", {}),
             **new_tool_output_cache,
         },
+        "memory_reads_cache": new_reads_cache,
         "last_action_status": action_status,
         "last_action_fingerprint": last_action_fingerprint,
         "duplicate_streak": duplicate_streak,

@@ -873,5 +873,27 @@ class EvidenceExtractionTests(unittest.TestCase):
         )
 
 
+class CompositeToolEvidenceTests(unittest.TestCase):
+    def test_inspect_slab_object_evidence_includes_struct_layout(self) -> None:
+        from src.react.evidence import extract_evidence_facts
+
+        output = (
+            "struct irq_desc {\n"
+            "  [0] struct irq_common_data irq_common_data;\n"
+            "  [112] struct irqaction *action;\n"
+            "  SIZE: 448\n"
+            "}\n"
+            "ff292187ae124a80:  0000000000000001 0000000000000002\n"
+        )
+        facts = extract_evidence_facts(
+            "inspect_slab_object",
+            {"command": "inspect_slab_object 0xff292187ae124a80 irq_desc"},
+            output,
+        )
+        self.assertIn("struct_type:irq_desc", facts)
+        self.assertIn("struct_field:irq_desc.action@0x70", facts)
+        self.assertIn("rd_word:0xff292187ae124a80=0x1", facts)
+
+
 if __name__ == "__main__":
     unittest.main()

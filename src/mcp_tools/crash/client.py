@@ -9,6 +9,7 @@ import sys
 from typing import Any, List, Optional
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from src.utils.logging import logger
+from src.utils.crash_command import with_tool_prefix
 
 MCP_SERVER_NAME = "crash"
 
@@ -116,10 +117,7 @@ def _build_full_crash_command(tool_name: str, raw_args: Any) -> str:
     if not command:
         return tool_name
 
-    if command == tool_name or command.startswith(f"{tool_name} "):
-        return command
-
-    return f"{tool_name} {command}"
+    return with_tool_prefix(tool_name, command)
 
 
 def build_tool_payload(

@@ -9,6 +9,13 @@ from typing import Any, Iterable, List, Optional
 
 from .consistency import parse_struct_layouts
 
+from src.utils.crash_command import normalize_command_lines, with_tool_prefix
+from src.utils.mechanics import parse_int_literal
+
+# 复合 MCP 工具不是 crash 原生命令：它们由 crash provider 直接调度，
+# 不能被改写进 run_script（crash CLI 不认识这些子命令）。
+_COMPOSITE_MCP_TOOLS = frozenset({"inspect_slab_object", "compare_memory_blocks"})
+
 # 匹配 head/tail 管道后缀的正则表达式，用于清理命令输出过滤操作
 _HEAD_TAIL_SUFFIX_RE = re.compile(r"\s*\|\s*(?:head|tail)\s+-\d+\s*$")
 # 匹配宽泛可打印字符 grep 模式，避免把大块内存当作任意 ASCII 文本扫出海量结果
@@ -22,9 +29,24 @@ _FORBIDDEN_EXPR_RE = re.compile(
 # 地址算术运算检测：只检查单个操作数 token 内部的 "地址 +/- 偏移"。
 # 不能在整行上匹配 "十六进制 - 选项/标识符"，否则 search -s <start> -e <end> <value>
 # 会把 -e 误判成减法，直接拒绝合法的 bounded search。
+# 符号分支只拦 "符号 +/- 0x十六进制偏移"（如 jiffies+0x10）：十进制后缀的
+# 标识符（如缓存名 kmalloc-128、kmalloc-4096）是合法 token，不能误判为算术。
 _ADDRESS_ARITHMETIC_TOKEN_RE = re.compile(
-    r"^(?:0x)?[0-9A-Fa-f]{8,}(?:[+-](?:0x)?[0-9A-Fa-f]+)$"
+    r"^(?:0x)?[0-9A-Fa-f]{8,}(?:[+-](?:0x)?[0-9A-Fa-f]+)+$"
+    r"|^[A-Za-z_][A-Za-z0-9_]*(?:[+-]0x[0-9A-Fa-f]+)+$"
 )
+# 字面量十六进制/十进制偏移地址算术：base 为 8~16 位十六进制地址，
+# 后跟一个或多个 +0xNN / -0xNN / +NN / -NN 形式的偏移量，可在 Python 侧确定性求值。
+_LITERAL_ADDRESS_ARITHMETIC_TOKEN_RE = re.compile(
+    r"^(?P<prefix>0x)?(?P<base>[0-9A-Fa-f]{8,16})(?P<ops>(?:[+-](?:0x[0-9A-Fa-f]+|\d+))+)$"
+)
+_ARITHMETIC_OP_STEP_RE = re.compile(r"(?P<op>[+-])(?P<val>0x[0-9A-Fa-f]+|\d+)")
+# JSON schema 占位符或序列化尾部垃圾 token 清理
+_PLACEHOLDER_TOKEN_RE = re.compile(
+    r"_placeholder_do_not_use_directly",
+    flags=re.IGNORECASE,
+)
+_TRAILING_JSON_JUNK_RE = re.compile(r"^[\]\},;]+$")
 # 反汇编行匹配：提取指令部分
 _DISASM_LINE_RE = re.compile(r"^\s*0x[0-9a-fA-F]+\s+<[^>]+>:\s+(?P<inst>.+)$")
 # 寄存器间 mov 指令匹配：追踪寄存器别名关系
@@ -67,12 +89,78 @@ def _has_unresolved_address_arithmetic(command_line: str) -> bool:
     return False
 
 
+def sanitize_action_tokens(tokens: Iterable[str]) -> list[str]:
+    """清理 LLM 序列化时泄露的 schema 占位符或 JSON 尾部括号碎片。"""
+    cleaned: list[str] = []
+    for raw in tokens:
+        token = str(raw).strip()
+        if not token:
+            continue
+        if _PLACEHOLDER_TOKEN_RE.search(token):
+            continue
+        if _TRAILING_JSON_JUNK_RE.fullmatch(token):
+            continue
+        cleaned.append(token)
+    return cleaned
+
+
+def resolve_address_arithmetic_token(token: str) -> str:
+    """若单个 token 是字面量地址加减偏移（如 ``0xff292187ae124a80+0x18``），在 Python 侧求值。"""
+    match = _LITERAL_ADDRESS_ARITHMETIC_TOKEN_RE.fullmatch(token.strip())
+    if match is None:
+        return token
+
+    prefix = match.group("prefix") or ""
+    base_str = match.group("base")
+    ops_str = match.group("ops")
+    try:
+        value = int(base_str, 16)
+        for step in _ARITHMETIC_OP_STEP_RE.finditer(ops_str):
+            op = step.group("op")
+            operand_str = step.group("val")
+            operand = (
+                int(operand_str, 16)
+                if operand_str.lower().startswith("0x")
+                else int(operand_str, 10)
+            )
+            value = value + operand if op == "+" else value - operand
+        if value < 0:
+            return token
+    except ValueError:
+        return token
+
+    width = len(base_str)
+    formatted = f"{value:0{width}x}" if width >= 8 else f"{value:x}"
+    return f"{prefix}{formatted}"
+
+
+def resolve_address_arithmetic_in_line(command_line: str) -> str:
+    """对单行 crash 命令首个管道前的字面量地址加减表达式做自动求值与占位符清理。"""
+    raw = _collapse_whitespace(command_line)
+    if not raw:
+        return ""
+
+    if "|" in raw:
+        head, tail = raw.split("|", 1)
+        head_tokens = [
+            resolve_address_arithmetic_token(tok)
+            for tok in sanitize_action_tokens(head.split())
+        ]
+        return f"{' '.join(head_tokens)} | {tail.strip()}".strip()
+
+    tokens = [
+        resolve_address_arithmetic_token(tok)
+        for tok in sanitize_action_tokens(raw.split())
+    ]
+    return " ".join(tokens)
+
+
 def canonicalize_command_line(command_line: str) -> str:
     """
     规范化 crash 命令行：移除输出过滤后缀、标准化选项顺序。
 
     主要功能：
-    1. 压缩多余空白字符
+    1. 压缩多余空白字符、清理 schema 占位符碎片并自动求值字面量地址加减
     2. 移除 | head/-N 或 | tail/-N 等输出限制后缀
     3. 对 struct 命令，确保 -o 选项紧跟在 struct 之后
 
@@ -82,8 +170,8 @@ def canonicalize_command_line(command_line: str) -> str:
     Returns:
         规范化后的命令字符串
     """
-    # 步骤 1: 压缩空白并去除首尾空格
-    normalized = _collapse_whitespace(command_line)
+    # 步骤 1: 压缩空白、清理占位符碎片并对字面量地址算术自动求值
+    normalized = resolve_address_arithmetic_in_line(command_line)
 
     # 步骤 2: 循环移除 head/tail 后缀，直到无法再移除
     while True:
@@ -148,9 +236,21 @@ def extract_command_lines(tool_name: str, args: Any) -> List[str]:
     # 处理普通命令：从 dict 或字符串中提取
     if isinstance(args, dict):
         command = str(args.get("command", "")).strip()
+        if not command:
+            raw_arguments = args.get("arguments")
+            if isinstance(raw_arguments, (list, tuple)):
+                command = " ".join(
+                    str(part).strip()
+                    for part in raw_arguments
+                    if str(part).strip()
+                )
     else:
         command = str(args).strip()
-    return [command] if command else []
+    if not command:
+        return []
+    # 结构化 action 的 arguments 不含 command_name；执行侧、校验侧、指纹、
+    # 收敛护栏都必须看到同一形式，否则会指纹分裂 / 护栏静默失效。
+    return [with_tool_prefix(tool_name, command)]
 
 
 def build_command_fingerprint(tool_name: str, args: Any) -> str:
@@ -213,6 +313,8 @@ def maybe_rewrite_module_symbol_tool_call(
     """
     if tool_name == "run_script" or not debug_symbol_paths:
         return None
+    if tool_name in _COMPOSITE_MCP_TOOLS:
+        return None
 
     lines = extract_command_lines(tool_name, args)
     if not lines or not _uses_module_specific_symbol(
@@ -221,7 +323,9 @@ def maybe_rewrite_module_symbol_tool_call(
         return None
 
     normalized_lines = [
-        canonicalize_command_line(line) for line in lines if line.strip()
+        canonicalize_command_line(with_tool_prefix(tool_name, line))
+        for line in lines
+        if line.strip()
     ]
     prelude = build_mod_s_prelude(debug_symbol_paths)
     script = "\n".join([*prelude, *normalized_lines])
@@ -259,6 +363,10 @@ def validate_tool_call_request(
         若验证失败返回错误信息字符串，成功返回 None
     """
     lines = extract_command_lines(tool_name, args)
+    if tool_name != "run_script":
+        # extract_command_lines 已补齐 command_name；这里保留一次幂等归一化，
+        # 防止直接传入未前缀行（非字典参数）的调用方绕过。
+        lines = normalize_command_lines(tool_name, lines)
 
     if tool_name != "run_script":
         for line in lines:
@@ -275,7 +383,9 @@ def validate_tool_call_request(
                     "sym -m <module> or sym -m <module> | grep -i <keyword>."
                 )
 
-        if _uses_module_specific_symbol(lines, debug_symbol_paths=debug_symbol_paths):
+        if tool_name not in _COMPOSITE_MCP_TOOLS and _uses_module_specific_symbol(
+            lines, debug_symbol_paths=debug_symbol_paths
+        ):
             required = [
                 _strip_module_debug_suffixes(str(path))
                 for path in (debug_symbol_paths or [])
@@ -285,6 +395,22 @@ def validate_tool_call_request(
                 "single crash commands that use third-party module symbols/types are forbidden; "
                 f"use run_script starting with one or more mod -s <module> <path> lines (required: {mod_list}) "
                 "and then issue the dependent command in the same crash session."
+            )
+
+        # 复合工具不是 crash 原生命令，不能改写成 run_script；但模块私有类型
+        # 必须在同一会话里先 mod -s，所以缺第 3 参数时给出可执行提示。
+        if (
+            tool_name == "inspect_slab_object"
+            and _uses_module_specific_symbol(
+                lines, debug_symbol_paths=debug_symbol_paths
+            )
+            and len(lines[0].split()) < 4
+        ):
+            return (
+                "inspect_slab_object uses a module-private type; pass the kernel "
+                "module name as the third argument "
+                "(inspect_slab_object <addr> <type> <module> [debug_path]) so "
+                "mod -s can run in the same crash session."
             )
 
     # 检查 run_script 至少包含一条命令
@@ -298,7 +424,11 @@ def validate_tool_call_request(
         # 例如：检查指令中涉及的偏移量（offset）是否在结构体定义的合法范围内，
         # 或者在执行 'bt' 命令时，是否允许携带特定的参数 (allow_bt_a)。
         # 如果校验失败，error 将包含具体的错误描述（如 "struct size mismatch"），用于反馈给 LLM。
-        error = _validate_command_line(line, allow_bt_a=allow_bt_a)
+        try:
+            error = _validate_command_line(line, allow_bt_a=allow_bt_a)
+        except (TypeError, ValueError) as exc:
+            # 参数解析类异常绝不能让整个 agent 节点崩溃：转成可反馈给 LLM 的错误。
+            return f"cannot parse numeric argument in crash command {line!r}: {exc}"
         if error:
             return error
 
@@ -408,9 +538,15 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
 
     # 地址算术只检查首个 pipe 之前的 crash 命令主体，避免把 grep tail
     # 中的选项或模式误判成 "identifier - identifier" 一类算术表达式。
+    # 注意：字面量十六进制/十进制偏移（如 0xff292187ae124a80+0x18）已在
+    # canonicalize_command_line 中自动求值；这里仅拦截无法求值的残余符号算术。
     arithmetic_target = normalized.split("|", 1)[0].strip()
     if _has_unresolved_address_arithmetic(arithmetic_target):
-        return f"address arithmetic must be resolved before execution: {normalized}"
+        return (
+            "address arithmetic must be resolved before execution: "
+            f"{normalized}. use `sym <symbol>` to resolve the symbol address "
+            "first, then emit the command with the literal address."
+        )
 
     rd_ss_error = _validate_rd_ss_command(normalized)
     if rd_ss_error is not None:
@@ -545,6 +681,58 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     # ptov/vtop/sym 命令检查：必须有目标操作数
     if command in {"ptov", "vtop", "sym"} and len(parts) == 1:
         return f"{command} requires a target operand."
+
+    if command == "inspect_slab_object":
+        if len(parts) < 2:
+            return "inspect_slab_object requires <hex_addr> [slot_size|struct_name] [module] [debug_path]."
+        if len(parts) > 5:
+            return (
+                "inspect_slab_object accepts at most "
+                "<hex_addr> [slot_size|struct_name] [module] [debug_path]."
+            )
+        target = parts[1].lower()
+        raw_hex = target[2:] if target.startswith("0x") else target
+        if not raw_hex or len(raw_hex) < 8 or any(c not in "0123456789abcdef" for c in raw_hex):
+            return "inspect_slab_object requires a hex kernel virtual address as its first argument."
+        if len(parts) >= 3:
+            slot_size = parse_int_literal(parts[2])
+            if slot_size is None and not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_.-]*", parts[2]
+            ):
+                return (
+                    "inspect_slab_object second argument must be slot_size_bytes, "
+                    "a C struct name, or a slab cache name."
+                )
+            if slot_size is not None and not (16 <= slot_size <= 4096):
+                return "inspect_slab_object slot_size_bytes must be between 16 and 4096."
+        if len(parts) >= 4 and not re.fullmatch(r"[A-Za-z_]\w*", parts[3]):
+            return "inspect_slab_object third argument must be a kernel module name."
+        if len(parts) >= 5 and not re.fullmatch(r"[A-Za-z0-9_./@+-]+", parts[4]):
+            return "inspect_slab_object fourth argument must be a debuginfo path."
+
+    if command == "compare_memory_blocks":
+        if len(parts) < 3 or len(parts) > 5:
+            return (
+                "compare_memory_blocks requires <src_hex_addr> <dst_hex_addr> "
+                "[qword_count] [stride_bytes]."
+            )
+        for addr_tok in parts[1:3]:
+            t = addr_tok.lower()
+            raw_hex = t[2:] if t.startswith("0x") else t
+            if not raw_hex or len(raw_hex) < 8 or any(c not in "0123456789abcdef" for c in raw_hex):
+                return "compare_memory_blocks requires valid hex kernel addresses for <src_hex_addr> and <dst_hex_addr>."
+        if len(parts) >= 4:
+            qword_count = parse_int_literal(parts[3])
+            if qword_count is None:
+                return "compare_memory_blocks qword_count must be an integer."
+            if not (2 <= qword_count <= 256):
+                return "compare_memory_blocks qword_count must be between 2 and 256."
+        if len(parts) >= 5:
+            stride = parse_int_literal(parts[4])
+            if stride is None:
+                return "compare_memory_blocks stride_bytes must be a decimal or 0x-prefixed integer."
+            if not (8 <= stride <= 4096):
+                return "compare_memory_blocks stride_bytes must be between 8 and 4096."
 
     return None
 

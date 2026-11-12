@@ -5,7 +5,9 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 
-from .consistency import parse_struct_layouts
+from .consistency import (
+    parse_struct_layouts,
+)
 
 _HEX = r"(?:0x)?[0-9a-fA-F]+"
 _RD_LINE_RE = re.compile(rf"^\s*(?P<address>{_HEX})\s*:\s*(?P<words>.*)$")
@@ -584,7 +586,7 @@ def extract_evidence_facts(
         # 提取命令的第一个单词（命令名），转为小写以统一匹配
         # 例如 "rd 0x100 8" → "rd"，"struct task_struct" → "struct"
         name = command.split(maxsplit=1)[0].lower() if command.strip() else ""
-        if name == "rd":
+        if name in {"rd", "compare_memory_blocks"}:
             # 解析内存读取输出，提取每个 8 字节字及其地址
             facts.update(_parse_rd(output))
         elif name == "struct":
@@ -600,6 +602,13 @@ def extract_evidence_facts(
             facts.update(_parse_vtop(output))
         elif name == "kmem":
             facts.update(_parse_kmem(output))
+        elif name == "inspect_slab_object":
+            facts.update(_parse_kmem(output))
+            facts.update(_parse_vtop(output))
+            facts.update(_parse_rd(output))
+            # struct -o / struct <type> <addr> 的输出也在同一个复合工具结果里，
+            # 不能漏掉布局事实（struct_type/struct_field/struct_size）。
+            facts.update(_parse_struct(output))
     return facts
 
 

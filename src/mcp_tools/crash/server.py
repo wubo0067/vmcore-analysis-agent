@@ -12,15 +12,278 @@ Crash MCP 服务器实现
 """
 
 from typing import Annotated
+import re
 from pydantic import Field
 from fastmcp import FastMCP
 from .executor import run_crash_command, run_crash_script
 from .scsishow import run_scsishow
+from src.utils.mechanics import (
+    format_mechanical_analysis_summary,
+    parse_int_literal,
+    parse_kmem_slab_outputs,
+    parse_memory_reads,
+)
 
 crash_server = FastMCP(
     "crash_server",
     instructions="This server provides crash analysis tools for Linux vmcore files.",
 )
+
+
+def _parse_hex_int(token: str) -> int:
+    cleaned = token.strip().lower()
+    if cleaned.startswith("0x"):
+        cleaned = cleaned[2:]
+    return int(cleaned, 16)
+
+
+@crash_server.tool()
+def inspect_slab_object(
+    command: Annotated[
+        str,
+        Field(
+            description=(
+                "The full 'inspect_slab_object' command string to execute.\n"
+                "Syntax: inspect_slab_object <hex_address> [slot_size_bytes|struct_name] [module] [debug_path]\n"
+                "Example: inspect_slab_object 0xff292187ae124a80 mpt3sas_adapter mpt3sas "
+                "/usr/lib/debug/lib/modules/4.18.0/mpt3sas.ko.debug\n"
+                "Composite helper: resolves real slab geometry from kmem -S first, then dumps the "
+                "target slot plus its immediate predecessor and successor slots, optionally decodes "
+                "the object with struct -o/struct <type> <addr> (pass the module name, and a "
+                "custom debug_path when debuginfo is not in the default search path, to load "
+                "module-private debuginfo with mod -s), and appends deterministic slab slot index "
+                "& boundary calculations."
+            )
+        ),
+    ],
+    vmcore_path: Annotated[
+        str, Field(description="The absolute path to the vmcore file.")
+    ],
+    vmlinux_path: Annotated[
+        str, Field(description="The absolute path to the vmlinux file.")
+    ],
+) -> str:
+    """
+    Composite slab object & neighbor inspector (kmem -S + vtop + neighbor slot dumps + mechanical slot attribution).
+    (Crash Subcommand: inspect_slab_object)
+    """
+    try:
+        parts = [p for p in command.strip().split() if p]
+        if parts and parts[0].lower() == "inspect_slab_object":
+            parts = parts[1:]
+        if not parts:
+            return "[error] inspect_slab_object requires at least <hex_address>."
+        target_addr = _parse_hex_int(parts[0])
+        if len(parts) > 4:
+            return (
+                "[error] inspect_slab_object accepts at most "
+                "<addr> [slot_size|struct_name] [module] [debug_path]."
+            )
+        slot_size = 128
+        struct_name = ""
+        module_name = ""
+        debug_path = ""
+        if len(parts) >= 2:
+            second = parts[1]
+            parsed_size = parse_int_literal(second)
+            if parsed_size is not None:
+                if not (16 <= parsed_size <= 4096):
+                    return "[error] inspect_slab_object slot_size_bytes must be between 16 and 4096."
+                slot_size = parsed_size
+            elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", second):
+                # Only C identifiers can be passed to `struct`; cache names such as
+                # kmalloc-96 are accepted as a label but decoded via kmem instead.
+                struct_name = second if re.fullmatch(r"[A-Za-z_]\w*", second) else ""
+            else:
+                return (
+                    "[error] inspect_slab_object second argument must be "
+                    "slot_size_bytes, a C struct name, or a slab cache name."
+                )
+        if len(parts) >= 3:
+            if not re.fullmatch(r"[A-Za-z_]\w*", parts[2]):
+                return "[error] inspect_slab_object third argument must be a kernel module name."
+            module_name = parts[2]
+        if len(parts) >= 4:
+            if not re.fullmatch(r"[A-Za-z0-9_./@+-]+", parts[3]):
+                return "[error] inspect_slab_object fourth argument must be a debuginfo path."
+            debug_path = parts[3]
+
+        # Phase 1: metadata only. Never dump neighbor slots before kmem tells us
+        # the real object size and slot base (non power-of-two caches such as
+        # kmalloc-96/192 would otherwise be read at the wrong stride).
+        phase1: list[str] = []
+        if module_name:
+            # Module-private struct decode needs the module debuginfo in the SAME
+            # crash session; every run_script is a fresh process.
+            if debug_path:
+                phase1.append(f"mod -s {module_name} {debug_path}")
+            else:
+                phase1.append(f"mod -s {module_name}")
+        phase1.extend(
+            [
+                f"kmem -S 0x{target_addr:x}",
+                f"vtop 0x{target_addr:x}",
+            ]
+        )
+        if struct_name:
+            phase1.append(f"struct -o {struct_name}")
+            phase1.append(f"struct {struct_name} 0x{target_addr:x}")
+        raw_output = run_crash_script(
+            "\n".join(phase1), vmcore_path, vmlinux_path, True
+        )
+        if struct_name and "invalid data structure reference" in raw_output.lower():
+            raw_output += (
+                "\n[hint] struct type is module-private; pass the module name as the "
+                "third argument (inspect_slab_object <addr> <type> <module>) so the "
+                "tool can run mod -s in the same crash session."
+            )
+
+        # Phase 2: dump prev/current/next using the geometry parsed from phase 1.
+        slab_infos = parse_kmem_slab_outputs(raw_output)
+        if slab_infos:
+            info = slab_infos[0]
+            slot_size = info.obj_size or slot_size
+            qwords = min(512, max(2, slot_size // 8))
+            start = (
+                info.prev_slot if info.prev_slot is not None else info.slot_address
+            )
+            count = min(768, qwords * (3 if info.prev_slot is not None else 2))
+        else:
+            aligned_addr = (
+                target_addr & ~(slot_size - 1)
+                if (slot_size & (slot_size - 1)) == 0
+                else target_addr
+            )
+            start = max(0, aligned_addr - slot_size)
+            qwords = max(2, slot_size // 8)
+            count = qwords * 3
+
+        slot_dump = run_crash_command(
+            f"rd -x 0x{start:x} {count}", vmcore_path, vmlinux_path, True
+        )
+        raw_output = f"{raw_output.rstrip()}\n\n{slot_dump}"
+        summary = format_mechanical_analysis_summary(
+            raw_output,
+            parse_memory_reads(raw_output),
+            default_stride=max(16, min(slot_size, 4096)),
+        )
+        if summary:
+            return f"{raw_output.rstrip()}\n\n{summary}"
+        return raw_output
+    except Exception as e:
+        return f"Failed to execute inspect_slab_object: {str(e)}"
+
+
+@crash_server.tool()
+def compare_memory_blocks(
+    command: Annotated[
+        str,
+        Field(
+            description=(
+                "The full 'compare_memory_blocks' command string to execute.\n"
+                "Syntax: compare_memory_blocks <src_hex_addr> <dst_hex_addr> [qword_count] [stride_bytes]\n"
+                "Example: compare_memory_blocks 0xff292187bbcd3a00 0xff292187ae124a00 32 128\n"
+                "Composite helper: reads both virtual address blocks in one crash session and "
+                "deterministically computes address delta, exact byte/qword match length, "
+                "spanned stride-byte slots, and the exact offset + values of the first divergence."
+            )
+        ),
+    ],
+    vmcore_path: Annotated[
+        str, Field(description="The absolute path to the vmcore file.")
+    ],
+    vmlinux_path: Annotated[
+        str, Field(description="The absolute path to the vmlinux file.")
+    ],
+) -> str:
+    """
+    Read and mechanically compare two memory blocks for byte-for-byte copy correlation, constant address delta, and first divergence offset.
+    (Crash Subcommand: compare_memory_blocks)
+    """
+    try:
+        parts = [p for p in command.strip().split() if p]
+        if parts and parts[0].lower() == "compare_memory_blocks":
+            parts = parts[1:]
+        if len(parts) < 2:
+            return (
+                "[error] compare_memory_blocks requires <src_hex_addr> <dst_hex_addr> [qword_count]."
+            )
+        src_addr = _parse_hex_int(parts[0])
+        dst_addr = _parse_hex_int(parts[1])
+        if len(parts) > 4:
+            return (
+                "[error] compare_memory_blocks accepts at most "
+                "<src> <dst> [qword_count] [stride_bytes]."
+            )
+        qword_count = parse_int_literal(parts[2]) if len(parts) >= 3 else 32
+        if qword_count is None:
+            return "[error] compare_memory_blocks qword_count must be an integer."
+        if not (2 <= qword_count <= 256):
+            return "[error] compare_memory_blocks qword_count must be between 2 and 256."
+        stride = parse_int_literal(parts[3]) if len(parts) >= 4 else 128
+        if stride is None:
+            return "[error] compare_memory_blocks stride_bytes must be an integer."
+        if not (8 <= stride <= 4096):
+            return "[error] compare_memory_blocks stride_bytes must be between 8 and 4096."
+        script_lines = [
+            f"rd -x 0x{src_addr:x} {qword_count}",
+            f"rd -x 0x{dst_addr:x} {qword_count}",
+        ]
+        raw_output = run_crash_script(
+            "\n".join(script_lines), vmcore_path, vmlinux_path, True
+        )
+        reads = parse_memory_reads(raw_output)
+        summary = format_mechanical_analysis_summary(
+            raw_output, reads, default_stride=stride
+        )
+        # Also compute direct aligned word-by-word comparison from src_addr & dst_addr start
+        word_map: dict[int, int] = {}
+        for r in reads:
+            for idx, w in enumerate(r.words):
+                word_map[r.address + idx * 8] = w
+        direct_lines: list[str] = [
+            f"- block_pair: src=0x{src_addr:x} dst=0x{dst_addr:x} "
+            f"signed_delta={dst_addr - src_addr:+d} (abs_delta=0x{abs(dst_addr - src_addr):x}, "
+            f"window={qword_count * 8}B / {qword_count} qwords)"
+        ]
+        matched_qwords = 0
+        first_diff_byte: int | None = None
+        first_diff_detail = ""
+        for q in range(qword_count):
+            sw = word_map.get(src_addr + q * 8)
+            dw = word_map.get(dst_addr + q * 8)
+            if sw is None or dw is None:
+                break
+            if sw == dw:
+                matched_qwords += 1
+            else:
+                sb = (sw & ((1 << 64) - 1)).to_bytes(8, "little")
+                db = (dw & ((1 << 64) - 1)).to_bytes(8, "little")
+                sub = 0
+                for b1, b2 in zip(sb, db):
+                    if b1 == b2:
+                        sub += 1
+                    else:
+                        break
+                first_diff_byte = q * 8 + sub
+                first_diff_detail = (
+                    f"first_diff_at=+0x{first_diff_byte:x} ({first_diff_byte}B): "
+                    f"src@0x{src_addr + q * 8:x}=0x{sw:016x} vs dst@0x{dst_addr + q * 8:x}=0x{dw:016x}"
+                )
+                break
+        exact_prefix_bytes = (
+            first_diff_byte if first_diff_byte is not None else matched_qwords * 8
+        )
+        direct_lines.append(
+            f"- aligned_prefix_match: {exact_prefix_bytes}B (0x{exact_prefix_bytes:x}, "
+            f"{matched_qwords} full qwords)"
+            + (f"; {first_diff_detail}" if first_diff_detail else "; all compared qwords identical")
+        )
+        if summary:
+            return f"{raw_output.rstrip()}\n\n{summary}\n" + "\n".join(direct_lines)
+        return f"{raw_output.rstrip()}\n\n[mechanical-analysis]\n" + "\n".join(direct_lines)
+    except Exception as e:
+        return f"Failed to execute compare_memory_blocks: {str(e)}"
 
 
 # @crash_server.tool()

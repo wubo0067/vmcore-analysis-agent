@@ -423,6 +423,18 @@ class ToolCall(BaseModel):
                         break
                 if "arguments" not in data:
                     data["arguments"] = []
+            if isinstance(data.get("arguments"), list):
+                cleaned_args: list[str] = []
+                for raw_item in data["arguments"]:
+                    token = str(raw_item).strip()
+                    if not token:
+                        continue
+                    if "_placeholder_do_not_use_directly" in token.lower():
+                        continue
+                    if token in {"],", "]", "},", "}"}:
+                        continue
+                    cleaned_args.append(token)
+                data["arguments"] = cleaned_args
         return data
 
 

@@ -28,6 +28,9 @@ from .action_guard import (
     build_mod_s_prelude,
     canonicalize_command_line,
     missing_module_preludes,
+    resolve_address_arithmetic_in_line,
+    resolve_address_arithmetic_token,
+    sanitize_action_tokens,
     validate_tool_call_request,
 )
 from .consistency import (
@@ -171,7 +174,7 @@ def render_action_arguments(arguments: list[str]) -> str:
     in_grep_command = False
     grep_expects_pattern = False
 
-    for token in arguments:
+    for token in sanitize_action_tokens(arguments):
         if token == "|":
             rendered_tokens.append(token)
             in_grep_command = False
@@ -199,7 +202,9 @@ def render_action_arguments(arguments: list[str]) -> str:
             grep_expects_pattern = False
             continue
 
-        rendered_tokens.append(token)
+        rendered_tokens.append(
+            token if in_grep_command else resolve_address_arithmetic_token(token)
+        )
         if in_grep_command and grep_expects_pattern:
             grep_expects_pattern = False
 
@@ -504,7 +509,13 @@ def build_tool_calls(
         # drop the required fields.
         tool_args = dict(analysis_result.action.parameters)
     elif tool_name == "run_script":
-        tool_args = {"script": "\n".join(analysis_result.action.arguments)}
+        cleaned_lines = [
+            resolve_address_arithmetic_in_line(line)
+            for line in sanitize_action_tokens(analysis_result.action.arguments)
+        ]
+        cleaned_lines = [line for line in cleaned_lines if line]
+        analysis_result.action.arguments = cleaned_lines
+        tool_args = {"script": "\n".join(cleaned_lines)}
     else:
         tool_args = {
             "command": render_action_arguments(analysis_result.action.arguments)
@@ -1255,6 +1266,23 @@ def _preflight_action_with_guard(
     # 非 crash 工具（kernel_source 等）不适用管道改写 / mod -s 前导 / crash 语法校验。
     if _is_non_crash_tool(action.command_name):
         return analysis_step
+
+    # ── 第 0b 步：清理 schema 占位符并自动求值字面量地址算术 ──
+    if action.arguments:
+        if action.command_name == "run_script":
+            action.arguments = [
+                line
+                for line in (
+                    resolve_address_arithmetic_in_line(raw_line)
+                    for raw_line in sanitize_action_tokens(action.arguments)
+                )
+                if line
+            ]
+        else:
+            action.arguments = [
+                resolve_address_arithmetic_token(tok)
+                for tok in sanitize_action_tokens(action.arguments)
+            ]
 
     prefix = f"{log_prefix}: " if log_prefix else ""
     rendered_action = _render_structured_action_text(analysis_step)

@@ -276,5 +276,101 @@ class ProductionPathRegressionTests(unittest.TestCase):
         self.assertIn("@0xff100000", conflicts[1])
 
 
+class MechanicalAnalysisTests(unittest.TestCase):
+    def test_parse_kmem_slab_and_vtop_and_format_summary(self) -> None:
+        from src.react.consistency import (
+            coalesce_memory_reads,
+            detect_memory_block_correlations,
+            format_mechanical_analysis_summary,
+            parse_kmem_slab_outputs,
+            parse_vtop_outputs,
+        )
+
+        kmem_out = (
+            "CACHE             OBJSIZE  ALLOCATED     TOTAL  SLABS  SSIZE  NAME\n"
+            "ff292187800047c0      128       2164      2944     92     4k  kmalloc-128\n"
+            "  SLAB              MEMORY            NODE  TOTAL  ALLOCATED  FREE\n"
+            "  ffca29c406b84900  ff292187ae124000     0     32         31     1\n"
+            "  FREE / [ALLOCATED]\n"
+            "  [ff292187ae124a80]\n"
+        )
+        vtop_out = (
+            "VIRTUAL           PHYSICAL        \n"
+            "ff292187ae124a80  1ae124a80       \n"
+            "  PAGE        PHYSICAL      MAPPING       INDEX CNT FLAGS\n"
+            "ffca29c406b84900 1ae124000                0        0  1 17ffffc0008100 slab\n"
+        )
+        slabs = parse_kmem_slab_outputs(kmem_out)
+        self.assertEqual(len(slabs), 1)
+        self.assertEqual(slabs[0].cache_name, "kmalloc-128")
+        self.assertEqual(slabs[0].obj_size, 128)
+        self.assertEqual(slabs[0].slot_address, 0xFF292187AE124A80)
+        self.assertEqual(slabs[0].slot_index, 21)
+        self.assertEqual(slabs[0].prev_slot, 0xFF292187AE124A00)
+        self.assertEqual(slabs[0].next_slot, 0xFF292187AE124B00)
+
+        vtops = parse_vtop_outputs(vtop_out)
+        self.assertEqual(len(vtops), 1)
+        self.assertEqual(vtops[0].virtual_address, 0xFF292187AE124A80)
+        self.assertEqual(vtops[0].physical_address, 0x1AE124A80)
+        self.assertEqual(vtops[0].page_offset, 0xA80)
+
+        rd_src = parse_memory_reads(
+            "ff29218824aa8a80:  0010000904060001 0000000000000000\n"
+            "ff29218824aa8a90:  0f00000500000000 0000000000000012\n"
+            "ff29218824aa8aa0:  000000000000005c 0000000000000000\n"
+            "ff29218824aa8ab0:  0000000000000000 0000000000000000\n"
+        )
+        rd_dst_text = (
+            "ff292187ae124a80:  0010000904060001 0000000000000000\n"
+            "ff292187ae124a90:  0f00000500000000 0000000000000012\n"
+            "ff292187ae124aa0:  000000000000005c 0000000000000000\n"
+            "ff292187ae124ab0:  0000000000000000 0000000000000000\n"
+        )
+        rd_dst = parse_memory_reads(rd_dst_text)
+        coalesced = coalesce_memory_reads(rd_src + rd_dst)
+        correlations = detect_memory_block_correlations(coalesced)
+        self.assertEqual(len(correlations), 1)
+        self.assertEqual(correlations[0].exact_match_bytes, 64)
+        self.assertGreaterEqual(correlations[0].matching_words, 8)
+
+        summary = format_mechanical_analysis_summary(
+            kmem_out + "\n" + vtop_out + "\n" + rd_dst_text,
+            all_memory_reads=coalesced,
+        )
+        self.assertIn("[mechanical-analysis]", summary)
+        self.assertIn("slab_slot:", summary)
+        self.assertIn("vtop_map:", summary)
+        self.assertIn("memory_copy_candidate:", summary)
+
+    def test_detect_memory_block_correlations_ignores_two_pointer_coincidences(self) -> None:
+        from src.utils.mechanics import MemoryRead, detect_memory_block_correlations
+
+        low = MemoryRead(
+            address=0x1000,
+            words=(0x0000000000000001, 0x0000000000000002, 0x0000000000000003, 0x0000000000000004),
+        )
+        high = MemoryRead(
+            address=0x2000,
+            words=(0x0000000000000001, 0x0000000000000002, 0x0000000000000011, 0x0000000000000012),
+        )
+        self.assertEqual(detect_memory_block_correlations([low, high]), [])
+
+    def test_coalesce_accepts_duck_typed_reads(self) -> None:
+        from src.utils.mechanics import coalesce_memory_reads
+
+        class _Read:
+            def __init__(self, address: int, words: tuple[int, ...]) -> None:
+                self.address = address
+                self.words = words
+
+        merged = coalesce_memory_reads(
+            [_Read(0x1000, (1, 2)), _Read(0x1010, (3, 4))]
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].address, 0x1000)
+        self.assertEqual(merged[0].words, (1, 2, 3, 4))
+
+
 if __name__ == "__main__":
     unittest.main()

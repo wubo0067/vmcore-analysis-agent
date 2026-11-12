@@ -156,6 +156,194 @@ def source_status_impl(source_root: str = "") -> str:
     return "\n".join(lines)
 
 
+_MACRO_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9_]{3,}\b")
+_MACRO_STOPWORDS = frozenset(
+    {
+        "NULL",
+        "TRUE",
+        "FALSE",
+        "EINVAL",
+        "ENOMEM",
+        "EIO",
+        "EBUSY",
+        "ENOENT",
+        "EFAULT",
+        "EAGAIN",
+        "ETIMEDOUT",
+        "ENOSPC",
+        "EPERM",
+        "EACCES",
+        "ENODEV",
+        "ENXIO",
+        "GFP_KERNEL",
+        "GFP_ATOMIC",
+        "GFP_NOWAIT",
+        "THIS_MODULE",
+        "EXPORT_SYMBOL",
+        "EXPORT_SYMBOL_GPL",
+        "MODULE_LICENSE",
+        "MODULE_AUTHOR",
+        "MODULE_DESCRIPTION",
+        "MODULE_VERSION",
+        "WARN_ON",
+        "WARN_ON_ONCE",
+        "BUG_ON",
+        "BUILD_BUG_ON",
+        "READ_ONCE",
+        "WRITE_ONCE",
+        "ARRAY_SIZE",
+        "CONTAINER_OF",
+        "LIST_HEAD",
+        "INIT_LIST_HEAD",
+        "SPIN_LOCK_IRQSAVE",
+        "SPIN_UNLOCK_IRQRESTORE",
+    }
+)
+
+
+_MACRO_CACHE_LIMIT = 64
+_MACRO_RESOLUTION_CACHE: dict[tuple[str, str, tuple[str, ...]], dict[str, str]] = {}
+_MACRO_HEADER_BUDGET = 120
+_MACRO_BYTE_BUDGET = 4 * 1024 * 1024
+
+
+def _iter_macro_header_paths(tree: SourceTree, source_path: Path) -> Iterator[Path]:
+    """Yield headers to scan for ``#define`` values, cheap local ones first.
+
+    Sibling headers cover driver-private macros; the ``include/`` tree covers
+    cross-directory constants (``include/linux/...``) that the old
+    same-directory-only scan missed. A bounded header/byte budget keeps the
+    fallback cheap on a full kernel tree.
+    """
+
+    seen: set[Path] = set()
+    for sibling in sorted(source_path.parent.glob("*.h"))[:16]:
+        if sibling not in seen:
+            seen.add(sibling)
+            yield sibling
+
+    include_root = tree.root / "include"
+    if not include_root.is_dir():
+        return
+
+    preferred: list[Path] = []
+    for name in ("linux", "asm-generic", "uapi"):
+        base = include_root / name
+        if base.is_dir():
+            preferred.extend(sorted(base.glob("*.h")))
+
+    emitted = 0
+    for path in preferred:
+        if emitted >= _MACRO_HEADER_BUDGET:
+            return
+        if path in seen:
+            continue
+        seen.add(path)
+        emitted += 1
+        yield path
+
+    for dirpath, dirnames, filenames in os.walk(include_root):
+        dirnames[:] = sorted(name for name in dirnames if name != ".git")
+        for name in sorted(filenames):
+            if emitted >= _MACRO_HEADER_BUDGET:
+                return
+            if not name.endswith(".h"):
+                continue
+            path = Path(dirpath) / name
+            if path in seen:
+                continue
+            seen.add(path)
+            emitted += 1
+            yield path
+
+
+def _resolve_referenced_macros(
+    tree: SourceTree,
+    source_path: Path,
+    file_lines: list[str],
+    snippet_lines: list[str],
+) -> list[str]:
+    """Resolve simple `#define` constants referenced in a source snippet."""
+    candidates: list[str] = []
+    seen_tokens: set[str] = set()
+    for line in snippet_lines:
+        stripped = line.lstrip()
+        if stripped.startswith(("*", "/*", "//", "#")):
+            continue
+        for token in _MACRO_TOKEN_RE.findall(line):
+            if (
+                token in _MACRO_STOPWORDS
+                or token.startswith("CONFIG_")
+                or token in seen_tokens
+            ):
+                continue
+            seen_tokens.add(token)
+            candidates.append(token)
+            if len(candidates) >= 16:
+                break
+        if len(candidates) >= 16:
+            break
+
+    if not candidates:
+        return []
+
+    cache_key = (str(tree.root), str(source_path), tuple(sorted(candidates)))
+    cached = _MACRO_RESOLUTION_CACHE.get(cache_key)
+    if cached is not None:
+        return [cached[name] for name in candidates if name in cached][:8]
+
+    alt = "|".join(re.escape(tok) for tok in candidates)
+    define_re = re.compile(
+        rf"^\s*#\s*define\s+(?P<name>{alt})\b(?:\s+(?P<val>.+?))?\s*$"
+    )
+    resolved: dict[str, str] = {}
+
+    def _collect_from_lines(lines_to_scan: list[str], rel_label: str) -> None:
+        for line_no, text_line in enumerate(lines_to_scan, start=1):
+            m = define_re.match(text_line)
+            if m is None:
+                continue
+            name = m.group("name")
+            if name in resolved:
+                continue
+            # Ignore function-like macros `#define FOO(x)` when there is no space before '('
+            after_name = text_line[m.end("name") :]
+            if after_name.startswith("("):
+                continue
+            val = (m.group("val") or "").split("/*", 1)[0].split("//", 1)[0].strip()
+            if not val or val.endswith("\\"):
+                continue
+            resolved[name] = f"{name} = {_trim(val, 80)} ({rel_label}:{line_no})"
+
+    _collect_from_lines(file_lines, relative_name(tree, source_path))
+
+    if len(resolved) < len(candidates):
+        remaining_bytes = _MACRO_BYTE_BUDGET
+        for header in _iter_macro_header_paths(tree, source_path):
+            if len(resolved) >= len(candidates) or len(resolved) >= 8:
+                break
+            if remaining_bytes <= 0:
+                break
+            try:
+                raw_h = header.read_bytes()
+            except OSError:
+                continue
+            remaining_bytes -= len(raw_h)
+            if len(raw_h) > 256 * 1024 or not _is_probably_text(raw_h):
+                continue
+            _collect_from_lines(
+                raw_h.decode("utf-8", errors="replace").splitlines(),
+                relative_name(tree, header),
+            )
+
+    if resolved:
+        if len(_MACRO_RESOLUTION_CACHE) >= _MACRO_CACHE_LIMIT:
+            _MACRO_RESOLUTION_CACHE.pop(next(iter(_MACRO_RESOLUTION_CACHE)))
+        _MACRO_RESOLUTION_CACHE[cache_key] = dict(resolved)
+
+    return [resolved[name] for name in candidates if name in resolved][:8]
+
+
 def read_source_impl(
     file: str,
     kver: str = "",
@@ -205,15 +393,22 @@ def read_source_impl(
             end = start + MAX_LINES_PER_READ - 1
 
     anchor = line if line > 0 else start
+    snippet_slice = lines[start - 1 : end]
     body = "\n".join(
         f"{number:6d}| {lines[number - 1]}" for number in range(start, end + 1)
+    )
+    macro_defs = _resolve_referenced_macros(tree, path, lines, snippet_slice)
+    macro_footer = (
+        "\n[macro-constants]\n" + "\n".join(f"- {item}" for item in macro_defs)
+        if macro_defs
+        else ""
     )
     header = (
         f"{_status_block(tree)}\n"
         f"file={rel} lines={start}-{end}/{total}\n"
         f"SOURCE_REF: {rel}:{anchor}\n"
     )
-    output = f"{header}{body}"
+    output = f"{header}{body}{macro_footer}"
     if len(output) > MAX_OUTPUT_CHARS:
         output = output[:MAX_OUTPUT_CHARS] + "\n[truncated]"
     return output
@@ -480,7 +675,8 @@ def find_struct_impl(
     kver: str = "",
     prefix: str = "",
     source_root: str = "",
-    max_lines: int = 120,
+    max_lines: int = 350,
+    field_filter: str = "",
 ) -> str:
     """Return the full definition body of one struct type in a single hop.
 
@@ -497,8 +693,15 @@ def find_struct_impl(
     if tree is None:
         return f"SOURCE_ERROR {error}"
 
-    limit = max(10, min(int(max_lines or 120), 400))
+    limit = max(10, min(int(max_lines or 350), 500))
     needle = name.encode()
+    filter_regex: Optional[re.Pattern[str]] = None
+    if field_filter and str(field_filter).strip():
+        raw_pat = str(field_filter).strip()
+        try:
+            filter_regex = re.compile(raw_pat, re.IGNORECASE)
+        except re.error:
+            filter_regex = re.compile(re.escape(raw_pat), re.IGNORECASE)
 
     def _scan(path: Path) -> Optional[str]:
         try:
@@ -528,29 +731,63 @@ def find_struct_impl(
             else:
                 continue
 
-            body: list[str] = []
+            full_struct_lines: list[tuple[int, str]] = []
             depth = 0
             in_block_comment = start_in_block
-            for offset in range(brace_index, min(len(lines), brace_index + limit)):
+            for offset in range(brace_index, min(len(lines), brace_index + 1200)):
                 current = lines[offset]
                 code, in_block_comment = _code_without_comments(
                     current, in_block_comment
                 )
                 depth += code.count("{") - code.count("}")
-                body.append(f"{offset + 1:6d}| {current}")
+                full_struct_lines.append((offset + 1, current))
                 if depth <= 0:
                     break
 
+            if filter_regex is not None:
+                keep_indexes: set[int] = set()
+                for idx, (ln, txt) in enumerate(full_struct_lines):
+                    if (
+                        filter_regex.search(txt)
+                        or ln == full_struct_lines[0][0]
+                        or ln == full_struct_lines[-1][0]
+                    ):
+                        keep_indexes.add(idx)
+                # 嵌套 struct/union 的开闭行不含被筛选字段名，但它们是理解
+                # “该字段属于哪个子结构”的上下文；保留花括号行。
+                for idx, (_ln, txt) in enumerate(full_struct_lines):
+                    stripped = txt.strip()
+                    if stripped.endswith("{") or stripped.startswith("}"):
+                        keep_indexes.add(idx)
+                matched = [
+                    f"{ln:6d}| {txt}"
+                    for idx, (ln, txt) in enumerate(full_struct_lines)
+                    if idx in keep_indexes
+                ]
+                body = matched[:limit]
+                truncated = len(matched) > limit
+            else:
+                body = [f"{ln:6d}| {txt}" for ln, txt in full_struct_lines[:limit]]
+                truncated = len(full_struct_lines) > limit
+
             rel = relative_name(tree, path)
+            end_line_num = (
+                full_struct_lines[-1][0]
+                if filter_regex is not None
+                else brace_index + len(body)
+            )
             header = (
                 f"{_status_block(tree)}\n"
                 f"SOURCE_STRUCT type={name} file={rel} "
-                f"lines={brace_index + 1}-{brace_index + len(body)}\n"
+                f"lines={brace_index + 1}-{end_line_num}\n"
                 f"SOURCE_REF: {rel}:{index + 1}\n"
             )
             output = header + "\n".join(body)
-            if len(body) >= limit:
-                output += "\n[truncated: definition longer than max_lines]"
+            if truncated:
+                output += (
+                    f"\n[truncated: definition has {len(full_struct_lines)} lines "
+                    f"(>{limit}); pass field_filter='<regex>' or higher max_lines]"
+                )
             return output
         return None
 

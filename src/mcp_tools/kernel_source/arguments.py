@@ -18,7 +18,7 @@ POSITIONAL_FIELDS: dict[str, tuple[str, ...]] = {
     "git_history": ("file", "start_line", "end_line"),
     "list_writers": ("field",),
     "grep_source": ("pattern",),
-    "find_struct": ("type_name", "kver", "prefix"),
+    "find_struct": ("type_name", "kver", "prefix", "field_filter"),
 }
 
 _INTEGER_FIELDS = frozenset({"line", "start_line", "end_line"})

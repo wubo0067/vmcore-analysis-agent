@@ -212,6 +212,8 @@ Diagnostic-value rule:
 Correct examples:
 - kmem -i
 - kmem -S <addr|cache_name>
+- inspect_slab_object <addr> [struct_name]
+- compare_memory_blocks <src_addr> <dst_addr> [qword_count]
 - kmem -S kmalloc-4096
 - kmem -p <PA>
 - struct -o <type>
@@ -221,11 +223,17 @@ Correct examples:
 - rd -x <addr> <count>
 - run_script rd -SS <address> 64 | grep "<concrete_anchor>"
 
-Correct arithmetic handling examples:
-- Correct reasoning: "canary is 0x40 bytes before ffff8b817de17a10, so the literal target is ffff8b817de179d0"
-- Correct action: rd -x ffff8b817de179d0 16
-- Forbidden action: rd -x ffff8b817de17a10-0x40 16
-- Forbidden action: rd -x ffff8b817de17a10+0x18 8
+## 1.3b Mechanical Calculation & Composite Tool Discipline
+
+- Never spend multiple steps manually probing adjacent slab slots, computing 128-byte/stride boundaries, or issuing repeated small `rd -x` reads to compare two memory regions.
+- Every tool output automatically appends a `[mechanical-analysis]` section when `kmem -S`, `vtop`, or `rd -x` outputs are present. It pre-computes slab object base/end/offset/stride, physical page frame bounds, coalesced memory spans, and exact byte/qword copy correlations across memory blocks. Always read and cite `[mechanical-analysis]` directly instead of re-deriving these numbers by hand.
+- Prefer `inspect_slab_object <addr> [struct_name|slot_size_bytes] [module] [debug_path]` to get `kmem -S`, `vtop`, previous/current/next slab slot memory dumps, and optional `struct -o`/`struct <type> <addr>` decode in a single step. The executor resolves the real slot geometry from `kmem -S` before dumping neighbors. For a module-private struct pass the module name as the third argument (e.g. `inspect_slab_object <addr> mpt3sas_adapter mpt3sas`); if that module's debuginfo is only available via a custom `debug_symbol_paths` entry, pass that `.ko.debug` path as the fourth argument so the tool runs `mod -s <module> <path>` in the same crash session.
+- Prefer `compare_memory_blocks <src_addr> <dst_addr> [qword_count] [stride_bytes]` to dump two regions and compute their exact word-by-word diff and shifted-copy alignment in a single step.
+
+Correct arithmetic handling:
+- Literal address+offset expressions (e.g. `rd -x ff292187ae124a80+0x18 4`) are auto-evaluated by the executor before execution.
+- Still prefer passing the final address directly, e.g. compute `ff292187ae124a98` and issue `rd -x ff292187ae124a98 4`.
+- Symbol arithmetic such as `sym+0x10` is not auto-evaluated: resolve the symbol with `sym <symbol>` first, then pass the numeric address.
 
 ## 1.3a Data Width and Alignment Discipline
 

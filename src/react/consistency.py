@@ -18,6 +18,19 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
+from src.utils.mechanics import (
+    MemoryBlockCorrelation,
+    MemoryRead,
+    SlabObjectInfo,
+    VtopTranslation,
+    coalesce_memory_reads,
+    detect_memory_block_correlations,
+    format_mechanical_analysis_summary,
+    parse_kmem_slab_outputs,
+    parse_memory_reads,
+    parse_vtop_outputs,
+)
+
 _HEX = r"(?:0x)?[0-9a-fA-F]+"
 
 # 结构体布局头部，例如 "struct irq_desc {"。
@@ -63,14 +76,6 @@ _MIN_OFFENDING_POINTER_FIELDS = 2
 
 # 单条矛盾事实中最多列出的违规字段数（控制提示词长度）。
 _MAX_LISTED_FIELDS = 4
-
-
-@dataclass(frozen=True)
-class MemoryRead:
-    """一次 ``rd`` 读取得到的连续内存快照。"""
-
-    address: int
-    words: tuple[int, ...]
 
 
 def _to_offset(text: str) -> int | None:
@@ -204,49 +209,6 @@ def parse_struct_layouts(text: str) -> dict[str, dict[str, Any]]:
 
     _commit(current)
     return layouts
-
-
-def parse_memory_reads(text: str) -> list[MemoryRead]:
-    """解析 crash ``rd -x`` 输出为内存快照列表。
-
-    crash 按行打印内存，每行通常是 2 个字，因此连续的地址行会被合并为一次
-    快照，才能与结构体布局的字节数进行比较。合并只依据地址连续性，
-    两次分别发起的读取不会因此被错误拼接（起始地址不连续即断开）。
-    """
-    snapshots: list[MemoryRead] = []
-    start: int | None = None
-    words: list[int] = []
-
-    def _flush() -> None:
-        if start is not None and words:
-            snapshots.append(MemoryRead(address=start, words=tuple(words)))
-
-    for line in text.splitlines():
-        match = _RD_LINE_RE.match(line)
-        if match is None:
-            continue
-        address = _to_address(match.group("address"))
-        if address is None:
-            continue
-        line_words: list[int] = []
-        for token in match.group("words").split():
-            # 行尾的 ASCII 列与缩进说明不属于字值，遇到即停止。
-            if _RD_WORD_RE.match(token) is None:
-                break
-            line_words.append(int(token, 16))
-        if not line_words:
-            continue
-
-        if start is not None and address == start + len(words) * _WORD_SIZE:
-            words.extend(line_words)
-            continue
-
-        _flush()
-        start = address
-        words = list(line_words)
-
-    _flush()
-    return snapshots
 
 
 def _pointer_fields_by_offset(layout: Mapping[str, Any]) -> dict[int, dict[str, Any]]:
