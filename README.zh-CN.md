@@ -12,9 +12,12 @@
 
 主要能力：
 
-- 先收集崩溃基础信息，再根据当前分析状态选择后续诊断动作。
-- 通过 MCP 调用 `crash` 等工具，并对命令执行进行保护和去重。
+- 先收集崩溃基础信息（含已加载模块 `mod`），再根据当前分析状态选择后续诊断动作。
+- 通过 MCP 调用 `crash` 等工具，对命令执行进行保护和去重；严格约束 `run_script` 语法（执行纯 crash 命令、拦截 shell 控制流并引导循环展开与单步多命令批量取证）。
+- 自动检测并提示模块私有结构体类型所需的会话级 `mod -s <module>` 前导符号加载。
+- 结合内核源码树提供结构体定义快速定位（`find_struct`）、反汇编代码行映射与补丁验证。
 - 使用假设与验证门控跟踪证据；是否关闭门控由执行器根据工具输出判断，而非直接采信模型给出的状态。
+- 针对长时分析提供证据按类别截断、关键目标地址锁定与历史消息 Gate 载荷精简，有效控制 Token 消耗与上下文膨胀。
 - 提供同步和 SSE 流式 API；报告正文之外可生成单独的 Gate 审计文件。
 
 ## 工作流程
@@ -98,6 +101,12 @@ REASONING_MIN_THINKING_OUTPUT_TOKENS=40960
 REASONING_HISTORY_KEEP=2
 LANGSMITH_TRACING=false
 
+# 长度失败熔断阈值与降级配置
+REASONING_LENGTH_FAILURE_THRESHOLD=2
+REASONING_DEGRADED_MAX_OUTPUT_TOKENS=16000
+REASONING_DEGRADED_REASONING_EFFORT=low
+REASONING_DEGRADED_THINKING=false
+
 # 可选：源码级验证使用的内核源码树
 # KERNEL_SOURCE_ROOT=/data/kernel-src/4.18.0-305.130.1.el8_4.x86_64
 KERNEL_SOURCE_ROOT=
@@ -116,7 +125,11 @@ KERNEL_SOURCE_ROOT=
 | `REASONING_MAX_OUTPUT_TOKENS` | 否 | 最大 completion 预算，默认 `48000` |
 | `REASONING_MIN_THINKING_OUTPUT_TOKENS` | 否 | 保持 thinking 模式所需的最低输出预算，默认 `40960` |
 | `REASONING_HISTORY_KEEP` | 否 | 压缩时保留的历史 reasoning 数量，默认 `2` |
-| `KERNEL_SOURCE_ROOT` | 否 | 与本次 dump 匹配的内核源码树（也可指向按版本分目录的根目录）；仅在请求未提供 `kernel_source_root` 时生效。启用 `read_source` / `list_writers` / `git_history`，留空时 agent 会明确说明源码无法核实，而不是凭记忆引用内核代码 |
+| `REASONING_LENGTH_FAILURE_THRESHOLD` | 否 | 单次分析中输出长度超限（max_tokens）的熔断阈值，默认 `2`。达到该次数后本次运行的后续调用启用降级配置；设为 `0` 关闭熔断 |
+| `REASONING_DEGRADED_MAX_OUTPUT_TOKENS` | 否 | 降级调用的最大 completion 预算，默认 `16000` |
+| `REASONING_DEGRADED_REASONING_EFFORT` | 否 | 降级调用的推理强度，默认 `low` |
+| `REASONING_DEGRADED_THINKING` | 否 | 降级调用是否启用 thinking，默认 `false` |
+| `KERNEL_SOURCE_ROOT` | 否 | 与本次 dump 匹配的内核源码树（也可指向按版本分目录的根目录）；仅在请求未提供 `kernel_source_root` 时生效。启用 `read_source` / `list_writers` / `git_history` / `find_struct`，留空时 agent 会明确说明源码无法核实，而不是凭记忆引用内核代码 |
 | `LANGSMITH_TRACING` | 否 | 是否启用 LangSmith 追踪，默认 `false` |
 
 输出长度熔断可配置：`REASONING_LENGTH_FAILURE_THRESHOLD`（默认 `2`，设为 `0` 关闭）、`REASONING_DEGRADED_MAX_OUTPUT_TOKENS`（默认 `16000`）、`REASONING_DEGRADED_REASONING_EFFORT`（默认 `low`）、`REASONING_DEGRADED_THINKING`（默认 `false`）。达到阈值后，同一 run 的后续调用改用降级预算，避免因长度被拒的输出再次按全预算重试。
@@ -174,7 +187,7 @@ uv run main.py --url http://localhost:8000 --stream \
 
 ### 5. 准备内核源码（可选，用于源码级验证）
 
-有匹配的源码树时，agent 可以读取 `dis -s` 给出的 `file:line` 处真实代码、枚举可能写某个字段的代码路径、并确认这棵树里是否已包含修复。没有源码树时，agent 会明确说明"源码无法核实"，而不是凭记忆引用内核代码。
+有匹配的源码树时，agent 可以读取 `dis -s` 给出的 `file:line` 处真实代码、按类型名快速查找结构体定义及成员声明（`find_struct`，减少交替 grep 与 read 源码的开销）、枚举可能写某个字段的代码路径、并确认这棵树里是否已包含修复。没有源码树时，agent 会明确说明"源码无法核实"，而不是凭记忆引用内核代码。
 
 在**服务端**用 [`tools/get-kernel-source.sh`](tools/get-kernel-source.sh) 准备源码：
 
@@ -264,6 +277,15 @@ Gate 是分析状态机中的验证检查点。Gate 是否关闭由执行器根�
 
 具体必需 Gate 和完成条件由 [`schema.py`](./vmcore-analysis-agent/src/react/schema.py) 与 [`evidence.py`](./vmcore-analysis-agent/src/react/evidence.py) 定义。
 
+### 长时分析与证据膨胀控制
+
+在长时间复杂 vmcore 分析中，单次 `kmem`、`rd`、`dis` 等命令可能产生数百至上千条结构化事实。为避免上下文超限与历史消息膨胀，系统具备以下机制：
+
+- **门控证据按类别截断与汇总**：门控展示层（`gate.evidence`）按事实前缀分类，每类最多保留 8 条事实，超出部分幂等合并为 `<category>: ... (+N more)` 计数；审计报告中会明确标注为截断视图。
+- **关键目标地址锁定与置顶**：通过地址提取自动锁定当前证据目标与动作意图中的关键十六进制地址（含目标对象及生命周期闭合交集地址），确保关键证据不被字典序无关地址挤出。
+- **精简历史消息载荷**：写入 `AIMessage` 历史对话的门控状态仅保留 `required_for`、`status` 和 `closure_basis`，剥离冗长的证据文本与完成标准，消除单步 MB 级的消息体积膨胀与重复反序列化开销。
+- **完整闭合判定保真**：状态中的 `evidence_facts` 依然保持全量事实，门控闭合判定基于完整事实集执行，不影响判断准确性。
+
 ## 项目结构
 
 ```text
@@ -292,10 +314,12 @@ ai-app-hub/                       # 仓库根目录（包含多个项目）
 
 - **服务启动提示缺少配置**：检查 `vmcore-analysis-agent/.env` 或进程环境中是否设置了 `REASONING_API_KEY`、`REASONING_BASE_URL`、`REASONING_MODEL`。
 - **模型网关报错 `400 unsupported_parameter: 'thinking'`**：部分严格校验 `/v1/chat/completions` 的网关不接受 DeepSeek 私有的 `thinking` 字段，请在 `.env` 中设置 `REASONING_PARAM_PROFILE=openai`，并将 `REASONING_EFFORT` 设为网关支持的值。
+- **执行 crash 脚本提示 `shell control flow is not executable by crash` 或语法被拦截**：`run_script` 的每个参数仅执行单条 crash 原生命令，不支持 `for`/`while`/`if` 循环、分号、`&&`、重定向（如 `2>/dev/null`）或 shell 变量。应将循环展开为逐行独立的 crash 命令（支持在同一次 `run_script` 中批量传入多行以减少交互步数）。
+- **执行 crash 脚本提示 `gdb request failed` 或结构体无法识别**：若引用的结构体属于第三方或内核模块私有类型，由于每次 `run_script` 都是独立的 crash 进程会话，脚本中需在读取该类型前显式执行 `mod -s <module>` 加载模块符号。
 - **文件不存在**：传给 API 的路径在服务端解析，不是运行 CLI 的客户端本地路径。
 - **crash 命令或扩展不可用**：确认服务主机已安装 `crash`，符号文件与 vmcore 对应；仓库脚本只适用于 x86_64 的 crash 8.0/9.0。
 - **模块缺少源码/符号信息**：为对应内核和模块准备匹配的调试符号；可参考下方附录。
-- **API 长时间无响应**：尝试 `--stream` 查看进度，并根据分析耗时调整客户端 `--timeout`。
+- **API 长时间无响应**：尝试 `--stream` 查看进度，并根据分析耗时调整客户端 `--timeout`。若多次遇到输出长度超限，可确认已启用 `REASONING_LENGTH_FAILURE_THRESHOLD` 熔断降级。
 
 ## 附录：第三方驱动调试符号编译指南（以 mlx5_core 为例）
 

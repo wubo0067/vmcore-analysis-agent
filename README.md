@@ -12,9 +12,12 @@ The service accepts a vmcore, its matching `vmlinux`, `vmcore-dmesg.txt`, and op
 
 Key capabilities:
 
-- Collects crash basics first, then selects diagnostic actions from the current analysis state.
-- Calls `crash` and related tools through MCP, with action guards and command deduplication.
+- Collects crash basics first (including loaded kernel modules via `mod`), then selects diagnostic actions from the current analysis state.
+- Calls `crash` and related tools through MCP with action guards and command deduplication; strictly enforces `run_script` syntax (executing pure crash commands, rejecting shell control flow, and guiding loop unrolling and multi-command batch forensics).
+- Automatically detects and provides actionable hints when module-private struct references miss per-session `mod -s <module>` symbol loading.
+- Fast structure definition lookup (`find_struct`), disassembly line mapping, and patch verification via kernel source trees.
 - Tracks hypotheses and verification gates. Gate closure is evaluated by the executor against tool evidence rather than accepted from the model directly.
+- Bounds gate evidence by category with pinned critical target addresses and slims historical message payloads, curbing token and memory bloat during long-running analyses.
 - Provides synchronous and SSE streaming APIs; a separate Gate audit file can accompany the report.
 
 ## How it works
@@ -98,6 +101,12 @@ REASONING_MIN_THINKING_OUTPUT_TOKENS=40960
 REASONING_HISTORY_KEEP=2
 LANGSMITH_TRACING=false
 
+# Length-failure circuit breaker and degraded budget
+REASONING_LENGTH_FAILURE_THRESHOLD=2
+REASONING_DEGRADED_MAX_OUTPUT_TOKENS=16000
+REASONING_DEGRADED_REASONING_EFFORT=low
+REASONING_DEGRADED_THINKING=false
+
 # Optional: kernel source tree used for source-level verification.
 # KERNEL_SOURCE_ROOT=/data/kernel-src/4.18.0-305.130.1.el8_4.x86_64
 KERNEL_SOURCE_ROOT=
@@ -116,7 +125,11 @@ KERNEL_SOURCE_ROOT=
 | `REASONING_MAX_OUTPUT_TOKENS` | No | Maximum completion budget; defaults to `48000` |
 | `REASONING_MIN_THINKING_OUTPUT_TOKENS` | No | Minimum remaining output budget for thinking mode; defaults to `40960` |
 | `REASONING_HISTORY_KEEP` | No | Number of reasoning history items to keep during compression; defaults to `2` |
-| `KERNEL_SOURCE_ROOT` | No | Kernel source tree matching the analysed dump (or a directory of per-version trees). Used only when a request does not carry `kernel_source_root`. Enables `read_source` / `list_writers` / `git_history`; when empty, the agent reports that source could not be verified instead of quoting kernel code from memory |
+| `REASONING_LENGTH_FAILURE_THRESHOLD` | No | Consecutive length failure (max_tokens) threshold before switching to degraded budget in a single run; defaults to `2` (`0` disables circuit breaker) |
+| `REASONING_DEGRADED_MAX_OUTPUT_TOKENS` | No | Maximum completion budget under degraded mode; defaults to `16000` |
+| `REASONING_DEGRADED_REASONING_EFFORT` | No | Reasoning effort under degraded mode; defaults to `low` |
+| `REASONING_DEGRADED_THINKING` | No | Whether thinking is enabled under degraded mode; defaults to `false` |
+| `KERNEL_SOURCE_ROOT` | No | Kernel source tree matching the analysed dump (or a directory of per-version trees). Used only when a request does not carry `kernel_source_root`. Enables `read_source` / `list_writers` / `git_history` / `find_struct`; when empty, the agent reports that source could not be verified instead of quoting kernel code from memory |
 | `LANGSMITH_TRACING` | No | Enable LangSmith tracing; defaults to `false` |
 
 The length-failure circuit breaker is configurable: `REASONING_LENGTH_FAILURE_THRESHOLD` (default `2`; `0` disables it), `REASONING_DEGRADED_MAX_OUTPUT_TOKENS` (default `16000`), `REASONING_DEGRADED_REASONING_EFFORT` (default `low`) and `REASONING_DEGRADED_THINKING` (default `false`). Once the threshold is reached, later calls in the same run use the degraded budget, so an output rejected for length is not retried at full cost.
@@ -174,7 +187,7 @@ Common CLI options:
 
 ### 5. Prepare the kernel source (optional, enables source-level verification)
 
-With a matching source tree, the agent can read the exact code behind a `file:line` returned by `dis -s`, enumerate the code paths that can write a field, and check whether this tree already carries a fix. Without it, the agent states that the source could not be verified instead of quoting kernel code from memory.
+With a matching source tree, the agent can read the exact code behind a `file:line` returned by `dis -s`, look up struct definitions by type name (`find_struct`, eliminating back-and-forth grep and read cycles to inspect member declarations), enumerate the code paths that can write a field, and check whether this tree already carries a fix. Without it, the agent states that the source could not be verified instead of quoting kernel code from memory.
 
 Prepare the tree **on the server host** with [`tools/get-kernel-source.sh`](tools/get-kernel-source.sh):
 
@@ -264,6 +277,15 @@ Examples:
 
 The required gates and completion criteria are defined in [`schema.py`](./vmcore-analysis-agent/src/react/schema.py) and [`evidence.py`](./vmcore-analysis-agent/src/react/evidence.py).
 
+### Long-run analysis and evidence bounding
+
+In long-running and complex vmcore analyses, commands such as `kmem`, `rd`, and `dis` can generate hundreds to thousands of structured facts. To prevent context window exhaustion and message history serialization bloat, the agent employs several evidence controls:
+
+- **Categorized gate evidence bounding**: Evidence in the presentation layer (`gate.evidence`) is grouped by fact prefix and capped at 8 facts per category by default. Excess facts are idempotently summarized into `<category>: ... (+N more)`, and audit reports explicitly indicate when a truncated view is rendered.
+- **Critical target address pinning**: Hexadecimal target addresses from `current_evidence_goal` and `current_action_intent.target_object` (including `object_lifetime` closure intersection addresses) are pinned, preventing critical evidence from being squeezed out by lexicographical sorting.
+- **Slimmed historical message payloads**: Gate structures serialized into `AIMessage` history retain only `required_for`, `status`, and `closure_basis`, stripping raw evidence text and completion criteria to eliminate MB-level per-step serialization and parsing overhead.
+- **Preserved closure fidelity**: Full facts are always preserved in the state's `evidence_facts` collection, ensuring gate closure evaluation remains completely accurate.
+
 ## Project layout
 
 ```text
@@ -292,10 +314,12 @@ ai-app-hub/                       # Repository root (contains multiple projects)
 
 - **Missing configuration on startup:** Check `REASONING_API_KEY`, `REASONING_BASE_URL`, and `REASONING_MODEL` in `vmcore-analysis-agent/.env` or the process environment.
 - **`400 unsupported_parameter: 'thinking'` from the LLM gateway:** Set `REASONING_PARAM_PROFILE=openai` and choose a supported effort value when using gateways that strictly validate `/v1/chat/completions`.
+- **Script rejected with `shell control flow is not executable by crash`:** `run_script` runs each argument as a single native crash command; it does not support `for`/`while`/`if` loops, `;`, `&&`, redirection (e.g. `2>/dev/null`), or shell variables. Expand loops into individual sequential crash commands per line (batching multiple commands in a single `run_script` call is encouraged to reduce ReAct steps).
+- **Script fails with `gdb request failed` or unknown structure reference:** When inspecting private structures of a kernel module, remember that each `run_script` call runs in a separate crash process session; the script must explicitly include `mod -s <module>` before referencing the module's private types.
 - **File not found:** API paths are resolved on the server, not on the machine running the CLI.
 - **Unavailable crash command or extension:** Confirm that `crash` is installed on the service host and that symbols match the vmcore; the bundled installer supports x86_64 crash 8.0/9.0 only.
 - **Missing module source/symbol information:** Prepare debug symbols matching the kernel and module; see the appendix below.
-- **Long-running request:** Use `--stream` to observe progress and increase the client `--timeout` if needed.
+- **Long-running request:** Use `--stream` to observe progress and increase the client `--timeout` if needed. If the model frequently runs out of tokens, verify that the `REASONING_LENGTH_FAILURE_THRESHOLD` circuit breaker is active.
 
 ## Appendix: Third-party Driver Debug Symbol Compilation Guide (mlx5_core example)
 
