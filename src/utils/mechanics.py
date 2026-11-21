@@ -178,53 +178,81 @@ def parse_memory_reads(text: str) -> list[MemoryRead]:
 
 
 def parse_kmem_slab_outputs(text: str) -> list[SlabObjectInfo]:
+    """解析 crash 命令 `kmem -s` / `kmem -S` 的输出文本,提取 slab 缓存与对象槽位信息。
+
+    输出文本通常包含三个层级的内容:
+      1. 表头 + kmem_cache 行:给出缓存地址、对象大小、缓存名称等;
+      2. slab 行:给出 slab 结构地址、内存基址、对象总数/已分配/空闲计数;
+      3. 槽位明细段(以 "FREE / [ALLOCATED]" 标记开始):逐行列出每个对象的
+         地址及其分配状态。
+
+    解析策略:逐行扫描,维护"当前缓存 / 当前 slab"的上下文状态;遇到槽位明细段时,
+    依据槽位地址与 slab 内存基址、对象大小推算出槽位索引、前后邻居槽位等派生信息,
+    并按 (cache 地址, 槽位地址, 分配状态) 三元组去重后返回。
+
+    Args:
+        text: `kmem -s` / `kmem -S` 命令的原始输出文本。
+
+    Returns:
+        去重后的 SlabObjectInfo 列表;若输入不是非空字符串则返回空列表。
+    """
+    # 输入类型/空值防御:非字符串或空文本直接返回空结果
     if not isinstance(text, str) or not text:
         return []
 
-    results: list[SlabObjectInfo] = []
+    results: list[SlabObjectInfo] = []  # 最终返回的槽位信息列表
+    # 去重集合:key = (kmem_cache 地址, 槽位地址, 分配状态),避免同一槽位重复入列
     seen: set[tuple[int, int, str]] = set()
     lines = text.splitlines()
 
-    current_cache_addr: int | None = None
-    current_cache_name: str = ""
-    current_obj_size: int = 0
-    current_slab_addr: int | None = None
-    current_memory_base: int | None = None
-    current_total: int = 0
-    current_allocated: int = 0
-    current_free: int = 0
-    in_slot_section = False
+    # ---- 以下为逐行扫描过程中维护的"当前上下文"状态 ----
+    current_cache_addr: int | None = None   # 当前 kmem_cache 结构的十六进制地址
+    current_cache_name: str = ""            # 当前缓存名称(如 "kmalloc-128")
+    current_obj_size: int = 0               # 当前缓存中单个对象的大小(字节,十进制)
+    current_slab_addr: int | None = None    # 当前 slab 结构体的地址
+    current_memory_base: int | None = None  # 当前 slab 的内存起始地址(对象区基址)
+    current_total: int = 0                  # 当前 slab 的对象总数
+    current_allocated: int = 0              # 当前 slab 已分配对象数
+    current_free: int = 0                   # 当前 slab 空闲对象数
+    in_slot_section = False                 # 是否正处于槽位明细段(ALLOCATED/FREE 列表)
 
     idx = 0
     while idx < len(lines):
         line = lines[idx]
+        slab_match = _KMEM_SLAB_ROW_RE.match(line)
+
+        # 1) 匹配 kmem_cache 表头行:说明下一行是缓存信息行,需先退出槽位明细段
         if _KMEM_CACHE_HEADER_RE.match(line):
             in_slot_section = False
+            # 尝试解析紧随其后的缓存数据行,成功则更新当前缓存上下文
             if idx + 1 < len(lines):
                 cache_match = _KMEM_CACHE_ROW_RE.match(lines[idx + 1])
                 if cache_match:
                     current_cache_addr = int(cache_match.group("cache"), 16)
                     current_obj_size = int(cache_match.group("objsize"), 10)
                     current_cache_name = cache_match.group("name")
-                    idx += 2
+                    idx += 2  # 表头 + 数据行都已消费,跳过两行
                     continue
 
-        slab_match = _KMEM_SLAB_ROW_RE.match(line)
+        # 2) 匹配 slab 行:更新当前 slab 上下文(需已有有效的缓存上下文)
         if slab_match and current_cache_addr is not None and current_obj_size > 0:
             current_slab_addr = int(slab_match.group("slab"), 16)
             current_memory_base = int(slab_match.group("memory"), 16)
             current_total = int(slab_match.group("total"), 10)
             current_allocated = int(slab_match.group("allocated"), 10)
             current_free = int(slab_match.group("free"), 10)
-            in_slot_section = False
+            in_slot_section = False  # 新的 slab 行意味着上一 slab 的槽位段结束
             idx += 1
             continue
 
+        # 3) 槽位明细段的起始标记行("FREE / [ALLOCATED]"):
+        #    只置位标志,后续行才开始逐个解析槽位
         if "FREE / [ALLOCATED]" in line.upper():
             in_slot_section = True
             idx += 1
             continue
 
+        # 4) 处于槽位明细段,且缓存/slab 上下文齐全时,尝试解析单行槽位
         if (
             in_slot_section
             and current_cache_addr is not None
@@ -234,18 +262,25 @@ def parse_kmem_slab_outputs(text: str) -> list[SlabObjectInfo]:
         ):
             slot_match = _KMEM_SLOT_LINE_RE.match(line)
             if slot_match:
+                # 每行只填写 allocated 或 free 中的一个地址字段:
+                # 已分配对象记录在 ALLOCATED 列,空闲对象记录在 FREE 列
                 alloc_tok = slot_match.group("allocated")
                 free_tok = slot_match.group("free")
                 raw_slot = alloc_tok or free_tok
                 if raw_slot:
                     slot_addr = int(raw_slot, 16)
                     state = "allocated" if alloc_tok else "free"
+                    # 去重 + 合法性校验:槽位地址不得早于 slab 内存基址
                     key = (current_cache_addr, slot_addr, state)
                     if key not in seen and slot_addr >= current_memory_base:
                         seen.add(key)
+                        # 由槽位地址反推其在 slab 中的索引:
+                        # 偏移量 = 槽位地址 - slab 内存基址,再按对象大小整除
                         offset_in_slab = slot_addr - current_memory_base
                         slot_idx = offset_in_slab // current_obj_size
+                        # 槽位起始地址对齐到对象边界(行内地址可能指向对象内部)
                         slot_base = current_memory_base + slot_idx * current_obj_size
+                        # 计算前驱/后继槽位地址;首槽位无前驱,末槽位无后继
                         prev_slot = (
                             slot_base - current_obj_size if slot_idx > 0 else None
                         )
@@ -254,6 +289,7 @@ def parse_kmem_slab_outputs(text: str) -> list[SlabObjectInfo]:
                             if (current_total <= 0 or slot_idx + 1 < current_total)
                             else None
                         )
+                        # 汇总缓存、slab、槽位三层信息,构造结构化结果
                         results.append(
                             SlabObjectInfo(
                                 cache_address=current_cache_addr,
@@ -276,6 +312,7 @@ def parse_kmem_slab_outputs(text: str) -> list[SlabObjectInfo]:
                         )
                 idx += 1
                 continue
+            # 非槽位行且顶格非空白:说明槽位明细段已结束(遇到新的段落/命令输出)
             if line.strip() and not line.startswith(" "):
                 in_slot_section = False
 
@@ -285,26 +322,53 @@ def parse_kmem_slab_outputs(text: str) -> list[SlabObjectInfo]:
 
 
 def parse_vtop_outputs(text: str) -> list[VtopTranslation]:
+    """解析 crash 命令 `vtop` 的输出文本,提取虚拟地址到物理地址的翻译信息。
+
+    典型的 `vtop` 输出包含:
+      - 表头行(VIRTUAL PHYSICAL ...),后跟一行虚拟/物理地址数据行;
+      - 可选的 PAGE 段:包含 "PAGE" 与 "PHYSICAL" 关键字的标题行,下一行给出
+        page 结构体地址、page 物理基址和页标志(flags)。
+
+    解析策略:逐行扫描寻找表头;命中后解析紧随其后的数据行,再向前最多查看 12 行,
+    尝试提取可选的 PAGE 信息段(遇到下一个表头即提前停止)。结果按
+    (虚拟地址, 物理地址) 二元组去重,并附带页内偏移与线性映射差值等派生字段。
+
+    Args:
+        text: `vtop` 命令的原始输出文本。
+
+    Returns:
+        去重后的 VtopTranslation 列表;若输入不是非空字符串则返回空列表。
+    """
+    # 输入类型/空值防御:非字符串或空文本直接返回空结果
     if not isinstance(text, str) or not text:
         return []
 
     lines = text.splitlines()
-    results: list[VtopTranslation] = []
+    results: list[VtopTranslation] = []  # 最终返回的翻译结果列表
+    # 去重集合:key = (虚拟地址, 物理地址),避免重复翻译条目入列
     seen: set[tuple[int, int]] = set()
 
     idx = 0
     while idx < len(lines):
+        # 1) 匹配表头行,且需保证存在后续数据行
         if _VTOP_HEADER_RE.match(lines[idx]) and idx + 1 < len(lines):
+            # 表头下一行即虚拟/物理地址数据行
             row_match = _VTOP_ROW_RE.match(lines[idx + 1])
             if row_match:
-                vaddr = int(row_match.group("virtual"), 16)
-                paddr = int(row_match.group("physical"), 16)
-                page_struct: int | None = None
-                page_phys_base: int | None = None
-                page_flags = ""
+                vaddr = int(row_match.group("virtual"), 16)   # 虚拟地址(十六进制)
+                paddr = int(row_match.group("physical"), 16)  # 物理地址(十六进制)
+
+                # ---- 2) 向前探测可选的 PAGE 信息段 ----
+                page_struct: int | None = None     # page 结构体的虚拟地址
+                page_phys_base: int | None = None  # page 结构体的物理基址
+                page_flags = ""                    # 页标志字符串(如 "6|UPD|...")
+                # 最多向后查看 12 行(视作 PAGE 段的最大搜索窗口);
+                # 窗口边界同时防止越界
                 for look_ahead in range(idx + 2, min(idx + 14, len(lines))):
+                    # 遇到下一个表头说明当前翻译块结束,提前停止搜索
                     if _VTOP_HEADER_RE.match(lines[look_ahead]):
                         break
+                    # 命中 PAGE 段标题行,其下一行是 PAGE 数据行
                     if "PAGE" in lines[look_ahead] and "PHYSICAL" in lines[look_ahead]:
                         if look_ahead + 1 < len(lines):
                             pm = _VTOP_PAGE_ROW_RE.match(lines[look_ahead + 1])
@@ -313,6 +377,8 @@ def parse_vtop_outputs(text: str) -> list[VtopTranslation]:
                                 page_phys_base = int(pm.group("phys_base"), 16)
                                 page_flags = pm.group("flags").strip()
                         break
+
+                # ---- 3) 去重后构造结果 ----
                 key = (vaddr, paddr)
                 if key not in seen:
                     seen.add(key)
@@ -320,15 +386,19 @@ def parse_vtop_outputs(text: str) -> list[VtopTranslation]:
                         VtopTranslation(
                             virtual_address=vaddr,
                             physical_address=paddr,
+                            # 页内偏移:虚拟地址低 12 位(4KB 页大小)
                             page_offset=vaddr & 0xFFF,
+                            # 线性映射差值:虚拟地址 - 物理地址(直接映射偏移量)
                             linear_map_delta=vaddr - paddr,
                             page_struct_address=page_struct,
                             page_physical_base=page_phys_base,
                             page_flags=page_flags,
                         )
                     )
+                # 表头 + 数据行均已消费,跳过两行
                 idx += 2
                 continue
+        # 当前行不匹配(或数据行缺失),推进到下一行
         idx += 1
 
     return results
@@ -408,7 +478,7 @@ def detect_memory_block_correlations(
             for l_idx, word in enumerate(low_block.words):
                 if _is_trivial_word(word):
                     continue
-                for h_idx in high_index_by_word.get(word, ()): 
+                for h_idx in high_index_by_word.get(word, ()):
                     delta_words = h_idx - l_idx
                     if delta_words in visited_alignments:
                         continue
