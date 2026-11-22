@@ -5,7 +5,9 @@
 
 核心能力：
 1. 跨平台安全导入：POSIX 依赖（pty/termios）采用条件导入，非 POSIX（如 Windows 开发/CI）
-   下模块可正常导入，不破坏 executor 的 oneshot 模式及其他测试；
+   下模块可正常导入，不破坏 executor 的 oneshot 模式及其他测试；注意 Windows 的 CPython
+   虽带 Lib/pty.py，但其中 `import tty` -> `from termios import *` 必然失败，故运行时
+   _PTY_AVAILABLE 为 False，类型检查侧则通过 TYPE_CHECKING 提供真实模块类型；
 2. 使用伪终端（PTY）常驻运行 `crash --no_scroll <vmlinux> <vmcore>`，避免每次命令冷启动；
 3. 采用唯一哨兵（!echo <token>）+ `crash> ` 提示符双校验切分输出，彻底杜绝伪提示符导致的响应错位；
 4. 按模块逐行校验 `mod -s` 结果并归一化路径（bare/auto/具体路径），避免失败写脏缓存或重复加载；
@@ -26,17 +28,39 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TYPE_CHECKING, Protocol
 
-try:
-    import pty  # type: ignore[import-not-found]
-    import termios  # type: ignore[import-not-found]
+# 在 Windows 上运行时 `import pty` 必然失败（pty 内部 `import tty` 会触发
+# `from termios import *`，而 Windows 没有 termios）。因此这里先无条件声明该标志，
+# 再由分支决定取值，避免把两次赋值都放进静态分析判定为不可达的分支里。
+_PTY_AVAILABLE = False
 
-    _PTY_AVAILABLE = True
-except ImportError:
-    pty = None  # type: ignore[assignment]
-    termios = None  # type: ignore[assignment]
-    _PTY_AVAILABLE = False
+if TYPE_CHECKING:
+    # 类型检查视角：typeshed 的 stdlib/pty.pyi 与 termios.pyi 整体包裹在
+    # `if sys.platform != "win32":` 之中，于是在 Windows 解释器下这两个模块被解析为
+    # 空模块，openpty/tcgetattr/ECHO 等属性一律不可见。这里用局部 Protocol 声明实际
+    # 用到的接口，绕开对平台相关存根的依赖；运行时行为完全不变（该分支永不执行）。
+    class _PtyModule(Protocol):
+        def openpty(self) -> tuple[int, int]: ...
+
+    class _TermiosModule(Protocol):
+        ECHO: int
+        TCSANOW: int
+
+        def tcgetattr(self, fd: int) -> list[Any]: ...
+        def tcsetattr(self, fd: int, when: int, attributes: list[Any]) -> None: ...
+
+    _pty_mod: Optional[_PtyModule]
+    _termios_mod: Optional[_TermiosModule]
+else:
+    try:
+        import pty as _pty_mod
+        import termios as _termios_mod
+
+        _PTY_AVAILABLE = True
+    except ImportError:
+        _pty_mod = None
+        _termios_mod = None
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _MOD_S_LINE_RE = re.compile(r"^\s*mod\s+-s\s+(?P<mod>\S+)(?:\s+(?P<path>.+?))?\s*$")
@@ -249,16 +273,16 @@ class PersistentCrashSession:
         return 0
 
     def _start(self) -> None:
-        if not _PTY_AVAILABLE or pty is None:
+        if not _PTY_AVAILABLE or _pty_mod is None:
             raise RuntimeError("POSIX pty is not available on this platform")
 
         logger = _get_logger()
-        master_fd, slave_fd = pty.openpty()
-        if termios is not None:
+        master_fd, slave_fd = _pty_mod.openpty()
+        if _termios_mod is not None:
             try:
-                attrs = termios.tcgetattr(slave_fd)
-                attrs[3] &= ~termios.ECHO
-                termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+                attrs = _termios_mod.tcgetattr(slave_fd)
+                attrs[3] &= ~_termios_mod.ECHO
+                _termios_mod.tcsetattr(slave_fd, _termios_mod.TCSANOW, attrs)
             except Exception:
                 pass
 
@@ -575,7 +599,7 @@ class PersistentCrashSession:
         deadline = time.monotonic() + budget_sec
         try:
             if hasattr(os, "killpg") and hasattr(os, "getpgid"):
-                os.killpg(os.getpgid(self._proc.pid), signal.SIGINT)
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGINT)  # type: ignore[attr-defined]
             else:
                 os.write(self._master_fd, b"\x03")
 
@@ -639,7 +663,7 @@ class PersistentCrashSession:
             if proc.poll() is None:
                 try:
                     if hasattr(os, "killpg") and hasattr(os, "getpgid") and hasattr(signal, "SIGKILL"):
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # type: ignore[attr-defined]
                     else:
                         proc.kill()
                 except Exception:
