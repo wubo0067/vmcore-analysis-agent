@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# analyzer.py - Lock Hang 分析核心实现
+# Author: CalmWU
+# Created: 2026-11-22
 
 """Deterministic Linux kernel lock-wait-graph, deadlock, lockup, and RCU stall analyzer.
 
@@ -16,7 +19,7 @@ import json
 import re
 import shlex
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Iterator, Optional
+from typing import Callable, Iterator, Optional, TypedDict
 
 from src.mcp_tools.crash.executor import run_crash_command, run_crash_script
 
@@ -28,20 +31,36 @@ LOCK_OWNER_TASK_MASK = ~LOCK_OWNER_FLAG_MASK
 RWSEM_READER_OWNED_BIT = 0x1
 
 # 正则模式
-_PS_LINE_RE = re.compile(
-    r"^\s*(?P<active>>)?\s*(?P<pid>\d+)\s+(?P<ppid>\d+)\s+(?P<cpu>\d+)\s+"
-    r"(?P<task>[0-9a-fA-F]+)\s+(?P<state>[A-Z]{2})\s+\S+\s+\d+\s+\d+\s+(?P<comm>.+?)\s*$"
-)
-_PS_M_LINE_RE = re.compile(
-    r"^\s*\[(?P<age>[^\]]+)\]\s+\[(?P<state>[A-Z]{2})\]\s+PID:\s+(?P<pid>\d+)\s+"
-    r"TASK:\s+(?P<task>[0-9a-fA-F]+)\s+CPU:\s+(?P<cpu>\d+)\s+COMMAND:\s+\"(?P<comm>[^\"]+)\""
-)
-_BT_HEADER_RE = re.compile(
-    r"^PID:\s+(?P<pid>\d+)\s+TASK:\s+(?P<task>[0-9a-fA-F]+)\s+CPU:\s+(?P<cpu>\d+)\s+COMMAND:\s+\"(?P<comm>[^\"]+)\""
-)
-_BT_FRAME_RE = re.compile(
-    r"^\s*#(?P<num>\d+)\s+\[(?P<frame>[0-9a-fA-F]+)\]\s+(?P<func>\S+)\s+at\s+(?P<rip>[0-9a-fA-F]+)"
-)
+_PS_LINE_RE = re.compile(r"""
+    ^\s*(?P<active>>)?          # 可选的 ">" 活跃任务标记
+    \s*(?P<pid>\d+)             # PID
+    \s+(?P<ppid>\d+)            # 父进程 PID
+    \s+(?P<cpu>\d+)             # CPU 编号
+    \s+(?P<task>[0-9a-fA-F]+)   # task_struct 地址（十六进制）
+    \s+(?P<state>[A-Z]{2})      # 任务状态（UN / IN / RU 等）
+    \s+\S+\s+\d+\s+\d+          # 优先级、nice 值等（跳过）
+    \s+(?P<comm>.+?)\s*$        # 命令名
+""", re.VERBOSE)
+_PS_M_LINE_RE = re.compile(r"""
+    ^\s*\[(?P<age>[^\]]+)\]     # [阻塞时长]，如 "0 00:05:12.100"
+    \s+\[(?P<state>[A-Z]{2})\]  # [任务状态]
+    \s+PID:\s+(?P<pid>\d+)      # PID
+    \s+TASK:\s+(?P<task>[0-9a-fA-F]+)   # task_struct 地址
+    \s+CPU:\s+(?P<cpu>\d+)      # CPU 编号
+    \s+COMMAND:\s+\"(?P<comm>[^\"]+)\"  # 命令名（双引号包裹）
+""", re.VERBOSE)
+_BT_HEADER_RE = re.compile(r"""
+    ^PID:\s+(?P<pid>\d+)        # PID
+    \s+TASK:\s+(?P<task>[0-9a-fA-F]+)   # task_struct 地址
+    \s+CPU:\s+(?P<cpu>\d+)      # CPU 编号
+    \s+COMMAND:\s+\"(?P<comm>[^\"]+)\"  # 命令名
+""", re.VERBOSE)
+_BT_FRAME_RE = re.compile(r"""
+    ^\s*\#(?P<num>\d+)          # 帧序号
+    \s+\[(?P<frame>[0-9a-fA-F]+)\]  # 帧地址
+    \s+(?P<func>\S+)            # 函数名
+    \s+at\s+(?P<rip>[0-9a-fA-F]+)   # 指令指针地址
+""", re.VERBOSE)
 _BT_EXCEPTION_RE = re.compile(r"^\s*\[exception RIP:\s+(?P<func>[^,\]]+)")
 _STACK_WORD_RE = re.compile(r"\b(ffff[0-9a-fA-F]{12})\b")
 _OWNER_COUNTER_RE = re.compile(r"counter\s*=\s*(?P<val>-?(?:0x)?[0-9a-fA-F]+)")
@@ -98,16 +117,20 @@ _IO_WAIT_FUNCS = (
     "submit_bio_wait",
     "rq_qos_throttle",
 )
-_IRQ_SOFTIRQ_FUNCS = (
+# 真正代表软中断执行或看门狗/RCU停顿检测的原语
+_SOFTIRQ_OR_STALL_FUNCS = (
     "__do_softirq",
     "do_softirq",
-    "irq_exit",
-    "asm_common_interrupt",
-    "common_interrupt",
     "watchdog_timer_fn",
     "watchdog_overflow_callback",
-    "nmi_handle",
     "rcu_dump_cpu_stacks",
+)
+# 底层硬件中断与 NMI 入口/出口跳板（不作为等待原语参与 wait_category 分类）
+_HARDIRQ_ENTRY_FUNCS = (
+    "asm_common_interrupt",
+    "common_interrupt",
+    "irq_exit",
+    "nmi_handle",
 )
 _IDLE_FUNCS = (
     "cpu_idle",
@@ -117,6 +140,17 @@ _IDLE_FUNCS = (
     "acpi_idle_enter",
     "cpuidle_enter_state",
     "arch_cpu_idle",
+)
+
+# 复合常量与单一事实来源
+_LOCK_FUNC_PREFIXES = (*_MUTEX_FUNCS, *_RWSEM_FUNCS)
+
+_CLASSIFY_PRIORITY = (
+    ("mutex", _MUTEX_FUNCS),
+    ("rwsem", _RWSEM_FUNCS),
+    ("spinlock", _SPINLOCK_FUNCS),
+    ("io_wait", _IO_WAIT_FUNCS),
+    ("irq_softirq", _SOFTIRQ_OR_STALL_FUNCS),
 )
 
 
@@ -629,9 +663,16 @@ def analyze_lock_wait_graph(
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
-def parse_runq_summary(runq_output: str) -> dict[int, dict[str, object]]:
+class RunqCpuInfo(TypedDict):
+    cpu: int
+    current_pid: Optional[int]
+    current_comm: Optional[str]
+    queued_tasks: int
+
+
+def parse_runq_summary(runq_output: str) -> dict[int, RunqCpuInfo]:
     """解析 `runq` 输出，提取各 CPU 的当前运行任务与就绪队列积压数。"""
-    per_cpu: dict[int, dict[str, object]] = {}
+    per_cpu: dict[int, RunqCpuInfo] = {}
     current_cpu: Optional[int] = None
     for line in runq_output.splitlines():
         m_cpu = _RUNQ_CPU_RE.match(line.strip())
@@ -652,10 +693,7 @@ def parse_runq_summary(runq_output: str) -> dict[int, dict[str, object]]:
             per_cpu[current_cpu]["current_comm"] = m_curr.group("comm")
             continue
         if re.match(r"^\s*\[\d+\]\s+PID:\s+\d+", line):
-            queued_tasks = per_cpu[current_cpu]["queued_tasks"]
-            per_cpu[current_cpu]["queued_tasks"] = (
-                queued_tasks + 1 if isinstance(queued_tasks, int) else 1
-            )
+            per_cpu[current_cpu]["queued_tasks"] += 1
     return per_cpu
 
 
@@ -716,21 +754,21 @@ def analyze_cpu_lockup_rcu(
     suspected_lockup_cpus: list[dict[str, object]] = []
     spinlock_contenders: list[dict[str, object]] = []
     irq_or_softirq_cpus: list[dict[str, object]] = []
+    hardirq_active_cpus: list[dict[str, object]] = []
     idle_cpu_count = 0
 
     for bt in cpu_bts:
         frame_funcs = [f.function for f in bt.frames]
         is_idle = any(fn in _IDLE_FUNCS for fn in frame_funcs[:6]) and not any(
-            fn in _SPINLOCK_FUNCS or fn in _IRQ_SOFTIRQ_FUNCS for fn in frame_funcs[:8]
+            fn in _SPINLOCK_FUNCS or fn in _SOFTIRQ_OR_STALL_FUNCS for fn in frame_funcs[:8]
         )
         if is_idle:
             idle_cpu_count += 1
             if not opts.include_idle:
                 continue
 
-        rq_entry = runq_info.get(bt.cpu, {})
-        queued_tasks_value = rq_entry.get("queued_tasks", 0)
-        queued_tasks = queued_tasks_value if isinstance(queued_tasks_value, int) else 0
+        rq_entry = runq_info.get(bt.cpu)
+        queued_tasks = rq_entry["queued_tasks"] if rq_entry is not None else 0
         summary = {
             "cpu": bt.cpu,
             "pid": bt.pid,
@@ -744,15 +782,17 @@ def analyze_cpu_lockup_rcu(
 
         if bt.wait_category == "spinlock":
             spinlock_contenders.append(summary)
-        if any(fn in _IRQ_SOFTIRQ_FUNCS for fn in frame_funcs[:10]):
+        if any(fn in _SOFTIRQ_OR_STALL_FUNCS for fn in frame_funcs[:10]):
             irq_or_softirq_cpus.append(summary)
+        if not is_idle and any(fn in _HARDIRQ_ENTRY_FUNCS for fn in frame_funcs[:10]):
+            hardirq_active_cpus.append(summary)
         # 仅将真正存在异常指标的 CPU 标记为 suspected lockup：
         #   - spinlock 自旋等待
         #   - watchdog / RCU stall dump 触发
         #   - 运行队列严重积压（>= 4 个就绪任务）
-        #   - 非 idle 且处于 IRQ/softirq/spinlock 上下文（禁用抢占或中断）
+        #   - 非 idle 且处于 softirq/spinlock 上下文（禁用抢占或软中断执行）
         is_in_locked_context = not is_idle and any(
-            fn in _SPINLOCK_FUNCS or fn in _IRQ_SOFTIRQ_FUNCS
+            fn in _SPINLOCK_FUNCS or fn in _SOFTIRQ_OR_STALL_FUNCS
             for fn in frame_funcs[:10]
         )
         if (
@@ -775,6 +815,16 @@ def analyze_cpu_lockup_rcu(
             recommended.append(f"dis -rl {top_frames[0]}")
         else:
             recommended.append(f"bt -c {top_cpu.get('cpu')}")
+    elif not recommended and hardirq_active_cpus:
+        # 兜底建议：当未检测到明显的自旋锁争抢或看门狗触发，但存在处于非 idle 硬中断上下文的活跃 CPU 时，
+        # 推荐检查其调用栈与反汇编顶帧（防止硬件中断 ISR 内无锁忙等死循环导致系统挂死）
+        top_irq_cpu = hardirq_active_cpus[0]
+        recommended.append(
+            f"bt -c {','.join(str(c['cpu']) for c in hardirq_active_cpus[:4])}"
+        )
+        top_frames = top_irq_cpu.get("top_frames", [])
+        if isinstance(top_frames, list) and top_frames:
+            recommended.append(f"dis -rl {top_frames[0]}")
 
     result = {
         "total_cpus_parsed": len(cpu_bts),
@@ -913,32 +963,23 @@ def _resolve_lock_edge_for_bt(
 
 
 def _is_lock_frame(func_name: str) -> bool:
-    return (
-        any(func_name.startswith(prefix) for prefix in _MUTEX_FUNCS)
-        or any(func_name.startswith(prefix) for prefix in _RWSEM_FUNCS)
-    )
+    return any(func_name.startswith(p) for p in _LOCK_FUNC_PREFIXES)
 
 
 def _classify_backtrace(bt: ParsedBacktrace) -> None:
-    """根据栈帧函数名对等待/阻塞原语做确定性分类。"""
-    for frame in bt.frames:
-        fn = frame.function
-        if any(fn.startswith(p) for p in _MUTEX_FUNCS):
-            bt.wait_category = "mutex"
-            bt.wait_function = fn
-            return
-        if any(fn.startswith(p) for p in _RWSEM_FUNCS):
-            bt.wait_category = "rwsem"
-            bt.wait_function = fn
-            return
-        if any(fn.startswith(p) for p in _SPINLOCK_FUNCS):
-            bt.wait_category = "spinlock"
-            bt.wait_function = fn
-            return
-        if any(fn.startswith(p) for p in _IO_WAIT_FUNCS):
-            bt.wait_category = "io_wait"
-            bt.wait_function = fn
-            return
+    """根据栈帧函数名对等待/阻塞原语做确定性优先级分类。
+
+    优先级由 _CLASSIFY_PRIORITY 定义：mutex > rwsem > spinlock > io_wait > irq_softirq。
+    按优先级对整条调用栈进行扫描，确保即使栈顶包含看门狗或中断采样入口帧，深层的核心锁原语仍被优先提取。
+    底层硬件中断/NMI 跳板（_HARDIRQ_ENTRY_FUNCS）不作为等待原语参与分类。
+    """
+    for category, prefixes in _CLASSIFY_PRIORITY:
+        for frame in bt.frames:
+            fn = frame.function
+            if any(fn.startswith(p) for p in prefixes):
+                bt.wait_category = category
+                bt.wait_function = fn
+                return
 
 
 def _require_arg(tokens: list[str], index: int, flag: str) -> str:

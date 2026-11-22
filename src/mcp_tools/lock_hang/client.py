@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# client.py - Lock Hang MCP 客户端实现
+# Author: CalmWU
+# Created: 2026-11-22
 
 """MCP client for the lock_hang provider.
 
@@ -56,8 +59,7 @@ async def _initialize_tools() -> List:
         return _lock_hang_tools
     except Exception as exc:
         logger.error("Failed to initialize lock_hang tools: %s", exc)
-        _lock_hang_tools = []
-        return []
+        return []  # 不缓存空列表，_lock_hang_tools 保持 None 以允许下次重试
 
 
 async def initialize_tools() -> List:
@@ -70,6 +72,14 @@ def build_tool_payload(
     if tool_name not in _SUPPORTED_TOOLS:
         raise ValueError(f"Unsupported lock_hang tool: {tool_name}")
 
+    vmcore = state.get("vmcore_path")
+    vmlinux = state.get("vmlinux_path")
+    if not vmcore or not vmlinux:
+        raise ValueError(
+            f"lock_hang tool requires vmcore_path and vmlinux_path in state, "
+            f"got vmcore_path={vmcore!r}, vmlinux_path={vmlinux!r}"
+        )
+
     if isinstance(raw_args, dict):
         command = str(raw_args.get("command", "")).strip()
     elif isinstance(raw_args, (list, tuple)):
@@ -81,6 +91,6 @@ def build_tool_payload(
 
     return {
         "command": command,
-        "vmcore_path": state["vmcore_path"],
-        "vmlinux_path": state["vmlinux_path"],
+        "vmcore_path": vmcore,
+        "vmlinux_path": vmlinux,
     }

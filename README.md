@@ -18,6 +18,7 @@ Key capabilities:
 - Fast structure definition lookup (`find_struct`), disassembly line mapping, and patch verification via kernel source trees.
 - Tracks hypotheses and verification gates. Gate closure is evaluated by the executor against tool evidence rather than accepted from the model directly.
 - Bounds gate evidence by category with pinned critical target addresses and slims historical message payloads, curbing token and memory bloat during long-running analyses.
+- Ships a deterministic lock/hang analyzer: it decodes mutex/rwsem owner pointers, builds a Wait-For Graph to detect deadlock cycles and root blockers, and aggregates per-CPU spinlock contention, softirq/watchdog, and RCU stall state without flooding context with raw `bt -a` output.
 - Provides synchronous and SSE streaming APIs; a separate Gate audit file can accompany the report.
 
 ## How it works
@@ -40,8 +41,8 @@ An analysis follows these steps:
 | [`client/`](./vmcore-analysis-agent/client/) | HTTP/SSE client and CLI entry point |
 | [`src/react/`](./vmcore-analysis-agent/src/react/) | LangGraph nodes, routing, state, prompts, evidence evaluation, and report generation |
 | [`src/llm/`](./vmcore-analysis-agent/src/llm/) | LLM client creation |
-| [`src/mcp_tools/`](./vmcore-analysis-agent/src/mcp_tools/) | MCP tool registration and crash, source-patch, and related tools |
-| [`tests/`](./vmcore-analysis-agent/tests/) | Unit and integration tests |
+| [`src/mcp_tools/`](./vmcore-analysis-agent/src/mcp_tools/) | MCP tool registration plus crash, source-patch, stack-canary, and lock/hang tools |
+| [`tests/`](./vmcore-analysis-agent/tests/) | Unit and integration tests (including `test_lock_hang_analyzer.py` and `test_lock_hang_client.py`) |
 | [`doc/`](./vmcore-analysis-agent/doc/) | Architecture flow diagrams and project documentation |
 | [`reports/`](./vmcore-analysis-agent/reports/) | Local report output directory |
 
@@ -286,6 +287,53 @@ In long-running and complex vmcore analyses, commands such as `kmem`, `rd`, and 
 - **Slimmed historical message payloads**: Gate structures serialized into `AIMessage` history retain only `required_for`, `status`, and `closure_basis`, stripping raw evidence text and completion criteria to eliminate MB-level per-step serialization and parsing overhead.
 - **Preserved closure fidelity**: Full facts are always preserved in the state's `evidence_facts` collection, ensuring gate closure evaluation remains completely accurate.
 
+## Deterministic lock/hang analysis (`lock_hang` package)
+
+[`src/mcp_tools/lock_hang/`](./vmcore-analysis-agent/src/mcp_tools/lock_hang/) is a self-contained MCP provider, auto-discovered by the directory convention in [`registry.py`](./vmcore-analysis-agent/src/mcp_tools/registry.py) — no registry edits required. It collapses the "dump `bt -a` / `ps -m` / `runq` for every CPU" step into structured JSON, shrinking context usage and removing the model's hand-interpretation of stack frames.
+
+### Two tools
+
+| Tool | Use when | Command arguments |
+|---|---|---|
+| `analyze_lock_wait_graph` | hung_task, AB-BA deadlock, multiple `UN`-state tasks, `blocked for more than N seconds` | `[--pids <pid1,pid2,...>] [--top <int>] [--max-depth <int>] [--lock-addr <hex>] [--lock-type <mutex\|rwsem>]` |
+| `analyze_cpu_lockup_rcu` | soft/hard lockup, spinlock storm, RCU stall | `[--cpus <cpu1,cpu2,...>] [--include-idle]` |
+
+Both accept an empty string. In that case the former targets the 12 longest-blocked `UN` tasks from `ps -m` (`--top` defaults to 12) and the latter analyzes every non-idle CPU.
+
+### What `analyze_lock_wait_graph` does
+
+1. Runs a single `ps -m` to fetch the task table (skipped when `--pids` is given);
+2. Batches all target `bt -f` into one `run_crash_script` call, avoiding a crash process per task;
+3. Decodes kernel lock structures in Python — the low 3 bits of `mutex.owner` and `rw_semaphore.owner` are flags (`MUTEX_FLAG_WAITERS/HANDOFF/PICKUP`, `RWSEM_READER_OWNED/RD_NONSPINNABLE/WR_NONSPINNABLE`) under mask `0x7`, and only the masked value is the `task_struct` address;
+4. Builds the Wait-For Graph, runs DFS to detect deadlock cycles, and separately ranks root blockers by blocked-task count;
+5. Walks further down the owner chain (`--max-depth`, default 6) until it hits a cycle or reaches an owner that is not itself waiting.
+
+Output includes `status` (`deadlock_detected` / `wait_graph_built` / `no_uninterruptible_tasks`), `wait_category_counts`, `deadlock_cycles`, `root_blockers`, `wait_edges`, `non_sleep_lock_or_unresolved_tasks`, and `recommended_next_commands`.
+
+Stack classification scans in a fixed priority order (`_CLASSIFY_PRIORITY`): `mutex` → `rwsem` → `spinlock` → `io_wait` → `irq_softirq`. The priority is load-bearing: in real stacks, hardware-interrupt entry frames such as `asm_common_interrupt` sit **above** spinlock frames, so a frame-order-first match would swallow genuine lock waits.
+
+### What `analyze_cpu_lockup_rcu` does
+
+One script runs `bt -a` (or `bt -c <cpus>`), then `runq`, then `p rcu_state`, split by two markers. It then:
+
+- Classifies each CPU's `wait_category` and collects `spinlock_contenders`;
+- Decides idleness as: one of `_IDLE_FUNCS` within the top 6 frames **and** no spinlock or softirq/watchdog primitive within the top 8 — seeing `do_idle`/`cpu_idle` alone is not enough;
+- Excludes hardware-interrupt entry frames (`asm_common_interrupt`, `common_interrupt`, `irq_exit`, `nmi_handle`) from `wait_category`, otherwise an idle CPU parked in an interrupt would be misreported as a softirq hang;
+- Routes softirq/stall primitives (`__do_softirq`, `do_softirq`, `watchdog_timer_fn`, `watchdog_overflow_callback`, `rcu_dump_cpu_stacks`) into `irq_or_softirq_cpus`, and records non-idle CPUs sitting in hardware-interrupt entry frames separately for fallback recommendations;
+- Marks `suspected` (output key `active_or_suspected_cpus`) only on concrete anomaly indicators: a spinlock wait, a watchdog/RCU-stall dump, `runq` backlog ≥ 4, or a non-idle CPU in spinlock/softirq context.
+
+Output fields: `total_cpus_parsed`, `idle_cpu_count`, `spinlock_contender_count`, `spinlock_contenders`, `irq_or_softirq_cpus`, `active_or_suspected_cpus`, `rcu_state_summary`, `recommended_next_commands`.
+
+> Note: `irq_or_softirq_cpus` now covers **soft** IRQ and stall-detection primitives only, not hardware interrupts. The field name is retained for compatibility with existing consumers.
+
+### Suggested usage order
+
+This repository does **not** currently enable a lock/hang fast path in `src/react/sop_fragments.py`; the analyzers are merely exposed as tools. To make the model prefer them over dumping `bt -a` under `soft_lockup` / `hard_lockup` / `hung_task` / `rcu_stall`, add the `lock_hang_fast_path` SOP fragment as described in [`INTEGRATION.md`](./INTEGRATION.md). Recommended order:
+
+1. Call `analyze_lock_wait_graph` (wait relationships) or `analyze_cpu_lockup_rcu` (CPU side) first to obtain the structured graph/summary;
+2. Then run targeted `bt -f <pid>`, `struct`, or `dis -rl` against deadlock cycle members or the root-blocking CPU;
+3. To confirm one specific lock address in isolation, use `--lock-addr <hex>` to enter the single-lock owner-tracing branch (`--lock-type` defaults to `mutex` when omitted; pass `rwsem` explicitly for read/write semaphores).
+
 ## Project layout
 
 ```text
@@ -305,6 +353,8 @@ ai-app-hub/                       # Repository root (contains multiple projects)
     ├── doc/                      # Flow diagrams and documentation
     ├── simulate-crash/           # Crash reproduction scenarios
     ├── reports/                  # Report output directory
+    ├── ARCHITECTURE.md           # Architecture and core logic (maintainer's code map)
+    ├── INTEGRATION.md            # lock_hang integration guide
     ├── pyproject.toml
     ├── uv.lock
     └── .env.example
@@ -319,6 +369,7 @@ ai-app-hub/                       # Repository root (contains multiple projects)
 - **File not found:** API paths are resolved on the server, not on the machine running the CLI.
 - **Unavailable crash command or extension:** Confirm that `crash` is installed on the service host and that symbols match the vmcore; the bundled installer supports x86_64 crash 8.0/9.0 only.
 - **Missing module source/symbol information:** Prepare debug symbols matching the kernel and module; see the appendix below.
+- **Lock/hang analysis returns `no_uninterruptible_tasks` or an empty graph:** Confirm the vmcore strictly matches the supplied `vmlinux` and that target tasks really are in `UN` state; if `ps -m` is unusable, pass `--pids` explicitly. Tasks whose owner could not be resolved appear in `non_sleep_lock_or_unresolved_tasks` and usually need manual `bt -f` + `dis` confirmation of the stack slot.
 - **Long-running request:** Use `--stream` to observe progress and increase the client `--timeout` if needed. If the model frequently runs out of tokens, verify that the `REASONING_LENGTH_FAILURE_THRESHOLD` circuit breaker is active.
 
 ## Appendix: Third-party Driver Debug Symbol Compilation Guide (mlx5_core example)

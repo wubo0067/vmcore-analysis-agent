@@ -18,6 +18,7 @@
 - 结合内核源码树提供结构体定义快速定位（`find_struct`）、反汇编代码行映射与补丁验证。
 - 使用假设与验证门控跟踪证据；是否关闭门控由执行器根据工具输出判断，而非直接采信模型给出的状态。
 - 针对长时分析提供证据按类别截断、关键目标地址锁定与历史消息 Gate 载荷精简，有效控制 Token 消耗与上下文膨胀。
+- 内置确定性锁/挂死分析器：解码 mutex/rwsem owner 指针并构建 Wait-For Graph 检测死锁环与根阻塞任务，同时按 CPU 汇总自旋锁争抢、软中断/看门狗与 RCU stall 状态，避免 `bt -a` 原文撑爆上下文。
 - 提供同步和 SSE 流式 API；报告正文之外可生成单独的 Gate 审计文件。
 
 ## 工作流程
@@ -40,8 +41,8 @@
 | [`client/`](./vmcore-analysis-agent/client/) | HTTP/SSE 客户端及命令行入口 |
 | [`src/react/`](./vmcore-analysis-agent/src/react/) | LangGraph 节点、路由、状态、Prompt、证据评估和报告生成 |
 | [`src/llm/`](./vmcore-analysis-agent/src/llm/) | LLM 客户端创建 |
-| [`src/mcp_tools/`](./vmcore-analysis-agent/src/mcp_tools/) | MCP 工具注册及 crash、源码补丁等工具 |
-| [`tests/`](./vmcore-analysis-agent/tests/) | 单元和集成测试 |
+| [`src/mcp_tools/`](./vmcore-analysis-agent/src/mcp_tools/) | MCP 工具注册及 crash、源码补丁、栈保护、锁/挂死等工具 |
+| [`tests/`](./vmcore-analysis-agent/tests/) | 单元和集成测试（含 `test_lock_hang_analyzer.py`、`test_lock_hang_client.py`） |
 | [`doc/`](./vmcore-analysis-agent/doc/) | 架构流程图等项目文档 |
 | [`reports/`](./vmcore-analysis-agent/reports/) | 本地生成的报告目录 |
 
@@ -286,6 +287,53 @@ Gate 是分析状态机中的验证检查点。Gate 是否关闭由执行器根�
 - **精简历史消息载荷**：写入 `AIMessage` 历史对话的门控状态仅保留 `required_for`、`status` 和 `closure_basis`，剥离冗长的证据文本与完成标准，消除单步 MB 级的消息体积膨胀与重复反序列化开销。
 - **完整闭合判定保真**：状态中的 `evidence_facts` 依然保持全量事实，门控闭合判定基于完整事实集执行，不影响判断准确性。
 
+## 锁 / 挂死确定性分析（`lock_hang` 工具包）
+
+`src/mcp_tools/lock_hang/` 是一个独立的 MCP provider，按 [`registry.py`](./vmcore-analysis-agent/src/mcp_tools/registry.py) 的目录约定自动发现，无需改动注册表。它把"遍历所有 CPU 的 `bt -a` / `ps -m` / `runq` 原文"这一步收敛成结构化 JSON，减少上下文占用并消除模型对栈帧的手工解读。
+
+### 两个工具
+
+| 工具 | 适用场景 | 命令参数 |
+|---|---|---|
+| `analyze_lock_wait_graph` | hung_task、AB-BA 死锁、多个 `UN` 状态任务、`blocked for more than N seconds` | `[--pids <pid1,pid2,...>] [--top <int>] [--max-depth <int>] [--lock-addr <hex>] [--lock-type <mutex\|rwsem>]` |
+| `analyze_cpu_lockup_rcu` | soft/hard lockup、自旋锁风暴、RCU stall | `[--cpus <cpu1,cpu2,...>] [--include-idle]` |
+
+两者都接受空字符串，此时：前者自动取 `ps -m` 中阻塞时间最长的前 12 个 `UN` 任务（`--top` 默认 12），后者分析全部非 idle CPU。
+
+### `analyze_lock_wait_graph` 做了什么
+
+1. 一次性 `ps -m` 取任务表（`--pids` 显式指定时跳过筛选）；
+2. 用单次 `run_crash_script` 批量合并所有目标任务的 `bt -f`，避免逐 task 启动 crash；
+3. 在 Python 侧完成内核锁结构解码——`mutex.owner` 与 `rw_semaphore.owner` 的低 3 位是标志位（`MUTEX_FLAG_WAITERS/HANDOFF/PICKUP`、`RWSEM_READER_OWNED/RD_NONSPINNABLE/WR_NONSPINNABLE`），掩码为 `0x7`，掩掉后才是 `task_struct` 地址；
+4. 构建 Wait-For Graph 并 DFS 检出死锁环，另按"被阻塞任务数"排序输出根阻塞任务；
+5. 沿 owner 链继续下钻（`--max-depth`，默认 6），直到命中环或收敛到非等待态 owner。
+
+输出包含 `status`（`deadlock_detected` / `wait_graph_built` / `no_uninterruptible_tasks`）、`wait_category_counts`、`deadlock_cycles`、`root_blockers`、`wait_edges`、`non_sleep_lock_or_unresolved_tasks` 与 `recommended_next_commands`。
+
+栈分类按固定优先级扫描（`_CLASSIFY_PRIORITY`）：`mutex` → `rwsem` → `spinlock` → `io_wait` → `irq_softirq`。这里的优先级是必要的——真实栈里 `asm_common_interrupt` 之类的硬件中断入口帧位置在自旋锁帧**之上**，若按帧序先匹配中断帧就会吞掉真正的锁等待。
+
+### `analyze_cpu_lockup_rcu` 做了什么
+
+单次脚本内依次执行 `bt -a`（或 `bt -c <cpus>`）、`runq`、`p rcu_state`，用两个分隔标记切分输出，然后：
+
+- 逐 CPU 归类 `wait_category`，统计 `spinlock_contenders`；
+- 判定 idle：栈顶 6 帧命中 `_IDLE_FUNCS`，**且**栈顶 8 帧内没有自旋锁或软中断/看门狗原语——仅凭 `do_idle`/`cpu_idle` 出现不足以判 idle；
+- 硬件中断入口帧（`asm_common_interrupt`、`common_interrupt`、`irq_exit`、`nmi_handle`）**不参与** `wait_category` 分类，否则带中断的 idle CPU 会被误判成软中断挂死；
+- 软中断/停顿原语（`__do_softirq`、`do_softirq`、`watchdog_timer_fn`、`watchdog_overflow_callback`、`rcu_dump_cpu_stacks`）命中 → `irq_or_softirq_cpus`；非 idle 且命中硬件中断入口 → 单独记录，用于兜底建议；
+- `suspected`（输出键 `active_or_suspected_cpus`）只在有实质异常指标时置位：自旋锁等待、看门狗/RCU stall dump、`runq` 就绪队列积压 ≥ 4，或非 idle 且处于自旋锁/软中断上下文。
+
+输出字段：`total_cpus_parsed`、`idle_cpu_count`、`spinlock_contender_count`、`spinlock_contenders`、`irq_or_softirq_cpus`、`active_or_suspected_cpus`、`rcu_state_summary`、`recommended_next_commands`。
+
+> 注意：`irq_or_softirq_cpus` 现在只覆盖**软**中断与停顿检测原语，不包含硬件中断；字段名为兼容既有消费方而保留。
+
+### 建议的使用顺序
+
+本仓库当前**未**在 `src/react/sop_fragments.py` 中启用锁/挂死快速通道，分析器只作为工具暴露给模型。若要让模型在 `soft_lockup` / `hard_lockup` / `hung_task` / `rcu_stall` 签名下优先调用它、而不是先倾倒 `bt -a`，需要按 [`INTEGRATION.md`](./INTEGRATION.md) 追加 `lock_hang_fast_path` SOP 片段。顺序建议：
+
+1. 先 `analyze_lock_wait_graph`（等待关系）或 `analyze_cpu_lockup_rcu`（CPU 侧），拿到结构化图/摘要；
+2. 再对死锁环成员或根阻塞 CPU 定向执行 `bt -f <pid>`、`struct`、`dis -rl`；
+3. 命中的锁地址若要单独确认，用 `--lock-addr <hex>` 走单锁 owner 追踪分支（`--lock-type` 省略时按 `mutex` 处理，确认是读写信号量时需显式传 `rwsem`）。
+
 ## 项目结构
 
 ```text
@@ -305,6 +353,8 @@ ai-app-hub/                       # 仓库根目录（包含多个项目）
     ├── doc/                      # 流程图等文档
     ├── simulate-crash/           # 崩溃复现场景
     ├── reports/                  # 报告输出目录
+    ├── ARCHITECTURE.md           # 架构与核心逻辑（维护者读码地图）
+    ├── INTEGRATION.md            # lock_hang 工具集成指南
     ├── pyproject.toml
     ├── uv.lock
     └── .env.example
@@ -319,6 +369,7 @@ ai-app-hub/                       # 仓库根目录（包含多个项目）
 - **文件不存在**：传给 API 的路径在服务端解析，不是运行 CLI 的客户端本地路径。
 - **crash 命令或扩展不可用**：确认服务主机已安装 `crash`，符号文件与 vmcore 对应；仓库脚本只适用于 x86_64 的 crash 8.0/9.0。
 - **模块缺少源码/符号信息**：为对应内核和模块准备匹配的调试符号；可参考下方附录。
+- **锁/挂死分析返回 `no_uninterruptible_tasks` 或空图**：确认 vmcore 与该 `vmlinux` 严格匹配，且目标任务确实处于 `UN` 状态；`ps -m` 不可用时改用 `--pids` 显式指定任务。解析不到 owner 的任务会出现在 `non_sleep_lock_or_unresolved_tasks` 里，通常需要回归 `bt -f` + `dis` 手工确认栈槽位。
 - **API 长时间无响应**：尝试 `--stream` 查看进度，并根据分析耗时调整客户端 `--timeout`。若多次遇到输出长度超限，可确认已启用 `REASONING_LENGTH_FAILURE_THRESHOLD` 熔断降级。
 
 ## 附录：第三方驱动调试符号编译指南（以 mlx5_core 为例）

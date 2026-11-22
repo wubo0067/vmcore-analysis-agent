@@ -263,8 +263,86 @@ layer0 2.4a 则给出各里程碑必须达成的目标：
 
 ## 工具层（`src/mcp_tools/`）
 
-- `registry.py`：按目录名约定发现 provider（`crash`、`source_patch`、`stack_canary`），统一注入 `vmcore_path`/`vmlinux_path`
-- `crash/`：crash 命令执行（server/client/executor）；`stack_canary/`、`source_patch/` 为专题工具
+- `registry.py`：按目录名约定发现 provider（`crash`、`kernel_source`、`lock_hang`、`source_patch`、`stack_canary`），统一注入 `vmcore_path`/`vmlinux_path`
+- `crash/`：crash 命令执行（server/client/executor），并导出 `run_crash_command` / `run_crash_script` 供其他 provider 复用；`stack_canary/`、`source_patch/`、`kernel_source/` 为专题工具
+
+### `lock_hang/` —— 锁 / 挂死确定性分析
+
+`lock_hang` 与其余 provider 一样遵守 registry 契约（`MCP_CLIENT` / `MCP_SERVER_NAME` / `initialize_tools` / `build_tool_payload`），但它的价值全在 `analyzer.py` 这颗**纯函数式内核**上：除 `run_crash_command` / `run_crash_script` 外不依赖任何框架 API，且这两个 runner 都以关键字参数注入，因此单元测试可以用假 runner 驱动完整分析流程而不需要真实 vmcore。
+
+```
+server.py   FastMCP 外壳：两个 @tool 只做参数校验 + 异常转字符串
+client.py   暴露 registry 契约；build_tool_payload 从 state 补 vmcore/vmlinux
+analyzer.py 全部确定性逻辑（解析 → 分类 → 图构建 → 摘要）
+```
+
+两个工具的职责边界：
+
+| 工具 | 输入维度 | 核心产物 |
+|---|---|---|
+| `analyze_lock_wait_graph` | 任务维度（`ps -m` / `--pids`） | Wait-For Graph、死锁环、根阻塞任务 |
+| `analyze_cpu_lockup_rcu` | CPU 维度（`bt -a` / `bt -c`） | 每 CPU 的等待类别、自旋锁争抢、软中断/停顿、RCU 状态 |
+
+#### 等待原语分类（`_CLASSIFY_PRIORITY`）
+
+`_classify_backtrace` 不是"取第一个命中的帧"，而是**类别外层、帧内层**地按 `_CLASSIFY_PRIORITY` 顺序扫描：
+
+```
+mutex → rwsem → spinlock → io_wait → irq_softirq
+```
+
+顺序本身就是正确性的一部分：真实栈里 `asm_common_interrupt` / `common_interrupt` 这类硬件中断入口帧常常出现在自旋锁帧**之上**，若单纯按帧序取首个命中，中断入口会先被匹配成 `irq_softirq`，把真正的 spinlock 等待吞掉。所有函数名集合（`_MUTEX_FUNCS` … `_SOFTIRQ_OR_STALL_FUNCS`）都定义在 `_CLASSIFY_PRIORITY` 之前，`_LOCK_FUNC_PREFIXES` 也从这些集合派生——新增原语只需改集合本身。
+
+必须区分两组容易混淆的常量：
+
+| 常量 | 内容 | 参与 `wait_category` |
+|---|---|:---:|
+| `_SOFTIRQ_OR_STALL_FUNCS` | `__do_softirq`、`do_softirq`、`watchdog_timer_fn`、`watchdog_overflow_callback`、`rcu_dump_cpu_stacks` | 是（归为 `irq_softirq`） |
+| `_HARDIRQ_ENTRY_FUNCS` | `asm_common_interrupt`、`common_interrupt`、`irq_exit`、`nmi_handle` | 否（仅用于兜底建议） |
+
+两组不相交。硬件中断入口不参与分类是刻意的：一个停在 `asm_common_interrupt` 的 idle CPU 只是在等中断，不代表挂死；把它们算进 `irq_softirq` 会让 `idle_cpu_count` 归零并污染 `recommended_next_commands`。
+
+#### idle 判定
+
+```python
+is_idle = (
+    any(fn in _IDLE_FUNCS for fn in frame_funcs[:6])
+    and not any(fn in _SPINLOCK_FUNCS or fn in _SOFTIRQ_OR_STALL_FUNCS for fn in frame_funcs[:8])
+)
+```
+
+否定条件是核心：栈顶出现 `do_idle` / `cpu_idle` **不足以**判 idle。空闲 CPU 如果正在跑 watchdog timer softirq（`do_idle → irq_exit → __do_softirq → watchdog_timer_fn`），说明 softirq 卡在 idle 任务上下文里，这恰恰是最该被怀疑的现场之一，因此仍要计入 `active_or_suspected_cpus`。
+
+`suspected` 的置位条件是"至少一条实质异常指标"：自旋锁等待、watchdog/RCU-stall dump、`runq` 就绪队列积压 ≥ 4、或非 idle 且处于自旋锁/软中断上下文。纯硬件中断上下文不计入 suspected（硬中断本身不是"等待"），只在 `spinlock_contenders` 与 `suspected` 都为空时触发兜底建议 `bt -c <cpus>` + `dis -rl <top_frame>`。
+
+#### 锁 owner 解码
+
+`decode_lock_owner_word` / `parse_struct_lock_owner` 负责把 `owner` 字还原成 `task_struct` 地址：
+
+- `LOCK_OWNER_FLAG_MASK = 0x7`，`LOCK_OWNER_TASK_MASK = ~0x7`；
+- `mutex`：低 3 位为 `MUTEX_FLAG_WAITERS/HANDOFF/PICKUP`；
+- `rwsem`：低 3 位为 `RWSEM_READER_OWNED / RD_NONSPINNABLE / WR_NONSPINNABLE`，置了 reader-owned 位时**没有单一 owner task**，只能输出 `reader_owned=True` 并给出 `resolution_note`；
+- 0、负数、以及落在内核正文段的地址都被判为"无有效 owner"（`None`）。
+
+`WaitEdge.reader_owned` 与 `WaitEdge.resolution_note` 就是为这类"解析成功但语义受限"的边准备的，`resolution_note` 只放枚举式说明串，不放临时调试数据。
+
+#### 输入 / 输出契约
+
+| 侧 | 位置 | 说明 |
+|---|---|---|
+| 参数解析 | `parse_lock_wait_graph_command` / `parse_cpu_lockup_command` | 用 `shlex.split`，因此参数可带引号；`--top` 夹到 1..64，`--max-depth` 夹到 1..16 |
+| 结果结构 | `WaitEdge`、`RunqCpuInfo(TypedDict)` | `RunqCpuInfo.queued_tasks` 是 `int`，调用方直接下标访问，无需 `isinstance` 兜底 |
+| 建议命令 | `recommended_next_commands` | 只给下一轮的**定向**命令，不给全量 `bt -a` |
+
+`build_tool_payload` 是 LLM 参数与工具入参之间的适配层：把 dict / list / `None` / 标量四种形态统一压平成 `command` 字符串，并强制从 state 注入 `vmcore_path` / `vmlinux_path`；缺任一路径直接 `ValueError`，由 `src/react/nodes.py` 的 `call_crash_tool` 捕获成任务结果。
+
+#### 提示词侧状态
+
+截至当前版本，本仓库**未**在 `src/react/sop_fragments.py` 或 `prompt_builder._select_sop_fragments` 中挂载 `lock_hang_fast_path`：分析器只作为工具暴露，模型是否调用由通用工具描述决定。若要启用强制优先调用，按 `INTEGRATION.md` 追加 SOP 片段与签名/关键词触发条件即可，无需改 `registry.py`。
+
+#### 测试
+
+`tests/test_lock_hang_analyzer.py` 通过注入假 runner 覆盖端到端流程（AB-BA 环、CPU 聚合、idle+硬件中断、硬中断兜底建议等），不依赖真实 vmcore；`tests/test_lock_hang_client.py` 覆盖 `build_tool_payload` 与 **FastMCP server 的工具注册**，前者使 analyzer 测试不必导入 `langchain_mcp_adapters`，后者守住"参数先后顺序导致 server 一个工具都注册不上"这类只在建 pydantic 模型时暴露的问题。
 
 ## 报告（`report_generator.py`）
 
@@ -283,15 +361,27 @@ layer0 2.4a 则给出各里程碑必须达成的目标：
 | 改收敛/路由（何时结束、何时重试） | `edges.py`、`llm_node.py`（收口逻辑）、`nodes._convergence_guard_error` |
 | 改报告呈现 | `report_generator.py` |
 | 加新崩溃类型剧本 | `playbooks.py` 加条目 + `prompt_builder._select_playbook` 选择信号 |
+| 改等待原语分类（增删 mutex/rwsem/spinlock/io_wait/软中断函数） | `lock_hang/analyzer.py` 对应的 `_*_FUNCS` 集合；优先级在 `_CLASSIFY_PRIORITY` |
+| 改 idle 判定阈值（栈顶帧数、是否需要无锁/无软中断） | `lock_hang/analyzer.py` 的 `analyze_cpu_lockup_rcu` 内 `is_idle` 表达式 |
+| 改锁 owner 位掩码/reader-owned 语义 | `lock_hang/analyzer.py` 的 `LOCK_OWNER_FLAG_MASK` + `decode_lock_owner_word` |
+| 改 `lock_hang` 工具参数或描述 | `lock_hang/server.py` 的 `@tool` 签名与 `Annotated[..., Field(description=...)]` |
+| 让模型优先调用锁/挂死分析器 | `react/sop_fragments.py` 加 `lock_hang_fast_path` + `prompt_builder._select_sop_fragments` 触发条件（见 `INTEGRATION.md`） |
 
-注意：prompt 文本改动要检查 `tests/test_prompt_builder.py`、`test_convergence.py` 是否断言了相关字符串；门控改动跑 `tests/test_evidence.py`。
+注意：prompt 文本改动要检查 `tests/test_prompt_builder.py`、`test_convergence.py` 是否断言了相关字符串；门控改动跑 `tests/test_evidence.py`；`lock_hang` 改动跑 `tests/test_lock_hang_analyzer.py` 与 `tests/test_lock_hang_client.py`。
 
 ## 验证
 
 ```powershell
 # 必须用项目 venv（系统 Python 缺依赖）
 .\.venv\Scripts\python.exe -m pytest tests -q
+
+# 若 venv 内没有 pytest，tests/ 又没有 __init__.py（discover 不可用），逐个模块枚举：
+$mods = Get-ChildItem tests -Filter 'test_*.py' | ForEach-Object { 'tests.' + $_.BaseName }
+.\.venv\Scripts\python.exe -m unittest @mods
 ```
+
+`tests/test_lock_hang_analyzer.py` 不依赖 `langchain_mcp_adapters`，可直接用系统 Python 运行：
+`python -m unittest tests.test_lock_hang_analyzer`。
 
 ## 已知语义风险（备忘）
 
@@ -299,3 +389,5 @@ layer0 2.4a 则给出各里程碑必须达成的目标：
 - 多个签名的必需门控尚无执行器闭合规则；这类门控会保持未决，相应分析无法由当前规则集得出定论，直到补齐事实抽取与规则。
 - `n/a` 是预留状态，目前没有执行器适用性规则会产生该状态；LLM 请求会被拒绝。
 - `local_corruption_exclusion` 是代码级门控名，措辞上仍是 exclusion；prompt 侧已统一为 discrimination 语义，重命名标识符需同步 `state_manager`/`schema`/`report_generator` 与测试。
+- `lock_hang` 的 `irq_or_softirq_cpus` 只覆盖软中断与停顿检测原语，不含硬件中断（字段名沿用旧称以避免破坏消费方）；纯硬件中断上下文不计入 `active_or_suspected_cpus`，只在无其它线索时触发兜底建议。
+- `soft_lockup` / `hard_lockup` / `rcu_stall` / `hung_task` 的签名门控（`lock_holder`、`wait_chain` 等）在 `evidence._GATE_COMPLETION_CRITERIA` 里**没有**对应条款，因此这些签名当前无法由执行器判定定论；`lock_hang` 提供的是取证加速，不是门控闭合规则的替代。

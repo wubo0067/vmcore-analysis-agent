@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# server.py - Lock Hang MCP 服务器实现
+# Author: CalmWU
+# Created: 2026-11-22
 
-"""FastMCP server exposing deterministic lock-wait-graph and CPU lockup/RCU analyzers."""
+"""FastMCP server exposing deterministic lock-wait-graph and CPU lockup/RCU analyzers.
+
+Entry points:
+- client.py launches this server via: `python -m src.mcp_tools.lock_hang.server`
+- __main__.py provides the package-level CLI entry point: `python -m src.mcp_tools.lock_hang`
+"""
 
 from typing import Annotated
 
@@ -41,10 +49,10 @@ def analyze_lock_wait_graph(
         ),
     ],
     vmcore_path: Annotated[
-        str, Field(description="The absolute path to the vmcore file.")
+        str, Field(description="The absolute path to the vmcore file.", default="")
     ],
     vmlinux_path: Annotated[
-        str, Field(description="The absolute path to the vmlinux file.")
+        str, Field(description="The absolute path to the vmlinux file.", default="")
     ],
 ) -> str:
     """Extract UN-state task backtraces, resolve mutex/rwsem owners, and detect deadlock cycles."""
@@ -70,10 +78,10 @@ def analyze_cpu_lockup_rcu(
         ),
     ],
     vmcore_path: Annotated[
-        str, Field(description="The absolute path to the vmcore file.")
+        str, Field(description="The absolute path to the vmcore file.", default="")
     ],
     vmlinux_path: Annotated[
-        str, Field(description="The absolute path to the vmlinux file.")
+        str, Field(description="The absolute path to the vmlinux file.", default="")
     ],
 ) -> str:
     """Summarize multi-CPU lockup/spinlock/IRQ/softirq states and RCU stall indicators."""
