@@ -20,6 +20,7 @@
 - 针对长时分析提供证据按类别截断、关键目标地址锁定与历史消息 Gate 载荷精简，有效控制 Token 消耗与上下文膨胀。
 - 内置确定性锁/挂死分析器：解码 mutex/rwsem owner 指针并构建 Wait-For Graph 检测死锁环与根阻塞任务，同时按 CPU 汇总自旋锁争抢、软中断/看门狗与 RCU stall 状态，避免 `bt -a` 原文撑爆上下文。
 - 提供同步和 SSE 流式 API；报告正文之外可生成单独的 Gate 审计文件。
+- 支持基于 PTY 的常驻 `crash` 会话池（`pool` 模式）与跨进程共享守护进程（`daemon` 模式）：消除每步冷启动、`mod -s` 幂等缓存、超时 3 秒 `SIGINT` 自愈、严格全局 LRU/空闲 TTL 内存管控及多客户端并发访问。
 
 ## 工作流程
 
@@ -42,7 +43,7 @@
 | [`src/react/`](./vmcore-analysis-agent/src/react/) | LangGraph 节点、路由、状态、Prompt、证据评估和报告生成 |
 | [`src/llm/`](./vmcore-analysis-agent/src/llm/) | LLM 客户端创建 |
 | [`src/mcp_tools/`](./vmcore-analysis-agent/src/mcp_tools/) | MCP 工具注册及 crash、源码补丁、栈保护、锁/挂死等工具 |
-| [`tests/`](./vmcore-analysis-agent/tests/) | 单元和集成测试（含 `test_lock_hang_analyzer.py`、`test_lock_hang_client.py`） |
+| [`tests/`](./vmcore-analysis-agent/tests/) | 单元和集成测试（含 `test_lock_hang_analyzer.py`、`test_lock_hang_client.py`、`test_crash_session_pool.py`） |
 | [`doc/`](./vmcore-analysis-agent/doc/) | 架构流程图等项目文档 |
 | [`reports/`](./vmcore-analysis-agent/reports/) | 本地生成的报告目录 |
 
@@ -111,6 +112,16 @@ REASONING_DEGRADED_THINKING=false
 # 可选：源码级验证使用的内核源码树
 # KERNEL_SOURCE_ROOT=/data/kernel-src/4.18.0-305.130.1.el8_4.x86_64
 KERNEL_SOURCE_ROOT=
+
+# 常驻 Crash 会话池与共享守护进程
+CRASH_EXECUTION_MODE=pool
+CRASH_DAEMON_ENDPOINT=unix:///tmp/vmcore_crashd.sock
+CRASH_POOL_MAX_SESSIONS=4
+CRASH_POOL_SLOTS_PER_VMCORE=1
+CRASH_POOL_IDLE_TTL_SEC=900
+CRASH_COMMAND_TIMEOUT_SEC=180
+CRASH_STARTUP_TIMEOUT_SEC=120
+CRASH_MCP_MAX_CONCURRENCY=8
 ```
 
 | 变量 | 必需 | 说明 |
@@ -132,6 +143,16 @@ KERNEL_SOURCE_ROOT=
 | `REASONING_DEGRADED_THINKING` | 否 | 降级调用是否启用 thinking，默认 `false` |
 | `KERNEL_SOURCE_ROOT` | 否 | 与本次 dump 匹配的内核源码树（也可指向按版本分目录的根目录）；仅在请求未提供 `kernel_source_root` 时生效。启用 `read_source` / `list_writers` / `git_history` / `find_struct`，留空时 agent 会明确说明源码无法核实，而不是凭记忆引用内核代码 |
 | `LANGSMITH_TRACING` | 否 | 是否启用 LangSmith 追踪，默认 `false` |
+| `CRASH_EXECUTION_MODE` | 否 | Crash 执行后端：`pool`（默认，进程内常驻 PTY 会话池）、`daemon`（跨进程共享守护进程，多客户端/多 MCP 生产推荐）或 `oneshot`（旧版短生命周期子进程兜底） |
+| `CRASH_DAEMON_ENDPOINT` | 否 | `daemon` 模式本地通信地址：`unix:///tmp/vmcore_crashd.sock`（默认，自动收紧权限至 `0600`）或 `http://127.0.0.1:8765`（无鉴权，仅限可信单租户主机） |
+| `CRASH_DAEMON_FALLBACK_TO_POOL` | 否 | `daemon` 不可达时是否降级为进程内池，默认 `false`（避免静默分裂会话池导致内存翻倍） |
+| `CRASH_POOL_MAX_SESSIONS` | 否 | 全局常驻 `crash` 进程上限（超限时按 `last_used_at` 全局 LRU 淘汰空闲槽），默认 `4` |
+| `CRASH_POOL_SLOTS_PER_VMCORE` | 否 | 单个 `(vmcore, vmlinux)` 允许并行持有的常驻进程槽位数，默认 `1` |
+| `CRASH_POOL_IDLE_TTL_SEC` | 否 | 空闲会话超时自动回收时间（秒），默认 `900` |
+| `CRASH_COMMAND_TIMEOUT_SEC` | 否 | 单条命令超时时间（秒；先 3 秒预算内发 `SIGINT` 挽救，失败再重建），默认 `180` |
+| `CRASH_STARTUP_TIMEOUT_SEC` | 否 | 大型 `vmcore` 首次冷启动加载符号超时时间（秒），默认 `120` |
+| `CRASH_MCP_MAX_CONCURRENCY` | 否 | `crash` MCP Server 单事件循环并发度（`asyncio.to_thread`），默认 `8`（`daemon` 模式下应配合池容量调小） |
+| `CRASH_MCP_TRANSPORT` / `CRASH_MCP_URL` | 否 | 可选常驻 HTTP MCP 服务端/客户端模式（`streamable-http`），未配置时保持默认 `stdio` |
 
 输出长度熔断可配置：`REASONING_LENGTH_FAILURE_THRESHOLD`（默认 `2`，设为 `0` 关闭）、`REASONING_DEGRADED_MAX_OUTPUT_TOKENS`（默认 `16000`）、`REASONING_DEGRADED_REASONING_EFFORT`（默认 `low`）、`REASONING_DEGRADED_THINKING`（默认 `false`）。达到阈值后，同一 run 的后续调用改用降级预算，避免因长度被拒的输出再次按全预算重试。
 
@@ -334,6 +355,42 @@ Gate 是分析状态机中的验证检查点。Gate 是否关闭由执行器根�
 2. 再对死锁环成员或根阻塞 CPU 定向执行 `bt -f <pid>`、`struct`、`dis -rl`；
 3. 命中的锁地址若要单独确认，用 `--lock-addr <hex>` 走单锁 owner 追踪分支（`--lock-type` 省略时按 `mutex` 处理，确认是读写信号量时需显式传 `rwsem`）。
 
+## 常驻 Crash 会话池与共享守护进程
+
+[`src/mcp_tools/crash/`](./vmcore-analysis-agent/src/mcp_tools/crash/) 提供常驻 PTY 会话池（`session_pool.py`）与可选的跨进程守护进程（`daemon.py`），`run_crash_command` / `run_crash_script` 签名保持不变，因此 `crash`、`stack_canary`、`lock_hang`、`scsishow` 全部自动受益。
+
+### 三种执行模式
+
+| 模式 | 运行方式 | 适用场景 |
+|---|---|---|
+| `pool`（默认） | 各 MCP Server 在进程内维护常驻 PTY 会话池（`crash --no_scroll`） | 本地开发调试、单次 CLI 分析（零额外运维） |
+| `daemon` | 独立运行 `python -m src.mcp_tools.crash.daemon` 托管全局 `CrashSessionPool`；所有 MCP Server 与并发 Worker 通过 Unix Domain Socket（`0600`）或 HTTP 共享 | 生产多客户端并发、多 MCP 协同分析（同一 `vmcore` 全程仅冷启动 1 次，内存 1×） |
+| `oneshot` | 回退为旧版每条命令独立 `subprocess.Popen` | 紧急回滚或非 POSIX（Windows）开发/CI 机 |
+
+### 生产启动共享守护进程
+
+```bash
+# 1) 启动跨进程共享守护服务（Unix Socket 自动收紧为 0600 权限）
+uv run python -m src.mcp_tools.crash.daemon --endpoint unix:///tmp/vmcore_crashd.sock
+
+# 2) 在 .env 中切换为 daemon 模式
+CRASH_EXECUTION_MODE=daemon
+CRASH_DAEMON_ENDPOINT=unix:///tmp/vmcore_crashd.sock
+
+# 3) 可选：将 crash MCP Server 独立为常驻 streamable-http 服务
+CRASH_MCP_TRANSPORT=streamable-http CRASH_MCP_HOST=127.0.0.1 CRASH_MCP_PORT=8766 \
+  uv run python -m src.mcp_tools.crash.server
+```
+
+守护服务暴露 `GET /health`（活跃会话、各 `crash` 进程 `VmRSS`、命中/淘汰统计）、`POST /execute` 以及 `POST /evict`（兼容 `DELETE /sessions`）用于主动释放指定 `vmcore` 的空闲会话。
+
+### 核心工程保障
+
+- **哨兵帧协议与关闭回显**：关闭 PTY 从端 `ECHO`，握手阶段一次性消费启动 Banner，并用 `!echo __CRASH_DONE_<uuid>__` + `crash> ` 双校验切分输出，彻底消除旧版关键词误删与伪提示符错位。
+- **`mod -s` 幂等缓存**：归一化裸命令 / `auto` / 具体路径，按模块逐行校验加载错误（失败绝不写脏缓存），已加载模块自动跳过。
+- **两级超时自愈**：超时后先在统一 3 秒预算内向进程组发送 `SIGINT` 挽救会话并保留已加载符号；恢复失败或进程意外退出时才杀进程组自动重建并报告 `exit_code`。
+- **多并发与防 OOM**：不同 `vmcore` 真并行；`server.py` 通过 `asyncio.to_thread` 与按事件循环隔离的 `WeakKeyDictionary` 信号量解除事件循环阻塞；按 `last_used_at` 严格全局 LRU 淘汰与后台空闲 TTL 回收控制宿主机内存。
+
 ## 项目结构
 
 ```text
@@ -366,6 +423,8 @@ ai-app-hub/                       # 仓库根目录（包含多个项目）
 - **模型网关报错 `400 unsupported_parameter: 'thinking'`**：部分严格校验 `/v1/chat/completions` 的网关不接受 DeepSeek 私有的 `thinking` 字段，请在 `.env` 中设置 `REASONING_PARAM_PROFILE=openai`，并将 `REASONING_EFFORT` 设为网关支持的值。
 - **执行 crash 脚本提示 `shell control flow is not executable by crash` 或语法被拦截**：`run_script` 的每个参数仅执行单条 crash 原生命令，不支持 `for`/`while`/`if` 循环、分号、`&&`、重定向（如 `2>/dev/null`）或 shell 变量。应将循环展开为逐行独立的 crash 命令（支持在同一次 `run_script` 中批量传入多行以减少交互步数）。
 - **执行 crash 脚本提示 `gdb request failed` 或结构体无法识别**：若引用的结构体属于第三方或内核模块私有类型，由于每次 `run_script` 都是独立的 crash 进程会话，脚本中需在读取该类型前显式执行 `mod -s <module>` 加载模块符号。
+- **Windows / 非 POSIX 环境使用 `pool` 或 `unix://` 报错**：常驻 PTY 会话依赖 POSIX `pty`/`termios`，`unix://` 依赖 `AF_UNIX`。Windows 开发/CI 请设置 `CRASH_EXECUTION_MODE=oneshot`（或用 `http://` 测试 TCP 守护模式）。
+- **`daemon` 模式下高并发触发获取槽位超时**：所有 MCP 进程共享守护进程侧的 `CRASH_POOL_MAX_SESSIONS`；请配合池容量调小 `CRASH_MCP_MAX_CONCURRENCY`，或按宿主机可用内存适当调大 `CRASH_POOL_MAX_SESSIONS`。
 - **文件不存在**：传给 API 的路径在服务端解析，不是运行 CLI 的客户端本地路径。
 - **crash 命令或扩展不可用**：确认服务主机已安装 `crash`，符号文件与 vmcore 对应；仓库脚本只适用于 x86_64 的 crash 8.0/9.0。
 - **模块缺少源码/符号信息**：为对应内核和模块准备匹配的调试符号；可参考下方附录。

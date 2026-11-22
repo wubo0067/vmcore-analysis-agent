@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# client.py - Crash MCP 客户端实现
+# client.py - Crash MCP 客户端实现（支持 stdio 与 streamable_http 远程常驻连接）
 # Author: CalmWU
 # Created: 2026-01-09
 
-# src/mcp_tools/crash/client.py
+import os
 import sys
 from typing import Any, List, Optional
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -13,16 +13,34 @@ from src.utils.crash_command import with_tool_prefix
 
 MCP_SERVER_NAME = "crash"
 
-# 初始化 MCP 客户端
-crash_client = MultiServerMCPClient(
-    {
-        MCP_SERVER_NAME: {
-            "command": sys.executable,
-            "args": ["-m", "src.mcp_tools.crash.server"],
-            "transport": "stdio",
+
+def _build_mcp_server_config() -> dict[str, Any]:
+    """根据环境变量构建 MCP 连接配置。
+
+    - 未配置 CRASH_MCP_URL 时保持默认 stdio 模式；
+    - 配置 CRASH_MCP_URL（如 http://127.0.0.1:8766/mcp）时连接常驻 HTTP MCP 服务，
+      使多个并发客户端 / Agent Worker 共享同一个常驻 CrashSessionPool。
+    """
+    mcp_url = os.environ.get("CRASH_MCP_URL", "").strip()
+    if mcp_url:
+        transport = (
+            os.environ.get("CRASH_MCP_CLIENT_TRANSPORT", "streamable_http").strip()
+            or "streamable_http"
+        )
+        return {
+            "url": mcp_url,
+            "transport": transport,
         }
+
+    return {
+        "command": sys.executable,
+        "args": ["-m", "src.mcp_tools.crash.server"],
+        "transport": "stdio",
     }
-)
+
+
+# 初始化 MCP 客户端
+crash_client = MultiServerMCPClient({MCP_SERVER_NAME: _build_mcp_server_config()})
 MCP_CLIENT = crash_client
 
 # 全局工具列表（延迟初始化）
@@ -50,30 +68,22 @@ async def _initialize_tools():
 
 
 def get_crash_tools() -> List:
-    """
-    获取 crash 工具列表（同步接口）
-
-    注意：这个函数会尝试在当前事件循环中获取工具，
-    如果没有运行中的事件循环，将返回空列表并记录警告。
-    """
+    """获取 crash 工具列表（同步接口）。"""
     global _crash_tools
 
-    # 如果已经初始化过，直接返回
     if _crash_tools is not None:
         return _crash_tools
 
     try:
         import asyncio
 
-        # 尝试获取当前运行的事件循环
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
         logger.warning(
             "Cannot initialize tools synchronously in a running event loop. "
             "Please call 'await initialize_crash_tools()' explicitly in async context."
         )
         return []
     except RuntimeError:
-        # 没有运行中的事件循环，可以安全地使用 asyncio.run
         import asyncio
 
         try:
@@ -84,12 +94,7 @@ def get_crash_tools() -> List:
 
 
 async def initialize_crash_tools() -> List:
-    """
-    异步初始化 crash 工具（推荐在 async 上下文中使用）
-
-    Returns:
-        List: crash 工具列表
-    """
+    """异步初始化 crash 工具（推荐在 async 上下文中使用）。"""
     return await _initialize_tools()
 
 
@@ -139,8 +144,6 @@ def build_tool_payload(
     return payload
 
 
-# 模块级别的工具列表（可能为空，需要在运行时初始化）
-# 推荐使用 initialize_crash_tools() 在 async 上下文中初始化
 crash_tools = []
 
 logger.info(

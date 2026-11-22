@@ -11,8 +11,12 @@ Crash MCP 服务器实现
 每个 crash 子命令都被注册为一个独立的 MCP 工具。
 """
 
-from typing import Annotated
+import asyncio
+import os
 import re
+import threading
+import weakref
+from typing import Annotated
 from pydantic import Field
 from fastmcp import FastMCP
 from .executor import run_crash_command, run_crash_script
@@ -28,6 +32,24 @@ crash_server = FastMCP(
     "crash_server",
     instructions="This server provides crash analysis tools for Linux vmcore files.",
 )
+
+_MAX_CONCURRENT_CRASH_CALLS = max(
+    1, int(os.environ.get("CRASH_MCP_MAX_CONCURRENCY", "8").strip() or "8")
+)
+_sync_concurrency_sem = threading.BoundedSemaphore(_MAX_CONCURRENT_CRASH_CALLS)
+_loop_semaphores: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+
+def _get_concurrency_semaphore() -> asyncio.Semaphore:
+    """返回绑定到当前运行事件循环的 Semaphore，避免跨 event loop 复用导致死锁。"""
+    loop = asyncio.get_running_loop()
+    sem = _loop_semaphores.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(_MAX_CONCURRENT_CRASH_CALLS)
+        _loop_semaphores[loop] = sem
+    return sem
 
 
 def _parse_hex_int(token: str) -> int:
@@ -128,9 +150,10 @@ def inspect_slab_object(
         if struct_name:
             phase1.append(f"struct -o {struct_name}")
             phase1.append(f"struct {struct_name} 0x{target_addr:x}")
-        raw_output = run_crash_script(
-            "\n".join(phase1), vmcore_path, vmlinux_path, True
-        )
+        with _sync_concurrency_sem:
+            raw_output = run_crash_script(
+                "\n".join(phase1), vmcore_path, vmlinux_path, True
+            )
         if struct_name and "invalid data structure reference" in raw_output.lower():
             raw_output += (
                 "\n[hint] struct type is module-private; pass the module name as the "
@@ -158,9 +181,10 @@ def inspect_slab_object(
             qwords = max(2, slot_size // 8)
             count = qwords * 3
 
-        slot_dump = run_crash_command(
-            f"rd -x 0x{start:x} {count}", vmcore_path, vmlinux_path, True
-        )
+        with _sync_concurrency_sem:
+            slot_dump = run_crash_command(
+                f"rd -x 0x{start:x} {count}", vmcore_path, vmlinux_path, True
+            )
         raw_output = f"{raw_output.rstrip()}\n\n{slot_dump}"
         summary = format_mechanical_analysis_summary(
             raw_output,
@@ -229,9 +253,10 @@ def compare_memory_blocks(
             f"rd -x 0x{src_addr:x} {qword_count}",
             f"rd -x 0x{dst_addr:x} {qword_count}",
         ]
-        raw_output = run_crash_script(
-            "\n".join(script_lines), vmcore_path, vmlinux_path, True
-        )
+        with _sync_concurrency_sem:
+            raw_output = run_crash_script(
+                "\n".join(script_lines), vmcore_path, vmlinux_path, True
+            )
         reads = parse_memory_reads(raw_output)
         summary = format_mechanical_analysis_summary(
             raw_output, reads, default_stride=stride
@@ -308,7 +333,7 @@ def compare_memory_blocks(
 
 
 @crash_server.tool()
-def run_script(
+async def run_script(
     script: Annotated[
         str,
         Field(
@@ -331,7 +356,10 @@ def run_script(
     Useful for executing a sequence of commands where state (like loaded modules) needs to be preserved.
     """
     try:
-        return run_crash_script(script, vmcore_path, vmlinux_path, True)
+        async with _get_concurrency_semaphore():
+            return await asyncio.to_thread(
+                run_crash_script, script, vmcore_path, vmlinux_path, True
+            )
     except Exception as e:
         return f"Failed to execute crash script: {str(e)}"
 
@@ -363,7 +391,10 @@ def register_crash_tool(name: str, syntax: str, example: str, summary: str):
     ) -> str:
         # 统一的执行逻辑
         try:
-            output = run_crash_command(command, vmcore_path, vmlinux_path, True)
+            async with _get_concurrency_semaphore():
+                output = await asyncio.to_thread(
+                    run_crash_command, command, vmcore_path, vmlinux_path, True
+                )
             return output
         except Exception as e:
             return f"Failed to execute crash command: {str(e)}"
@@ -697,5 +728,15 @@ for cmd_info in commands:
     register_crash_tool(*cmd_info)
 
 if __name__ == "__main__":
-    # 作为独立进程启动时，通过 stdio 与 MCP 客户端通信。
-    crash_server.run(transport="stdio", show_banner=False)
+    transport = os.environ.get("CRASH_MCP_TRANSPORT", "stdio").strip() or "stdio"
+    if transport == "stdio":
+        crash_server.run(transport="stdio", show_banner=False)
+    else:
+        host = os.environ.get("CRASH_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
+        port = int(os.environ.get("CRASH_MCP_PORT", "8766").strip() or "8766")
+        crash_server.run(
+            transport=transport,
+            host=host,
+            port=port,
+            show_banner=False,
+        )

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# executor.py - Crash 工具执行器实现
+# executor.py - Crash 工具执行器实现（支持常驻 PTY 会话池 / 跨进程 Daemon / 传统 Oneshot）
 # Author: CalmWU
 # Created: 2026-01-09
 
+from __future__ import annotations
+
+import os
 import subprocess
 
 
@@ -20,7 +23,6 @@ def _get_linux_distro_version() -> tuple[str, str]:
 
 
 # crash 命令单次执行的最长等待时间（秒）。
-# log | grep 等大输出命令可能导致无限期阻塞，超时后强制终止进程并返回截断结果。
 COMMAND_TIMEOUT = 180
 
 # 单次命令返回的最大字符数。超出部分将被截断以防止 LLM token 溢出。
@@ -49,17 +51,34 @@ CRASH_IGNORE_MARKERS = [
     "www.gnu.org",
 ]
 
+_VALID_EXECUTION_MODES = frozenset({"pool", "daemon", "oneshot"})
+
+
+def get_crash_execution_mode() -> str:
+    """获取当前 crash 执行模式：pool（默认常驻会话池）、daemon（跨进程共享）或 oneshot（旧版短进程）。"""
+    mode = os.environ.get("CRASH_EXECUTION_MODE", "pool").strip().lower() or "pool"
+    if mode not in _VALID_EXECUTION_MODES:
+        _get_logger().warning(
+            "Invalid CRASH_EXECUTION_MODE=%r; falling back to 'pool'.", mode
+        )
+        return "pool"
+    return mode
+
+
+def _is_supported_distro() -> bool:
+    if os.environ.get("CRASH_SKIP_DISTRO_CHECK", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+    distro, version = _get_linux_distro_version()
+    return distro == "rhel" and version.isdigit() and int(version) == 9
+
 
 def run_crash_command_rhel9(command, vmcore_path, vmlinux_path, verbose=False):
-    """Run a crash command on RHEL 9 systems.
-    Args:
-        command (str): The crash command to run.
-        vmcore_path (str): The path to the vmcore file.
-        vmlinux_path (str): The path to the vmlinux file.
-        debug (bool): Whether to enable debug mode.
-    Returns:
-        str: The output of the crash command.
-    """
+    """Run a one-shot crash command on RHEL 9 systems (legacy fallback)."""
     logger = _get_logger()
     full_cmd = ["crash", vmlinux_path, vmcore_path]
     process = subprocess.Popen(
@@ -136,20 +155,10 @@ def run_crash_command_rhel9(command, vmcore_path, vmlinux_path, verbose=False):
 
 
 def run_crash_script_rhel9(script_content, vmcore_path, vmlinux_path, verbose=False):
-    """Run multiple crash commands (script) on RHEL 9 systems.
-
-    Args:
-        script_content (str): The content of the script (commands separated by newlines).
-        vmcore_path (str): The path to the vmcore file.
-        vmlinux_path (str): The path to the vmlinux file.
-        verbose (bool): Whether to enable verbose mode.
-    Returns:
-        str: The filtered output of the crash session.
-    """
+    """Run multiple crash commands (one-shot script) on RHEL 9 systems (legacy fallback)."""
     logger = _get_logger()
     full_cmd = ["crash", vmlinux_path, vmcore_path]
 
-    # 执行 crash 命令，通过 stdin 传入脚本内容
     process = subprocess.Popen(
         full_cmd,
         stdin=subprocess.PIPE,
@@ -159,7 +168,6 @@ def run_crash_script_rhel9(script_content, vmcore_path, vmlinux_path, verbose=Fa
         bufsize=1024 * 1024,
     )
 
-    # 确保脚本以换行符和 quit 结束，以便正常退出 crash
     input_str = script_content
     if not input_str.endswith("\n"):
         input_str += "\n"
@@ -187,7 +195,6 @@ def run_crash_script_rhel9(script_content, vmcore_path, vmlinux_path, verbose=Fa
     lines = stdout.splitlines()
     filtered_lines = []
 
-    # 额外的 ignore markers
     extra_ignore_markers = [
         "KERNEL:",
         "DUMPFILE:",
@@ -210,13 +217,11 @@ def run_crash_script_rhel9(script_content, vmcore_path, vmlinux_path, verbose=Fa
         "STATE",
     ]
     for line in lines:
-        # 过滤包含特定标记的行
         if any(
             marker in line for marker in CRASH_IGNORE_MARKERS + extra_ignore_markers
         ):
             continue
 
-        # 过滤回显的 quit 命令
         if line.strip() == "quit":
             continue
 
@@ -240,37 +245,85 @@ def run_crash_script_rhel9(script_content, vmcore_path, vmlinux_path, verbose=Fa
     return output
 
 
-def run_crash_command(full_subcmd, vmcore_path, vmlinux_path, verbose=False):
-    """Run a crash subcommand on the given vmcore and vmlinux files.
-    Args:
-        full_subcmd (str): The crash subcommand to run.
-        vmcore_path (str): The path to the vmcore file.
-        vmlinux_path (str): The path to the vmlinux file.
-    Returns:
-        str: The output of the crash command.
-    """
+def _execute_via_pool_or_daemon(
+    command_or_script: str,
+    vmcore_path: str,
+    vmlinux_path: str,
+    *,
+    is_script: bool,
+    verbose: bool,
+) -> str:
+    mode = get_crash_execution_mode()
+    if mode == "daemon":
+        # 延迟导入，确保非 POSIX 环境下模块导入与 oneshot 模式不受影响
+        from .daemon import CrashDaemonClient
 
-    # 工具运行的 OS 环境和版本
-    distro, version = _get_linux_distro_version()
-    if distro == "rhel" and int(version) == 9:
-        return run_crash_command_rhel9(full_subcmd, vmcore_path, vmlinux_path, verbose)
-    else:
+        endpoint = os.environ.get(
+            "CRASH_DAEMON_ENDPOINT", "unix:///tmp/vmcore_crashd.sock"
+        ).strip()
+        try:
+            client = CrashDaemonClient(endpoint)
+            return client.execute(
+                command_or_script,
+                vmcore_path,
+                vmlinux_path,
+                is_script=is_script,
+                verbose=verbose,
+            )
+        except Exception as exc:
+            fallback = os.environ.get(
+                "CRASH_DAEMON_FALLBACK_TO_POOL", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if not fallback:
+                raise
+            _get_logger().warning(
+                "CrashDaemon (%s) unavailable (%s); falling back to in-process pool.",
+                endpoint,
+                exc,
+            )
+
+    from .session_pool import get_default_pool
+
+    return get_default_pool().execute(
+        command_or_script,
+        vmcore_path,
+        vmlinux_path,
+        is_script=is_script,
+        verbose=verbose,
+    )
+
+
+def run_crash_command(full_subcmd, vmcore_path, vmlinux_path, verbose=False):
+    """Run a crash subcommand on the given vmcore and vmlinux files."""
+    if not _is_supported_distro():
         return "functionality for other distros/versions not yet implemented."
+
+    if get_crash_execution_mode() == "oneshot":
+        return run_crash_command_rhel9(full_subcmd, vmcore_path, vmlinux_path, verbose)
+
+    return _execute_via_pool_or_daemon(
+        full_subcmd,
+        vmcore_path,
+        vmlinux_path,
+        is_script=False,
+        verbose=verbose,
+    )
 
 
 def run_crash_script(script_content, vmcore_path, vmlinux_path, verbose=False):
-    """Run a crash script on the given vmcore and vmlinux files.
-    Args:
-        script_content (str): The content of the script.
-        vmcore_path (str): The path to the vmcore file.
-        vmlinux_path (str): The path to the vmlinux file.
-    Returns:
-        str: The output of the crash script.
-    """
-    distro, version = _get_linux_distro_version()
-    if distro == "rhel" and int(version) == 9:
+    """Run a crash script on the given vmcore and vmlinux files."""
+    if not _is_supported_distro():
+        return "functionality for other distros/versions not yet implemented."
+
+    if get_crash_execution_mode() == "oneshot":
         return run_crash_script_rhel9(
             script_content, vmcore_path, vmlinux_path, verbose
         )
-    else:
-        return "functionality for other distros/versions not yet implemented."
+
+    return _execute_via_pool_or_daemon(
+        script_content,
+        vmcore_path,
+        vmlinux_path,
+        is_script=True,
+        verbose=verbose,
+    )

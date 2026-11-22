@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -24,15 +25,12 @@ load_dotenv(_ENV_FILE, override=False)
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 
-# 参数能力档位：不同网关对 /v1/chat/completions 的 schema 严格程度不同。
-#   deepseek —— DeepSeek 官方 / 阿里云 compatible-mode：接受私有扩展字段
-#               `thinking`（形如 {"type": "enabled"}），effort 可为 `max`。
-#   openai   —— 严格 OpenAI 兼容网关（如 AMD developer 网关）：未知顶层参数直接
-#               返回 400 unsupported_parameter，必须省略 `thinking`，effort 只能用
-#               标准取值。
 PARAM_PROFILES = ("deepseek", "openai")
 _DEEPSEEK_EFFORTS = ("minimal", "low", "medium", "high", "max")
 _STANDARD_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+CRASH_EXECUTION_MODES = ("pool", "daemon", "oneshot")
+
+_logger = logging.getLogger(__name__)
 
 
 def _require(name: str) -> str:
@@ -97,7 +95,6 @@ class Settings:
     reasoning_model: str
     reasoning_thinking: str
     reasoning_effort: str
-    # 网关参数能力档位，见 PARAM_PROFILES。
     reasoning_param_profile: str
     reasoning_temperature: float
     reasoning_context_window: int
@@ -105,33 +102,27 @@ class Settings:
     reasoning_min_thinking_output_tokens: int
     reasoning_history_keep: int
     langsmith_tracing: bool
-    # 连续 length 失败达到该次数后，本 run 剩余调用改用降级预算。
-    # 0 表示关闭熔断（始终使用常规预算）。
     reasoning_length_failure_threshold: int = 2
-    # 降级预算：输出上限、reasoning effort、是否保留 thinking。
     reasoning_degraded_max_output_tokens: int = 16_000
     reasoning_degraded_reasoning_effort: str = "low"
     reasoning_degraded_thinking: bool = False
-    # Optional kernel source tree used by the kernel_source MCP tools.
-    # Empty means source-level verification is unavailable for this deployment.
     kernel_source_root: str = ""
-    # Optional allowlist for request-supplied source roots (comma separated).
     kernel_source_allowed_roots: str = ""
+    # Persistent Crash Session Pool / Daemon settings (float/int types aligned with session_pool.py)
+    crash_execution_mode: str = "pool"
+    crash_daemon_endpoint: str = "unix:///tmp/vmcore_crashd.sock"
+    crash_pool_max_sessions: int = 4
+    crash_pool_slots_per_vmcore: int = 1
+    crash_pool_idle_ttl_sec: float = 900.0
+    crash_command_timeout_sec: float = 180.0
+    crash_startup_timeout_sec: float = 120.0
 
     @property
     def sends_thinking_field(self) -> bool:
-        """是否向请求体写入 DeepSeek 私有的 ``thinking`` 字段。
-
-        严格 OpenAI 兼容网关会把未知顶层参数判为 400 unsupported_parameter，
-        因此只有 deepseek 档位才发送该字段。
-        """
-
         return self.reasoning_param_profile == "deepseek"
 
     @property
     def allowed_reasoning_efforts(self) -> tuple[str, ...]:
-        """当前档位下合法的 reasoning_effort 取值。"""
-
         return (
             _DEEPSEEK_EFFORTS
             if self.reasoning_param_profile == "deepseek"
@@ -159,6 +150,13 @@ class Settings:
             "reasoning_degraded_thinking": self.reasoning_degraded_thinking,
             "kernel_source_root": self.kernel_source_root,
             "kernel_source_allowed_roots": self.kernel_source_allowed_roots,
+            "crash_execution_mode": self.crash_execution_mode,
+            "crash_daemon_endpoint": self.crash_daemon_endpoint,
+            "crash_pool_max_sessions": self.crash_pool_max_sessions,
+            "crash_pool_slots_per_vmcore": self.crash_pool_slots_per_vmcore,
+            "crash_pool_idle_ttl_sec": self.crash_pool_idle_ttl_sec,
+            "crash_command_timeout_sec": self.crash_command_timeout_sec,
+            "crash_startup_timeout_sec": self.crash_startup_timeout_sec,
         }
 
 
@@ -198,6 +196,14 @@ def get_settings() -> Settings:
             f"{', '.join(allowed_efforts)}."
         )
 
+    # 与 executor.get_crash_execution_mode() 保持一致：非法值降级为 warning + fallback，不拖垮启动
+    crash_mode = _optional("CRASH_EXECUTION_MODE", "pool").lower()
+    if crash_mode not in CRASH_EXECUTION_MODES:
+        _logger.warning(
+            "Invalid CRASH_EXECUTION_MODE=%r; falling back to 'pool'.", crash_mode
+        )
+        crash_mode = "pool"
+
     context_window = _parse_int("REASONING_CONTEXT_WINDOW", 524_288, 1)
     max_output_tokens = _parse_int("REASONING_MAX_OUTPUT_TOKENS", 48_000, 1)
     min_thinking_output_tokens = _parse_int(
@@ -210,7 +216,6 @@ def get_settings() -> Settings:
         )
 
     return Settings(
-        # 模型名与 URL 保持原始大小写，避免 lower() 破坏大小写敏感的路径。
         reasoning_api_key=_require("REASONING_API_KEY"),
         reasoning_base_url=_require("REASONING_BASE_URL"),
         reasoning_model=_require("REASONING_MODEL"),
@@ -235,4 +240,13 @@ def get_settings() -> Settings:
         reasoning_degraded_thinking=_parse_bool("REASONING_DEGRADED_THINKING", False),
         kernel_source_root=_optional("KERNEL_SOURCE_ROOT", ""),
         kernel_source_allowed_roots=_optional("KERNEL_SOURCE_ALLOWED_ROOTS", ""),
+        crash_execution_mode=crash_mode,
+        crash_daemon_endpoint=_optional(
+            "CRASH_DAEMON_ENDPOINT", "unix:///tmp/vmcore_crashd.sock"
+        ),
+        crash_pool_max_sessions=_parse_int("CRASH_POOL_MAX_SESSIONS", 4, 1),
+        crash_pool_slots_per_vmcore=_parse_int("CRASH_POOL_SLOTS_PER_VMCORE", 1, 1),
+        crash_pool_idle_ttl_sec=_parse_float("CRASH_POOL_IDLE_TTL_SEC", 900.0),
+        crash_command_timeout_sec=_parse_float("CRASH_COMMAND_TIMEOUT_SEC", 180.0),
+        crash_startup_timeout_sec=_parse_float("CRASH_STARTUP_TIMEOUT_SEC", 120.0),
     )

@@ -266,6 +266,37 @@ layer0 2.4a 则给出各里程碑必须达成的目标：
 - `registry.py`：按目录名约定发现 provider（`crash`、`kernel_source`、`lock_hang`、`source_patch`、`stack_canary`），统一注入 `vmcore_path`/`vmlinux_path`
 - `crash/`：crash 命令执行（server/client/executor），并导出 `run_crash_command` / `run_crash_script` 供其他 provider 复用；`stack_canary/`、`source_patch/`、`kernel_source/` 为专题工具
 
+### `crash/` —— 常驻 PTY 会话池与跨进程共享守护服务
+
+`crash/` 既对外暴露 51 个注册子命令 + `run_script` / `inspect_slab_object` / `compare_memory_blocks`，也是 `stack_canary/`、`lock_hang/`、`scsishow.py` 共享的底层执行入口。为了消除大型 `vmcore` 每步冷启动与多 MCP 进程重复加载的内存开销，执行层采用**透明三模式路由**，保持 `run_crash_command` / `run_crash_script` 签名 100% 不变：
+
+```
+executor.py      统一入口；按 CRASH_EXECUTION_MODE 延迟路由至 daemon / pool / oneshot
+session_pool.py  PersistentCrashSession（PTY + 哨兵帧 + mod -s 缓存 + 3s SIGINT 自愈）
+                 + CrashSessionPool（Condition 细粒度锁 + 严格全局 LRU + ReaperThread）
+daemon.py        零外部依赖多线程守护服务（unix:// 0600 或 http://）+ CrashDaemonClient
+server.py        FastMCP 外壳；asyncio.to_thread + WeakKeyDictionary 按 loop 隔离 Semaphore；
+                 CRASH_MCP_TRANSPORT 透传给 fastmcp.run()，前者为 stdio 时走 stdio 分支，
+                 其余值（streamable-http / http / sse）走 HTTP 分支并读取 CRASH_MCP_HOST/PORT
+                 （取值合法性由 fastmcp 2.x 的 run_async 校验，未知值抛 ValueError）
+client.py        未配置 CRASH_MCP_URL 保持 stdio；配置后切换 streamable_http 连接常驻服务
+```
+
+#### 关键工程不变量
+
+| 机制 | 实现细节 | 解决的问题 |
+|---|---|---|
+| **跨平台延迟导入** | `session_pool.py` 条件导入 `pty`/`termios`（`_PTY_AVAILABLE`）；`daemon.py` 探测 `_UNIX_SOCKET_AVAILABLE`；`executor.py` 在函数内延迟导入两者 | 保证 Windows 开发/CI 机可正常导入全链路并运行 `oneshot` 兜底与跨平台单测 |
+| **哨兵帧与 Banner 消费** | 启动关闭 slave `ECHO`、握手一次性消费 Banner 并执行 `set scroll off`；每条命令追加 `!echo __CRASH_DONE_<uuid>__` 并等待哨兵 + 紧随的 `crash> ` | 去除旧版 `extra_ignore_markers` 误删真实 `bt`/`ps` 行的风险，杜绝日志内伪 `crash> ` 导致输出错位 |
+| **`mod -s` 幂等与归属校验** | `_normalize_mod_path` 将 `""`/`auto` 归一为 `""`；已加载具体路径时后续裸/`auto` 请求直接跳过；`_mod_load_failed` 按行归属模块名与路径（识别 `cannot find`/`cannot open`/`no such file` 等） | 防止路径级加载失败写脏缓存，也防止多模块脚本中某一模块失败污染另一模块 |
+| **3s 统一恢复预算与诊断** | `_try_interrupt_recover(budget_sec=3.0)` 向进程组发 `SIGINT`、读回 `crash> ` 并短暂排空残余；全模块零 `assert`；超时/启动失败异常均携带 `exit_code` | 超时不断链保留已加载符号；120s 启动超时可区分“仍在加载大符号”与“crash 已崩溃退出” |
+| **并发、严格 LRU 与无锁快照** | 池锁仅保护槽位表（不锁命令执行），不同 `vmcore` 真并行；`_evict_lru_idle_locked` 在全部空闲槽中取 `min(last_used_at)`；`loaded_modules_snapshot()` 读取原子替换的 `tuple` 快照 | 支持多槽位严格 LRU，消除 `stats()` 与 `_io_lock` 的跨锁读撕裂 |
+| **Loop 隔离信号量与 UDS 加固** | `server.py` 用 `WeakKeyDictionary[AbstractEventLoop, asyncio.Semaphore]`；`daemon.py` 绑定 `unix://` 时 `umask(0o077)` + `chmod 0o600`；`request_stop()` / `shutdown()` 幂等退出 | 彻底消除跨 event loop 信号量死锁与同机其他用户借 `!` 逃逸命令越权执行的风险 |
+
+#### 跨进程测试
+
+`tests/test_crash_session_pool.py` 分为两组：`CrashSessionCrossPlatformUnitTests`（Windows 与 Linux CI 必跑，覆盖 `_clean_output`、`_mod_load_failed`、`_prepare_lines`、多槽位严格 LRU、TCP Daemon 及跨 loop 信号量）和 `CrashPersistentPtyIntegrationTests`（仅 POSIX 运行，使用真实 `pty.openpty()` 驱动 mock `crash` REPL，覆盖常驻复用、伪提示符、`SIGINT` 3s 恢复、`SIGKILL` 重建、多 `vmcore` 真并行与 UDS `0600` 权限校验）。
+
 ### `lock_hang/` —— 锁 / 挂死确定性分析
 
 `lock_hang` 与其余 provider 一样遵守 registry 契约（`MCP_CLIENT` / `MCP_SERVER_NAME` / `initialize_tools` / `build_tool_payload`），但它的价值全在 `analyzer.py` 这颗**纯函数式内核**上：除 `run_crash_command` / `run_crash_script` 外不依赖任何框架 API，且这两个 runner 都以关键字参数注入，因此单元测试可以用假 runner 驱动完整分析流程而不需要真实 vmcore。
@@ -364,6 +395,10 @@ is_idle = (
 | 改等待原语分类（增删 mutex/rwsem/spinlock/io_wait/软中断函数） | `lock_hang/analyzer.py` 对应的 `_*_FUNCS` 集合；优先级在 `_CLASSIFY_PRIORITY` |
 | 改 idle 判定阈值（栈顶帧数、是否需要无锁/无软中断） | `lock_hang/analyzer.py` 的 `analyze_cpu_lockup_rcu` 内 `is_idle` 表达式 |
 | 改锁 owner 位掩码/reader-owned 语义 | `lock_hang/analyzer.py` 的 `LOCK_OWNER_FLAG_MASK` + `decode_lock_owner_word` |
+| 改常驻 `crash` PTY 通信、哨兵帧、`mod -s` 缓存或 LRU/TTL | `crash/session_pool.py`（`PersistentCrashSession` / `CrashSessionPool`） |
+| 改跨进程 Crash Daemon 端点或 UDS 权限 | `crash/daemon.py`（`CrashDaemonServer` / `CrashDaemonClient`） |
+| 改 `crash` 执行模式路由（`pool`/`daemon`/`oneshot`） | `crash/executor.py`（`get_crash_execution_mode` / `_execute_via_pool_or_daemon`） |
+| 改 `crash` MCP 并发上限或 HTTP 传输模式 | `crash/server.py`（`_get_concurrency_semaphore`）与 `crash/client.py`（`_build_mcp_server_config`） |
 | 改 `lock_hang` 工具参数或描述 | `lock_hang/server.py` 的 `@tool` 签名与 `Annotated[..., Field(description=...)]` |
 | 让模型优先调用锁/挂死分析器 | `react/sop_fragments.py` 加 `lock_hang_fast_path` + `prompt_builder._select_sop_fragments` 触发条件（见 `INTEGRATION.md`） |
 
@@ -380,6 +415,8 @@ $mods = Get-ChildItem tests -Filter 'test_*.py' | ForEach-Object { 'tests.' + $_
 .\.venv\Scripts\python.exe -m unittest @mods
 ```
 
+`tests/test_crash_session_pool.py` 同样无外部框架依赖，在 Windows 上自动运行跨平台纯逻辑单测、在 Linux 上全量运行真实 PTY 集成测试：`python -m unittest tests.test_crash_session_pool`。
+
 `tests/test_lock_hang_analyzer.py` 不依赖 `langchain_mcp_adapters`，可直接用系统 Python 运行：
 `python -m unittest tests.test_lock_hang_analyzer`。
 
@@ -391,3 +428,5 @@ $mods = Get-ChildItem tests -Filter 'test_*.py' | ForEach-Object { 'tests.' + $_
 - `local_corruption_exclusion` 是代码级门控名，措辞上仍是 exclusion；prompt 侧已统一为 discrimination 语义，重命名标识符需同步 `state_manager`/`schema`/`report_generator` 与测试。
 - `lock_hang` 的 `irq_or_softirq_cpus` 只覆盖软中断与停顿检测原语，不含硬件中断（字段名沿用旧称以避免破坏消费方）；纯硬件中断上下文不计入 `active_or_suspected_cpus`，只在无其它线索时触发兜底建议。
 - `soft_lockup` / `hard_lockup` / `rcu_stall` / `hung_task` 的签名门控（`lock_holder`、`wait_chain` 等）在 `evidence._GATE_COMPLETION_CRITERIA` 里**没有**对应条款，因此这些签名当前无法由执行器判定定论；`lock_hang` 提供的是取证加速，不是门控闭合规则的替代。
+- `crash/daemon.py` 的 `http://` 端点无内置鉴权，仅限可信单租户主机；多用户主机必须使用 `unix://`（已自动收紧为 `0600` 权限），避免本地其他用户借 `crash` 的 `!` shell 逃逸执行任意命令。
+- `daemon` 模式下，所有 MCP Server 共享守护进程侧的 `CRASH_POOL_MAX_SESSIONS × CRASH_POOL_SLOTS_PER_VMCORE` 槽位；若各 MCP Server 的 `CRASH_MCP_MAX_CONCURRENCY` 之和远大于池容量，超出请求会在 `CRASH_POOL_ACQUIRE_TIMEOUT_SEC` 处排队超时，生产部署应按池容量同步调优。
