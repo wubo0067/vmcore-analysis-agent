@@ -6,7 +6,7 @@
 
 import os
 import sys
-from typing import Any, List, Optional
+from typing import Any, List, Optional, cast
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from src.utils.logging import logger
 from src.utils.crash_command import with_tool_prefix
@@ -40,7 +40,9 @@ def _build_mcp_server_config() -> dict[str, Any]:
 
 
 # 初始化 MCP 客户端
-crash_client = MultiServerMCPClient({MCP_SERVER_NAME: _build_mcp_server_config()})
+crash_client = MultiServerMCPClient(
+    cast(Any, {MCP_SERVER_NAME: _build_mcp_server_config()})
+)
 MCP_CLIENT = crash_client
 
 # 全局工具列表（延迟初始化）

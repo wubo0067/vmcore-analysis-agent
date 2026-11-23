@@ -223,6 +223,11 @@ class PersistentCrashSession:
         self.config = config or CrashSessionConfig.from_env()
         self._command_builder = command_builder or _default_command_builder
 
+        # 单会话 PTY I/O 互斥锁：保证同一 crash 进程同一时刻只有一个线程在
+        # 发命令/收输出（execute 串行、restart 重启期间不暴露半初始化状态）。
+        # 池层同 vmcore 并发由 _cond/slots 控制，此锁兜底防止直接共享 session
+        # 对象时命令与哨兵输出串台；用 RLock 是因为 execute 持锁后会重入调用
+        # restart()/_start() 等同样需要该锁的内部方法。
         self._io_lock = threading.RLock()
         self._proc: Optional[subprocess.Popen[bytes]] = None
         self._master_fd: Optional[int] = None
@@ -737,8 +742,17 @@ class CrashSessionPool:
         return sum(len(s) for s in self._slots.values()) + self._creating_count
 
     def _acquire_slot(self, vmcore_path: str, vmlinux_path: str) -> _SessionSlot:
+        """借出一个绑定到 (vmcore, vmlinux) 的会话槽位（阻塞，直到拿到槽位或超时）。
+
+        获取优先级：复用空闲槽位 > 新建槽位 > 等待他人归还。
+        注意：真正关闭被淘汰会话（close）和新建 crash 进程这两类耗时/可能阻塞的操作
+        必须放在 _cond 锁外执行，否则会长时间持锁阻塞其他线程的 acquire/release。
+        """
+        # key 用 realpath 归一化：符号链接/相对路径指向同一 vmcore 时能命中同一组槽位
         key = self._normalize_key(vmcore_path, vmlinux_path)
+        # 获取槽位的绝对截止时间（monotonic 时钟，不受系统时间跳变影响）
         deadline = time.monotonic() + self.config.acquire_timeout_sec
+        # 锁外待关闭的会话：先在锁内摘除引用，出锁后再统一 close，避免持锁执行阻塞 I/O
         to_close: list[PersistentCrashSession] = []
 
         with self._cond:
@@ -747,39 +761,57 @@ class CrashSessionPool:
                     raise RuntimeError("CrashSessionPool has been shut down")
 
                 key_slots = self._slots.get(key, [])
-                # 1. 优先复用该 vmcore 最近使用的空闲槽位（热点缓存命中）
+                # 1. 优先复用该 vmcore 最近使用的空闲槽位（热点缓存命中）。
+                #    选 last_used_at 最大的空闲槽位：保留"最新鲜"的会话（其 mod 缓存
+                #    等状态更可能仍有效），同时避免多个等待者集中抢同一个旧槽位。
                 idle_key_slots = [s for s in key_slots if not s.in_use]
                 if idle_key_slots:
                     slot = max(idle_key_slots, key=lambda s: s.session.last_used_at)
                     slot.in_use = True
+                    # move_to_end 维护 OrderedDict 的 LRU 顺序：越活跃的 key 越靠尾部，
+                    # 全局淘汰时从头部（最久未用）开始扫
                     self._slots.move_to_end(key)
                     self._hits += 1
                     return slot
 
-                # 2. 若该 vmcore 尚未达到单库槽位上限，尝试新建（必要时先全局 LRU 淘汰）
+                # 2. 若该 vmcore 尚未达到单库槽位上限，尝试新建（必要时先全局 LRU 淘汰腾位）
                 can_create_for_key = len(key_slots) < self.config.slots_per_vmcore
                 if can_create_for_key:
+                    # 全局总槽位已满时，先淘汰一个"别的 vmcore"的最近未用空闲会话。
+                    # exclude_key=self key：不能淘汰目标 vmcore 自己的会话（可能与
+                    # 并发等待者互相踢皮球导致活锁）。
                     if self._total_slots_locked() >= self.config.max_total_sessions:
                         evicted = self._evict_lru_idle_locked(exclude_key=key)
                         if evicted is not None:
                             to_close.append(evicted)
 
+                    # 淘汰腾位成功（或原本未满）才真正新建；_creating_count 计入总占用，
+                    # 防止并发线程在创建期间把总槽位超额建满。
                     if self._total_slots_locked() < self.config.max_total_sessions:
                         self._creating_count += 1
                         self._misses += 1
+                        # break 跳出锁内循环，转入锁外执行"关闭被淘汰会话 + 新建会话"
                         break
 
+                # 3. 无空闲槽位且无法新建：等待其他线程 release / 创建失败通知。
+                #    remaining <= 0 说明整体超时（常见于所有槽位都被长时间占用的命令卡住）。
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
                         f"Timed out after {self.config.acquire_timeout_sec}s waiting for "
                         f"an available crash session slot (max_total_sessions={self.config.max_total_sessions})."
                     )
+                # 用带超时的 wait 而非无限 wait：即使错过某次 notify_all 也能定期
+                # 醒来重新评估；同时保证不超过 deadline
                 self._cond.wait(timeout=min(remaining, 0.5))
 
+        # ---- 以下均在 _cond 锁外执行 ----
+
+        # 关闭被淘汰的旧会话（crash 进程退出可能耗时，绝不持锁做）
         for old_sess in to_close:
             old_sess.close()
 
+        # 新建常驻 crash 进程（PTY 启动 + 等待 crash> 提示符，可达 startup_timeout 秒）
         try:
             session = PersistentCrashSession(
                 vmcore_path=vmcore_path,
@@ -788,6 +820,7 @@ class CrashSessionPool:
                 command_builder=self._command_builder,
             )
         except Exception:
+            # 创建失败：归还配额并唤醒所有等待者（它们可重新尝试抢占或新建）
             with self._cond:
                 self._creating_count -= 1
                 self._cond.notify_all()
@@ -798,24 +831,35 @@ class CrashSessionPool:
             self._creating_count -= 1
             self._slots.setdefault(key, []).append(slot)
             self._slots.move_to_end(key)
+            # 唤醒等待者：总槽位变化（新建完成/失败）可能让它们的状态判断改变
             self._cond.notify_all()
         return slot
 
     def _release_slot(self, slot: _SessionSlot) -> None:
+        """归还槽位：标记空闲、维持 LRU 顺序，并唤醒正在等待槽位的 acquire 线程。"""
         with self._cond:
             slot.in_use = False
             if slot.key in self._slots:
                 self._slots.move_to_end(slot.key)
+            # 关键：唤醒所有 _acquire_slot 中 wait 的线程，让它们重新竞争这个空闲槽位
             self._cond.notify_all()
 
     def _evict_lru_idle_locked(
         self, *, exclude_key: Optional[tuple[str, str]] = None
     ) -> Optional[PersistentCrashSession]:
-        """在所有空闲槽位中按 session.last_used_at 最小者淘汰（严格全局 LRU，兼容多槽位）。"""
+        """在所有空闲槽位中按 session.last_used_at 最小者淘汰（严格全局 LRU，兼容多槽位）。
+
+        前置条件：调用方必须已持有 self._cond 锁（方法名后缀 _locked 即此约定）。
+        只淘汰空闲（in_use=False）会话，绝不碰正在执行命令的会话；
+        exclude_key 用于排除目标 vmcore 自身的槽位。
+        返回被摘除的 PersistentCrashSession（由调用方在锁外 close），无可淘汰时返回 None。
+        """
         best_key: Optional[tuple[str, str]] = None
         best_idx = -1
         best_ts = float("inf")
 
+        # 线性扫描所有 key 的所有槽位找全局最久未用的空闲会话。
+        # 槽位总数受 max_total_sessions 约束（默认个位数），扫描成本可忽略。
         for k, slot_list in self._slots.items():
             if k == exclude_key:
                 continue
@@ -826,8 +870,10 @@ class CrashSessionPool:
                     best_idx = idx
 
         if best_key is None:
+            # 没有任何可淘汰的空闲会话（例如全部都在执行命令）
             return None
 
+        # 从槽位表中摘除该槽位；若该 vmcore 的槽位列表因此变空则整个 key 移除
         slot_list = self._slots[best_key]
         removed = slot_list.pop(best_idx)
         if not slot_list:

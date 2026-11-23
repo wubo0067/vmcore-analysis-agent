@@ -731,12 +731,14 @@ if __name__ == "__main__":
     transport = os.environ.get("CRASH_MCP_TRANSPORT", "stdio").strip() or "stdio"
     if transport == "stdio":
         crash_server.run(transport="stdio", show_banner=False)
-    else:
+    elif transport in ("http", "sse", "streamable-http"):
         host = os.environ.get("CRASH_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
         port = int(os.environ.get("CRASH_MCP_PORT", "8766").strip() or "8766")
         crash_server.run(
-            transport=transport,
+            transport=transport,  # type: ignore[arg-type]
             host=host,
             port=port,
             show_banner=False,
         )
+    else:
+        raise ValueError(f"Unsupported CRASH_MCP_TRANSPORT: {transport!r}")
