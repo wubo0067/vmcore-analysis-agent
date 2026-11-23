@@ -4,7 +4,7 @@
 # Author: AI Agent
 
 import re
-from .executor import run_crash_command, run_crash_script
+from .executor import run_crash_script
 
 
 def _get_logger():
@@ -273,6 +273,9 @@ def run_scsishow(vmcore_path: str, vmlinux_path: str, kver: str) -> str:
             curr_counter_field = None
             if curr_target in all_devs:
                 devices[curr_target] = {}
+            continue
+
+        if curr_target is None:
             continue
 
         if curr_target in all_hostts:
