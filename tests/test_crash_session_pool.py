@@ -35,6 +35,7 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 from src.mcp_tools.crash import executor as crash_executor
+from src.mcp_tools.crash.client import _build_mcp_server_config
 from src.mcp_tools.crash.daemon import (
     CrashDaemonClient,
     CrashDaemonServer,
@@ -82,6 +83,9 @@ MOCK_CRASH_SCRIPT = textwrap.dedent(
                 sys.stdout.write(f"MOCK_PID={os.getpid()} VMCORE={vmcore}\\n")
             elif cmd == "fake_prompt":
                 sys.stdout.write("line1 before fake\\ncrash> fake prompt inside log\\nline2 after fake\\n")
+            elif cmd == "slow_cmd":
+                time.sleep(1.0)
+                sys.stdout.write("SLOW-DONE\\n")
             elif cmd.startswith("mod -s "):
                 if "/missing/" in cmd:
                     path = cmd.split()[-1]
@@ -107,6 +111,97 @@ MOCK_CRASH_SCRIPT = textwrap.dedent(
 
 class CrashSessionCrossPlatformUnitTests(unittest.TestCase):
     """不依赖 POSIX PTY，可在 Windows 与 Linux CI 全量运行。"""
+
+    def test_execution_mode_defaults_to_daemon_and_rejects_removed_pool(self) -> None:
+        """默认 daemon；pool/非法值回退 daemon；进程内默认全局池已移除。"""
+        from src.mcp_tools.crash import executor, session_pool
+
+        old_env = os.environ.copy()
+        try:
+            os.environ.pop("CRASH_EXECUTION_MODE", None)
+            self.assertEqual(executor.get_crash_execution_mode(), "daemon")
+
+            os.environ["CRASH_EXECUTION_MODE"] = "oneshot"
+            self.assertEqual(executor.get_crash_execution_mode(), "oneshot")
+
+            # 旧配置 pool 与非法值均回退为 daemon
+            os.environ["CRASH_EXECUTION_MODE"] = "pool"
+            self.assertEqual(executor.get_crash_execution_mode(), "daemon")
+
+            os.environ["CRASH_EXECUTION_MODE"] = "unknown_mode"
+            self.assertEqual(executor.get_crash_execution_mode(), "daemon")
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        # 不再暴露进程内默认全局池
+        self.assertFalse(hasattr(session_pool, "get_default_pool"))
+        self.assertFalse(hasattr(session_pool, "shutdown_default_pool"))
+
+    def test_daemon_unreachable_fails_fast_without_pool_fallback(self) -> None:
+        """daemon 不可达时快速失败，并给出启动指引（不再回退进程内池）。"""
+        from src.mcp_tools.crash import executor
+
+        old_env = os.environ.copy()
+        try:
+            os.environ["CRASH_EXECUTION_MODE"] = "daemon"
+            os.environ["CRASH_SKIP_DISTRO_CHECK"] = "1"
+            os.environ["CRASH_DAEMON_ENDPOINT"] = "http://127.0.0.1:1"
+
+            with self.assertRaises(RuntimeError) as ctx:
+                executor.run_crash_command("sys", "/tmp/a.vmcore", "/tmp/vmlinux")
+            self.assertIn("tools/crash-daemon.sh start", str(ctx.exception))
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_settings_and_client_env_keys_cleaned(self) -> None:
+        from pathlib import Path
+        from src.utils import settings as settings_mod
+
+        self.assertEqual(settings_mod.CRASH_EXECUTION_MODES, ("daemon", "oneshot"))
+        self.assertEqual(
+            settings_mod.Settings.__dataclass_fields__["crash_execution_mode"].default,
+            "daemon",
+        )
+        client_py = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "mcp_tools"
+            / "crash"
+            / "client.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("CRASH_DAEMON_FALLBACK_TO_POOL", client_py)
+        for removed in ("CRASH_POOL_MAX_SESSIONS", "CRASH_POOL_SLOTS_PER_VMCORE"):
+            self.assertNotIn(f'"{removed}"', client_py)
+
+    def test_stdio_server_receives_only_required_crash_configuration(self) -> None:
+        old_env = os.environ.copy()
+        try:
+            os.environ.pop("CRASH_MCP_URL", None)
+            os.environ.update(
+                {
+                    "CRASH_EXECUTION_MODE": "daemon",
+                    "CRASH_DAEMON_ENDPOINT": "unix:///tmp/crash-client-test.sock",
+                    "CRASH_COMMAND_TIMEOUT_SEC": "180",
+                    "CRASH_POOL_MAX_SESSIONS": "4",
+                    "REASONING_API_KEY": "must-not-be-forwarded",
+                }
+            )
+            config = _build_mcp_server_config()
+            self.assertEqual(config["env"]["CRASH_EXECUTION_MODE"], "daemon")
+            self.assertEqual(
+                config["env"]["CRASH_DAEMON_ENDPOINT"],
+                "unix:///tmp/crash-client-test.sock",
+            )
+            self.assertEqual(config["env"]["CRASH_COMMAND_TIMEOUT_SEC"], "180")
+            # 会话池参数与回退开关由 daemon 进程读取，不再转发给 stdio 子进程
+            self.assertNotIn("CRASH_POOL_MAX_SESSIONS", config["env"])
+            self.assertNotIn("CRASH_DAEMON_FALLBACK_TO_POOL", config["env"])
+            self.assertNotIn("REASONING_API_KEY", config["env"])
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
 
     def test_clean_output_and_mod_dedup_normalization(self) -> None:
         class _Dummy:
@@ -182,7 +277,9 @@ class CrashSessionCrossPlatformUnitTests(unittest.TestCase):
                 self.last_used_at = time.monotonic()
                 return f"FAKE:{cmd}@{os.path.basename(self.vmcore_path)}"
 
-            def close(self):
+            is_unusable = False
+
+            def close(self, *, reason="unspecified"):
                 self.closed = True
 
             def is_alive(self):
@@ -273,6 +370,177 @@ class CrashSessionCrossPlatformUnitTests(unittest.TestCase):
                     conn.close()
             finally:
                 daemon.shutdown()
+                pool.close_all()
+        finally:
+            sp_mod.PersistentCrashSession = orig_cls
+
+    def test_concurrent_acquire_same_key_creates_single_session(self) -> None:
+        """slots_per_vmcore=1 时，创建期间的并发 acquire 不能给同一 vmcore 重复建会话。"""
+        import src.mcp_tools.crash.session_pool as sp_mod
+
+        created: list[_FakeSession] = []
+        create_gate = threading.Event()
+
+        class _FakeSession:
+            def __init__(self, vmcore_path, vmlinux_path, config, command_builder=None):
+                self.vmcore_path = vmcore_path
+                self.vmlinux_path = vmlinux_path
+                self.config = config
+                self.last_used_at = time.monotonic()
+                self.command_count = 0
+                self.restart_count = 0
+                self.pid = len(created) + 100
+                self.is_unusable = False
+                self.closed = False
+                self._mods: tuple[str, ...] = ()
+                # 模拟真实场景：创建（crash 加载 vmcore）耗时，阻塞在锁外
+                create_gate.wait(timeout=5.0)
+                created.append(self)
+
+            def loaded_modules_snapshot(self):
+                return list(self._mods)
+
+            def execute(self, cmd, **kw):
+                self.command_count += 1
+                self.last_used_at = time.monotonic()
+                return f"FAKE:{cmd}"
+
+            def close(self, *, reason="unspecified"):
+                self.closed = True
+
+            def is_alive(self):
+                return not self.closed
+
+            def rss_kb(self):
+                return 0
+
+        orig_cls = sp_mod.PersistentCrashSession
+        sp_mod.PersistentCrashSession = _FakeSession  # type: ignore[assignment]
+        try:
+            cfg = CrashSessionConfig(
+                max_total_sessions=4, slots_per_vmcore=1, acquire_timeout_sec=10.0
+            )
+            pool = CrashSessionPool(cfg, start_reaper=False)
+            try:
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    futures = [
+                        ex.submit(pool.execute, "sys", "vm1", "vl") for _ in range(4)
+                    ]
+                    time.sleep(0.2)  # 让 4 个线程都进入 acquire 竞争
+                    create_gate.set()  # 放行第一个（也是唯一一个）创建
+                    outputs = [f.result(timeout=10.0) for f in futures]
+                self.assertEqual(len(created), 1)
+                self.assertTrue(all(o == "FAKE:sys" for o in outputs))
+            finally:
+                pool.close_all()
+        finally:
+            sp_mod.PersistentCrashSession = orig_cls
+
+    def test_find_unlinked_sentinel_skips_pty_echo(self) -> None:
+        tok = "__CRASH_DONE_abc123__"
+        tb = tok.encode()
+
+        # 旧逻辑只接受"哨兵 + 紧跟 crash> "；这里回显与提示符都已到达，结果应可解析
+        complete = bytearray(
+            f"crash> sys\nRELEASE: 5.14.0\ncrash> !echo {tok}\n{tok}\ncrash> ".encode()
+        )
+        pos = PersistentCrashSession._find_unlinked_sentinel(complete, tb)
+        # 真实输出是回显行之后那一份 token（回显里的 token 不算）
+        self.assertEqual(pos, complete.rfind(tok.encode()))
+
+        # 回显行尚未换行（末尾无 \n）时，最后一个 token 仍属于回显，不能算输出
+        mid_echo = bytearray(f"crash> bt\nPID: 1\ncrash> !echo {tok}".encode())
+        self.assertEqual(PersistentCrashSession._find_unlinked_sentinel(mid_echo, tb), -1)
+
+        # 完全没有回显时（ECHO 关闭），行首 token 就是真实输出
+        no_echo = bytearray(b"RELEASE: 5.14.0\n" + tok.encode() + b"\ncrash> ")
+        self.assertEqual(
+            PersistentCrashSession._find_unlinked_sentinel(no_echo, tb),
+            no_echo.find(tok.encode()),
+        )
+
+    def test_read_until_sentinel_accepts_complete_line_without_prompt_or_echo(self) -> None:
+        """日志实锤：ECHO 关闭且 crash 延迟刷新提示符时，token 独占完整行即完成。"""
+        import src.mcp_tools.crash.session_pool as sp_mod
+        from unittest.mock import patch
+
+        tok = "__CRASH_DONE_472380dad7f6__"
+        raw = (
+            b"/usr/lib64/crash/extensions/mpykdump-3.10.1-crash8.so: shared object loaded\r\n"
+            b"scroll: off (/usr/bin/less)\r\n"
+            + tok.encode()
+            + b"\r\n"
+        )
+        reads = iter((raw, b""))
+
+        class _Proc:
+            pid = 30062
+
+            @staticmethod
+            def poll() -> None:
+                return None
+
+        session = object.__new__(PersistentCrashSession)
+        session._master_fd = 7
+        session._proc = _Proc()
+        session.vmcore_path = "/var/crash/test/vmcore"
+
+        with patch.object(sp_mod.select, "select", side_effect=lambda *args: ([7], [], [])):
+            with patch.object(sp_mod.os, "read", side_effect=lambda fd, size: next(reads)):
+                output = session._read_until_sentinel(tok, timeout=1.0)
+        self.assertIn("scroll: off (/usr/bin/less)", output)
+
+    def test_declared_dead_session_is_dropped_and_replaced(self) -> None:
+        import src.mcp_tools.crash.session_pool as sp_mod
+
+        created: list[_FakeSession] = []
+
+        class _FakeSession:
+            def __init__(self, vmcore_path, vmlinux_path, config, command_builder=None):
+                self.vmcore_path = vmcore_path
+                self.vmlinux_path = vmlinux_path
+                self.config = config
+                self.last_used_at = time.monotonic()
+                self.command_count = 0
+                self.restart_count = 0
+                self.pid = len(created) + 200
+                self.is_unusable = False
+                self.closed = False
+                created.append(self)
+
+            def loaded_modules_snapshot(self):
+                return []
+
+            def execute(self, cmd, **kw):
+                self.command_count += 1
+                self.last_used_at = time.monotonic()
+                if self.command_count == 1 and self.pid == 200:
+                    self.is_unusable = True
+                    return "[CRASH SESSION ERROR] boom"
+                return f"FAKE:{cmd}"
+
+            def close(self, *, reason="unspecified"):
+                self.closed = True
+
+            def is_alive(self):
+                return not self.closed
+
+            def rss_kb(self):
+                return 0
+
+        orig_cls = sp_mod.PersistentCrashSession
+        sp_mod.PersistentCrashSession = _FakeSession  # type: ignore[assignment]
+        try:
+            cfg = CrashSessionConfig(max_total_sessions=1, slots_per_vmcore=1)
+            pool = CrashSessionPool(cfg, start_reaper=False)
+            try:
+                self.assertIn("CRASH SESSION ERROR", pool.execute("bt", "vm1", "vl"))
+                self.assertTrue(created[0].closed)
+                # 坏死槽位必须已被摘除，下一次执行要新建会话而不是复用
+                pool.execute("bt", "vm1", "vl")
+                self.assertEqual(len(created), 2)
+                self.assertFalse(created[1].closed)
+            finally:
                 pool.close_all()
         finally:
             sp_mod.PersistentCrashSession = orig_cls

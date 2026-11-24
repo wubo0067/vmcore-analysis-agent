@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# executor.py - Crash 工具执行器实现（支持常驻 PTY 会话池 / 跨进程 Daemon / 传统 Oneshot）
+# executor.py - Crash 工具执行器实现（支持跨进程共享 Daemon / 传统 Oneshot）
 # Author: CalmWU
 # Created: 2026-01-09
 
@@ -51,17 +51,24 @@ CRASH_IGNORE_MARKERS = [
     "www.gnu.org",
 ]
 
-_VALID_EXECUTION_MODES = frozenset({"pool", "daemon", "oneshot"})
+_VALID_EXECUTION_MODES = frozenset({"daemon", "oneshot"})
 
 
 def get_crash_execution_mode() -> str:
-    """获取当前 crash 执行模式：pool（默认常驻会话池）、daemon（跨进程共享）或 oneshot（旧版短进程）。"""
-    mode = os.environ.get("CRASH_EXECUTION_MODE", "pool").strip().lower() or "pool"
+    """获取当前 crash 执行模式：daemon（默认，跨进程共享常驻守护进程）或 oneshot（短生命周期子进程）。"""
+    mode = os.environ.get("CRASH_EXECUTION_MODE", "daemon").strip().lower() or "daemon"
     if mode not in _VALID_EXECUTION_MODES:
-        _get_logger().warning(
-            "Invalid CRASH_EXECUTION_MODE=%r; falling back to 'pool'.", mode
-        )
-        return "pool"
+        if mode == "pool":
+            _get_logger().warning(
+                "CRASH_EXECUTION_MODE='pool' has been removed (stdio MCP subprocesses "
+                "cannot persist an in-process pool across batches); falling back to "
+                "'daemon'. Set CRASH_EXECUTION_MODE=daemon or oneshot."
+            )
+        else:
+            _get_logger().warning(
+                "Invalid CRASH_EXECUTION_MODE=%r; falling back to 'daemon'.", mode
+            )
+        return "daemon"
     return mode
 
 
@@ -245,7 +252,7 @@ def run_crash_script_rhel9(script_content, vmcore_path, vmlinux_path, verbose=Fa
     return output
 
 
-def _execute_via_pool_or_daemon(
+def _execute_via_daemon(
     command_or_script: str,
     vmcore_path: str,
     vmlinux_path: str,
@@ -253,44 +260,28 @@ def _execute_via_pool_or_daemon(
     is_script: bool,
     verbose: bool,
 ) -> str:
-    mode = get_crash_execution_mode()
-    if mode == "daemon":
-        # 延迟导入，确保非 POSIX 环境下模块导入与 oneshot 模式不受影响
-        from .daemon import CrashDaemonClient
+    # 延迟导入，确保非 POSIX 环境下模块导入与 oneshot 模式不受影响
+    from .daemon import CrashDaemonClient
 
-        endpoint = os.environ.get(
-            "CRASH_DAEMON_ENDPOINT", "unix:///tmp/vmcore_crashd.sock"
-        ).strip()
-        try:
-            client = CrashDaemonClient(endpoint)
-            return client.execute(
-                command_or_script,
-                vmcore_path,
-                vmlinux_path,
-                is_script=is_script,
-                verbose=verbose,
-            )
-        except Exception as exc:
-            fallback = os.environ.get(
-                "CRASH_DAEMON_FALLBACK_TO_POOL", "false"
-            ).strip().lower() in {"1", "true", "yes", "on"}
-            if not fallback:
-                raise
-            _get_logger().warning(
-                "CrashDaemon (%s) unavailable (%s); falling back to in-process pool.",
-                endpoint,
-                exc,
-            )
-
-    from .session_pool import get_default_pool
-
-    return get_default_pool().execute(
-        command_or_script,
-        vmcore_path,
-        vmlinux_path,
-        is_script=is_script,
-        verbose=verbose,
+    endpoint = (
+        os.environ.get("CRASH_DAEMON_ENDPOINT", "unix:///tmp/vmcore_crashd.sock").strip()
+        or "unix:///tmp/vmcore_crashd.sock"
     )
+    try:
+        client = CrashDaemonClient(endpoint)
+        return client.execute(
+            command_or_script,
+            vmcore_path,
+            vmlinux_path,
+            is_script=is_script,
+            verbose=verbose,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            f"CrashDaemon ({endpoint}) is unreachable: {exc}. "
+            "Start it via 'tools/crash-daemon.sh start' or set "
+            "CRASH_EXECUTION_MODE=oneshot."
+        ) from exc
 
 
 def run_crash_command(full_subcmd, vmcore_path, vmlinux_path, verbose=False):
@@ -301,7 +292,7 @@ def run_crash_command(full_subcmd, vmcore_path, vmlinux_path, verbose=False):
     if get_crash_execution_mode() == "oneshot":
         return run_crash_command_rhel9(full_subcmd, vmcore_path, vmlinux_path, verbose)
 
-    return _execute_via_pool_or_daemon(
+    return _execute_via_daemon(
         full_subcmd,
         vmcore_path,
         vmlinux_path,
@@ -320,7 +311,7 @@ def run_crash_script(script_content, vmcore_path, vmlinux_path, verbose=False):
             script_content, vmcore_path, vmlinux_path, verbose
         )
 
-    return _execute_via_pool_or_daemon(
+    return _execute_via_daemon(
         script_content,
         vmcore_path,
         vmlinux_path,

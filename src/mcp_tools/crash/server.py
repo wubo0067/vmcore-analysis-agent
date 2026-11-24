@@ -16,6 +16,8 @@ import os
 import re
 import threading
 import weakref
+
+from src.utils.logging import logger as server_logger
 from typing import Annotated
 from pydantic import Field
 from fastmcp import FastMCP
@@ -729,16 +731,32 @@ for cmd_info in commands:
 
 if __name__ == "__main__":
     transport = os.environ.get("CRASH_MCP_TRANSPORT", "stdio").strip() or "stdio"
-    if transport == "stdio":
-        crash_server.run(transport="stdio", show_banner=False)
-    elif transport in ("http", "sse", "streamable-http"):
-        host = os.environ.get("CRASH_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
-        port = int(os.environ.get("CRASH_MCP_PORT", "8766").strip() or "8766")
-        crash_server.run(
-            transport=transport,  # type: ignore[arg-type]
-            host=host,
-            port=port,
-            show_banner=False,
+    server_logger.warning(
+        "[mcp lifecycle] crash server starting: python_pid=%s transport=%s "
+        "CRASH_MCP_URL=%r CRASH_EXECUTION_MODE=%s CRASH_DAEMON_ENDPOINT=%s",
+        os.getpid(),
+        transport,
+        os.environ.get("CRASH_MCP_URL"),
+        os.environ.get("CRASH_EXECUTION_MODE", "daemon"),
+        os.environ.get("CRASH_DAEMON_ENDPOINT", "unix:///tmp/vmcore_crashd.sock"),
+    )
+    try:
+        if transport == "stdio":
+            crash_server.run(transport="stdio", show_banner=False)
+        elif transport in ("http", "sse", "streamable-http"):
+            host = os.environ.get("CRASH_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
+            port = int(os.environ.get("CRASH_MCP_PORT", "8766").strip() or "8766")
+            crash_server.run(
+                transport=transport,  # type: ignore[arg-type]
+                host=host,
+                port=port,
+                show_banner=False,
+            )
+        else:
+            raise ValueError(f"Unsupported CRASH_MCP_TRANSPORT: {transport!r}")
+    finally:
+        server_logger.info(
+            "[mcp lifecycle] crash server.run exited: python_pid=%s transport=%s",
+            os.getpid(),
+            transport,
         )
-    else:
-        raise ValueError(f"Unsupported CRASH_MCP_TRANSPORT: {transport!r}")

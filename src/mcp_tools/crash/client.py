@@ -6,12 +6,45 @@
 
 import os
 import sys
+from pathlib import Path
 from typing import Any, List, Optional, cast
+
+from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from src.utils.logging import logger
+
 from src.utils.crash_command import with_tool_prefix
+from src.utils.logging import logger
 
 MCP_SERVER_NAME = "crash"
+
+# MCP stdio 默认只向子进程转发少量环境变量；在创建 client 前加载 .env，
+# 确保主进程与 stdio crash MCP 子进程读取一致的 daemon/oneshot 配置。
+# 注意：CRASH_POOL_* 等会话池参数由常驻 crash-daemon 进程自身读取，不转发给
+# stdio MCP 子进程，避免制造"在子进程侧调池参数"的错觉。
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+load_dotenv(_PROJECT_ROOT / ".env", override=False)
+
+_CRASH_SERVER_ENV_KEYS = frozenset(
+    {
+        "CRASH_EXECUTION_MODE",
+        "CRASH_DAEMON_ENDPOINT",
+        "CRASH_COMMAND_TIMEOUT_SEC",
+        "CRASH_MAX_OUTPUT_CHARS",
+        "CRASH_BINARY",
+        "CRASH_SKIP_DISTRO_CHECK",
+        "CRASH_MCP_MAX_CONCURRENCY",
+    }
+)
+
+
+def _crash_stdio_env() -> dict[str, str]:
+    """仅向 stdio MCP 子进程转发 crash 配置，不传递 API 密钥等无关变量。"""
+    env = {key: os.environ[key] for key in _CRASH_SERVER_ENV_KEYS if key in os.environ}
+    # PATH 用于查找 crash；PYTHONPATH 用于支持直接运行客户端时的 src.* 导入。
+    for key in ("PATH", "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    return env
 
 
 def _build_mcp_server_config() -> dict[str, Any]:
@@ -32,11 +65,20 @@ def _build_mcp_server_config() -> dict[str, Any]:
             "transport": transport,
         }
 
-    return {
+    config = {
         "command": sys.executable,
         "args": ["-m", "src.mcp_tools.crash.server"],
         "transport": "stdio",
+        "env": _crash_stdio_env(),
     }
+    logger.info(
+        "Configuring stdio crash MCP server: CRASH_EXECUTION_MODE=%s "
+        "CRASH_DAEMON_ENDPOINT=%s (forwarded %d environment variables)",
+        os.environ.get("CRASH_EXECUTION_MODE", "daemon"),
+        os.environ.get("CRASH_DAEMON_ENDPOINT", "unix:///tmp/vmcore_crashd.sock"),
+        len(config["env"]),
+    )
+    return config
 
 
 # 初始化 MCP 客户端

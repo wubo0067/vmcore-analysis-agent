@@ -18,7 +18,7 @@ Key capabilities:
 - Fast structure definition lookup (`find_struct`), disassembly line mapping, and patch verification via kernel source trees.
 - Tracks hypotheses and verification gates. Gate closure is evaluated by the executor against tool evidence rather than accepted from the model directly.
 - Bounds gate evidence by category with pinned critical target addresses and slims historical message payloads, curbing token and memory bloat during long-running analyses.
-- Runs `crash` in a persistent PTY session pool (`pool` mode) or a cross-process shared daemon (`daemon` mode), eliminating per-step cold starts, deduplicating `mod -s` module loads, recovering timed-out commands via SIGINT, and supporting multi-client concurrency with global LRU/TTL memory bounds.
+- Runs `crash` via a persistent PTY session pool engine owned by a cross-process shared daemon (`daemon` mode), eliminating per-step cold starts, deduplicating `mod -s` module loads, recovering timed-out commands via SIGINT, and supporting multi-client concurrency with global LRU/TTL memory bounds.
 - Ships a deterministic lock/hang analyzer: it decodes mutex/rwsem owner pointers, builds a Wait-For Graph to detect deadlock cycles and root blockers, and aggregates per-CPU spinlock contention, softirq/watchdog, and RCU stall state without flooding context with raw `bt -a` output.
 - Provides synchronous and SSE streaming APIs; a separate Gate audit file can accompany the report.
 
@@ -114,7 +114,7 @@ REASONING_DEGRADED_THINKING=false
 KERNEL_SOURCE_ROOT=
 
 # Persistent crash session pool & shared daemon
-CRASH_EXECUTION_MODE=pool
+CRASH_EXECUTION_MODE=daemon
 CRASH_DAEMON_ENDPOINT=unix:///tmp/vmcore_crashd.sock
 CRASH_POOL_MAX_SESSIONS=4
 CRASH_POOL_SLOTS_PER_VMCORE=1
@@ -143,10 +143,9 @@ CRASH_MCP_MAX_CONCURRENCY=8
 | `REASONING_DEGRADED_THINKING` | No | Whether thinking is enabled under degraded mode; defaults to `false` |
 | `KERNEL_SOURCE_ROOT` | No | Kernel source tree matching the analysed dump (or a directory of per-version trees). Used only when a request does not carry `kernel_source_root`. Enables `read_source` / `list_writers` / `git_history` / `find_struct`; when empty, the agent reports that source could not be verified instead of quoting kernel code from memory |
 | `LANGSMITH_TRACING` | No | Enable LangSmith tracing; defaults to `false` |
-| `CRASH_EXECUTION_MODE` | No | Crash execution backend: `pool` (default, in-process persistent PTY pool), `daemon` (shared cross-process daemon, recommended for multi-client/multi-MCP production), or `oneshot` (legacy one-shot subprocess fallback) |
-| `CRASH_DAEMON_ENDPOINT` | No | Local endpoint for `daemon` mode: `unix:///tmp/vmcore_crashd.sock` (default; socket permissions enforced to `0600`) or `http://127.0.0.1:8765` (trusted single-tenant hosts only) |
-| `CRASH_DAEMON_FALLBACK_TO_POOL` | No | Whether `daemon` mode falls back to an in-process pool when the daemon is unreachable; defaults to `false` to avoid silently splitting memory budgets |
-| `CRASH_POOL_MAX_SESSIONS` | No | Global cap on resident `crash` processes (evicts least-recently-used idle slots when exceeded); defaults to `4` |
+| `CRASH_EXECUTION_MODE` | No | Crash execution backend: `daemon` (default, cross-process shared daemon; shared persistent crash across rounds/MCP servers) or `oneshot` (legacy one-shot subprocess fallback); the old `pool` value is removed and maps to `daemon` |
+| `CRASH_DAEMON_ENDPOINT` | No | Local endpoint for `daemon` mode: `unix:///tmp/vmcore_crashd.sock` (default; socket permissions enforced to `0600`) or `http://127.0.0.1:8765` (trusted single-tenant hosts only); unreachable daemon fails fast with a startup hint |
+| `CRASH_POOL_MAX_SESSIONS` | No | Global cap on resident `crash` processes (evicts least-recently-used idle slots when exceeded); defaults to `4`; read by the daemon process |
 | `CRASH_POOL_SLOTS_PER_VMCORE` | No | Concurrent resident `crash` slots allowed per `(vmcore, vmlinux)` pair; defaults to `1` |
 | `CRASH_POOL_IDLE_TTL_SEC` | No | Idle timeout in seconds before the background reaper closes a resident session; defaults to `900` |
 | `CRASH_COMMAND_TIMEOUT_SEC` | No | Per-command timeout in seconds (attempts 3s `SIGINT` recovery before killing and respawning); defaults to `180` |
@@ -180,13 +179,12 @@ The client must be able to reach the service, and paths in the request must be *
 cd client
 uv run main.py --health --url http://localhost:8000
 
-uv run main.py --url http://localhost:8000 --stream \
-  --vmcore-path /data/case/vmcore \
-  --vmlinux-path /usr/lib/debug/lib/modules/<kernel-version>/vmlinux \
-  --vmcore-dmesg-path /data/case/vmcore-dmesg.txt \
-  --debug-symbols /data/case/driver.ko \
-  --kernel-source-root /root/kernel-sources/8/4.18.0-553.22.1.el8_10/BUILD/kernel-4.18.0-553.22.1.el8_10/linux-4.18.0-553.22.1.el8_10.x86_64 \
-  --output-dir ../reports
+uv run main.py --url http://192.168.2.130:8000 --stream \
+  --vmcore-path /var/crash/127.0.0.1-2026-11-24-12:01:20/vmcore \
+  --vmlinux-path /usr/lib/debug/lib/modules/5.14.0-362.24.1.el9_3.x86_64/vmlinux \
+  --vmcore-dmesg-path /var/crash/127.0.0.1-2026-11-24-12:01:20/vmcore-dmesg.txt \
+  --debug-symbols /home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko \
+  --kernel-source-root /root/kernel-sources/9/5.14.0-362.24.1.el9_3/BUILD/kernel-5.14.0-362.24.1.el9_3/linux-5.14.0-362.24.1.el9.x86_64
 ```
 
 `--kernel-source-root` is optional; step 5 shows how to prepare the source directory it points at.
@@ -363,19 +361,51 @@ This repository does **not** currently enable a lock/hang fast path in `src/reac
 
 | Mode | How it runs | Best for |
 |---|---|---|
-| `pool` (default) | Each MCP server maintains an in-process persistent PTY pool (`crash --no_scroll`) | Local development and single-analysis CLI runs (zero extra ops) |
-| `daemon` | A single `python -m src.mcp_tools.crash.daemon` process owns the global `CrashSessionPool`; all MCP servers (`crash`, `stack_canary`, `lock_hang`) and concurrent workers share it over Unix Domain Socket (`0600`) or HTTP | Multi-client production services and multi-MCP workloads (1x memory, single cold start per vmcore) |
+| `daemon` (default) | A single `python -m src.mcp_tools.crash.daemon` process owns the global `CrashSessionPool`; all MCP servers (`crash`, `stack_canary`, `lock_hang`) and concurrent workers share it over Unix Domain Socket (`0600`) or HTTP | Multi-client production services and multi-MCP workloads (1x memory, single cold start per vmcore) |
 | `oneshot` | Legacy one-shot `subprocess.Popen` per command | Emergency rollback or non-POSIX development/CI hosts |
 
-### Starting the shared daemon (production)
+> The old `pool` value has been removed: under the stdio architecture each MCP subprocess is started and stopped per `async with session()` turn, so an in-process pool cannot survive across ReAct rounds (only `daemon` achieves "one cold start per analysis"). Explicitly setting `pool` falls back to `daemon`; the `CrashSessionPool` class remains, used only as the daemon process's core engine. When the daemon is unreachable, tool calls fail fast with a startup hint — there is no in-process pool fallback.
+
+### Starting the shared daemon (required for daemon mode)
+
+`daemon` is the default execution mode — **complete this section before starting the agent service** (keep `CRASH_EXECUTION_MODE=daemon` in `.env` and leave `CRASH_MCP_URL` empty for stdio). If the daemon is not running, crash tool calls fail fast with a startup hint (no silent fallback to an in-process pool, preventing split pools and doubled memory).
 
 ```bash
-# 1) Start the shared crash session daemon (Unix socket permissions locked to 0600)
-uv run python -m src.mcp_tools.crash.daemon --endpoint unix:///tmp/vmcore_crashd.sock
+# 1) Start the shared crash session daemon in the background
+#    (Unix socket permissions locked to 0600; safe to re-run; for TCP, first
+#     export CRASH_DAEMON_ENDPOINT=http://127.0.0.1:8765)
+bash tools/crash-daemon.sh start
 
-# 2) Point the agent service to the daemon in .env
-CRASH_EXECUTION_MODE=daemon
-CRASH_DAEMON_ENDPOINT=unix:///tmp/vmcore_crashd.sock
+# Inspect the process, pool health, and daemon logs
+bash tools/crash-daemon.sh status   # PID / endpoint / running state
+bash tools/crash-daemon.sh health   # /health: sessions, VmRSS, hits/evictions
+bash tools/crash-daemon.sh logs     # tail -f the log (Ctrl-C leaves the daemon running)
+
+# Verify the fix is active — startup log should show:
+#   [crash spawner] resident spawner thread started (tid=...)
+# After an analysis run, health should show restart_count == 0 (crash no longer exits)
+bash tools/crash-daemon.sh logs | grep "crash spawner"
+```
+
+| Script subcommand | Description |
+|---|---|
+| `start` | Background start (`nohup` + PID-file duplicate guard; prints the last 50 log lines on failure) |
+| `stop` | Graceful `SIGTERM` shutdown (waits up to 30s before `SIGKILL`); also closes crash sessions it owns |
+| `restart` | `stop` + `start`; closes and recreates all crash sessions (use after code updates) |
+| `run` | Foreground mode for systemd or direct debugging |
+| `status` / `health` / `logs` | Process state / pool health / log tailing |
+
+Optional script environment variables: `CRASH_DAEMON_ENDPOINT` (default `unix:///tmp/vmcore_crashd.sock`, also `http://127.0.0.1:8765`), `CRASH_DAEMON_RUN_DIR` (PID dir, default `logs/`), `CRASH_DAEMON_LOG_FILE` (default `logs/crash-daemon.log`), `CRASH_DAEMON_STOP_TIMEOUT` (default 30s).
+
+```bash
+# Foreground startup without the helper script
+uv run python -m src.mcp_tools.crash.daemon --endpoint unix:///tmp/vmcore_crashd.sock
+```
+
+```bash
+# Standard flow after a code update (restart the daemon to pick up new code)
+bash tools/crash-daemon.sh restart
+bash tools/crash-daemon.sh health   # confirm the pool is healthy
 
 # 3) Optional: run the crash MCP server as a persistent streamable-http service
 CRASH_MCP_TRANSPORT=streamable-http CRASH_MCP_HOST=127.0.0.1 CRASH_MCP_PORT=8766 \
@@ -422,7 +452,7 @@ ai-app-hub/                       # Repository root (contains multiple projects)
 - **Missing configuration on startup:** Check `REASONING_API_KEY`, `REASONING_BASE_URL`, and `REASONING_MODEL` in `vmcore-analysis-agent/.env` or the process environment.
 - **`400 unsupported_parameter: 'thinking'` from the LLM gateway:** Set `REASONING_PARAM_PROFILE=openai` and choose a supported effort value when using gateways that strictly validate `/v1/chat/completions`.
 - **Script rejected with `shell control flow is not executable by crash`:** `run_script` runs each argument as a single native crash command; it does not support `for`/`while`/`if` loops, `;`, `&&`, redirection (e.g. `2>/dev/null`), or shell variables. Expand loops into individual sequential crash commands per line (batching multiple commands in a single `run_script` call is encouraged to reduce ReAct steps).
-- **Running `pool` or `unix://` daemon on Windows / non-POSIX hosts:** Persistent PTY sessions require POSIX `pty`/`termios`, and `unix://` requires `AF_UNIX`. Set `CRASH_EXECUTION_MODE=oneshot` for local Windows development/CI (or `http://` for TCP daemon testing).
+- **Running `daemon` (`unix://`) on Windows / non-POSIX hosts:** Persistent PTY sessions require POSIX `pty`/`termios`, and `unix://` requires `AF_UNIX`. Set `CRASH_EXECUTION_MODE=oneshot` for local Windows development/CI (or `http://` for TCP daemon testing).
 - **Acquire timeout in `daemon` mode under high concurrency:** All MCP servers share `CRASH_POOL_MAX_SESSIONS` on the daemon side; align `CRASH_MCP_MAX_CONCURRENCY` with the pool capacity or increase `CRASH_POOL_MAX_SESSIONS` according to available host RAM.
 - **Script fails with `gdb request failed` or unknown structure reference:** When inspecting private structures of a kernel module, remember that each `run_script` call runs in a separate crash process session; the script must explicitly include `mod -s <module>` before referencing the module's private types.
 - **File not found:** API paths are resolved on the server, not on the machine running the CLI.

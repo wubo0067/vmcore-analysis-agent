@@ -28,7 +28,7 @@ _FALSE_VALUES = {"0", "false", "no", "off"}
 PARAM_PROFILES = ("deepseek", "openai")
 _DEEPSEEK_EFFORTS = ("minimal", "low", "medium", "high", "max")
 _STANDARD_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
-CRASH_EXECUTION_MODES = ("pool", "daemon", "oneshot")
+CRASH_EXECUTION_MODES = ("daemon", "oneshot")
 
 _logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ class Settings:
     kernel_source_root: str = ""
     kernel_source_allowed_roots: str = ""
     # Persistent Crash Session Pool / Daemon settings (float/int types aligned with session_pool.py)
-    crash_execution_mode: str = "pool"
+    crash_execution_mode: str = "daemon"
     crash_daemon_endpoint: str = "unix:///tmp/vmcore_crashd.sock"
     crash_pool_max_sessions: int = 4
     crash_pool_slots_per_vmcore: int = 1
@@ -197,12 +197,17 @@ def get_settings() -> Settings:
         )
 
     # 与 executor.get_crash_execution_mode() 保持一致：非法值降级为 warning + fallback，不拖垮启动
-    crash_mode = _optional("CRASH_EXECUTION_MODE", "pool").lower()
+    crash_mode = _optional("CRASH_EXECUTION_MODE", "daemon").lower()
     if crash_mode not in CRASH_EXECUTION_MODES:
-        _logger.warning(
-            "Invalid CRASH_EXECUTION_MODE=%r; falling back to 'pool'.", crash_mode
-        )
-        crash_mode = "pool"
+        if crash_mode == "pool":
+            _logger.warning(
+                "CRASH_EXECUTION_MODE='pool' has been removed; falling back to 'daemon'."
+            )
+        else:
+            _logger.warning(
+                "Invalid CRASH_EXECUTION_MODE=%r; falling back to 'daemon'.", crash_mode
+            )
+        crash_mode = "daemon"
 
     context_window = _parse_int("REASONING_CONTEXT_WINDOW", 524_288, 1)
     max_output_tokens = _parse_int("REASONING_MAX_OUTPUT_TOKENS", 48_000, 1)

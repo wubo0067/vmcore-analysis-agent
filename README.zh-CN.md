@@ -20,7 +20,7 @@
 - 针对长时分析提供证据按类别截断、关键目标地址锁定与历史消息 Gate 载荷精简，有效控制 Token 消耗与上下文膨胀。
 - 内置确定性锁/挂死分析器：解码 mutex/rwsem owner 指针并构建 Wait-For Graph 检测死锁环与根阻塞任务，同时按 CPU 汇总自旋锁争抢、软中断/看门狗与 RCU stall 状态，避免 `bt -a` 原文撑爆上下文。
 - 提供同步和 SSE 流式 API；报告正文之外可生成单独的 Gate 审计文件。
-- 支持基于 PTY 的常驻 `crash` 会话池（`pool` 模式）与跨进程共享守护进程（`daemon` 模式）：消除每步冷启动、`mod -s` 幂等缓存、超时 3 秒 `SIGINT` 自愈、严格全局 LRU/空闲 TTL 内存管控及多客户端并发访问。
+- 支持基于 PTY 的常驻 `crash` 会话池引擎与跨进程共享守护进程（`daemon` 模式）：消除每步冷启动、`mod -s` 幂等缓存、超时 3 秒 `SIGINT` 自愈、严格全局 LRU/空闲 TTL 内存管控及多客户端并发访问。
 
 ## 工作流程
 
@@ -114,7 +114,7 @@ REASONING_DEGRADED_THINKING=false
 KERNEL_SOURCE_ROOT=
 
 # 常驻 Crash 会话池与共享守护进程
-CRASH_EXECUTION_MODE=pool
+CRASH_EXECUTION_MODE=daemon
 CRASH_DAEMON_ENDPOINT=unix:///tmp/vmcore_crashd.sock
 CRASH_POOL_MAX_SESSIONS=4
 CRASH_POOL_SLOTS_PER_VMCORE=1
@@ -143,10 +143,9 @@ CRASH_MCP_MAX_CONCURRENCY=8
 | `REASONING_DEGRADED_THINKING` | 否 | 降级调用是否启用 thinking，默认 `false` |
 | `KERNEL_SOURCE_ROOT` | 否 | 与本次 dump 匹配的内核源码树（也可指向按版本分目录的根目录）；仅在请求未提供 `kernel_source_root` 时生效。启用 `read_source` / `list_writers` / `git_history` / `find_struct`，留空时 agent 会明确说明源码无法核实，而不是凭记忆引用内核代码 |
 | `LANGSMITH_TRACING` | 否 | 是否启用 LangSmith 追踪，默认 `false` |
-| `CRASH_EXECUTION_MODE` | 否 | Crash 执行后端：`pool`（默认，进程内常驻 PTY 会话池）、`daemon`（跨进程共享守护进程，多客户端/多 MCP 生产推荐）或 `oneshot`（旧版短生命周期子进程兜底） |
-| `CRASH_DAEMON_ENDPOINT` | 否 | `daemon` 模式本地通信地址：`unix:///tmp/vmcore_crashd.sock`（默认，自动收紧权限至 `0600`）或 `http://127.0.0.1:8765`（无鉴权，仅限可信单租户主机） |
-| `CRASH_DAEMON_FALLBACK_TO_POOL` | 否 | `daemon` 不可达时是否降级为进程内池，默认 `false`（避免静默分裂会话池导致内存翻倍） |
-| `CRASH_POOL_MAX_SESSIONS` | 否 | 全局常驻 `crash` 进程上限（超限时按 `last_used_at` 全局 LRU 淘汰空闲槽），默认 `4` |
+| `CRASH_EXECUTION_MODE` | 否 | Crash 执行后端：`daemon`（默认，跨进程共享守护进程，跨轮次/多 MCP 共享常驻 crash）或 `oneshot`（旧版短生命周期子进程兜底）；旧值 `pool` 已移除，配置时回退为 `daemon` |
+| `CRASH_DAEMON_ENDPOINT` | 否 | `daemon` 模式本地通信地址：`unix:///tmp/vmcore_crashd.sock`（默认，自动收紧权限至 `0600`）或 `http://127.0.0.1:8765`（无鉴权，仅限可信单租户主机）；daemon 不可达时快速失败并提示启动命令 |
+| `CRASH_POOL_MAX_SESSIONS` | 否 | 全局常驻 `crash` 进程上限（超限时按 `last_used_at` 全局 LRU 淘汰空闲槽），默认 `4`；由 daemon 进程读取 |
 | `CRASH_POOL_SLOTS_PER_VMCORE` | 否 | 单个 `(vmcore, vmlinux)` 允许并行持有的常驻进程槽位数，默认 `1` |
 | `CRASH_POOL_IDLE_TTL_SEC` | 否 | 空闲会话超时自动回收时间（秒），默认 `900` |
 | `CRASH_COMMAND_TIMEOUT_SEC` | 否 | 单条命令超时时间（秒；先 3 秒预算内发 `SIGINT` 挽救，失败再重建），默认 `180` |
@@ -180,13 +179,12 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000
 cd client
 uv run main.py --health --url http://localhost:8000
 
-uv run main.py --url http://localhost:8000 --stream \
-  --vmcore-path /data/case/vmcore \
-  --vmlinux-path /usr/lib/debug/lib/modules/<kernel-version>/vmlinux \
-  --vmcore-dmesg-path /data/case/vmcore-dmesg.txt \
-  --debug-symbols /data/case/driver.ko \
-  --kernel-source-root /root/kernel-sources/8/4.18.0-553.22.1.el8_10/BUILD/kernel-4.18.0-553.22.1.el8_10/linux-4.18.0-553.22.1.el8_10.x86_64 \
-  --output-dir ../reports
+uv run main.py --url http://192.168.2.130:8000 --stream \
+  --vmcore-path /var/crash/127.0.0.1-2026-11-24-12:01:20/vmcore \
+  --vmlinux-path /usr/lib/debug/lib/modules/5.14.0-362.24.1.el9_3.x86_64/vmlinux \
+  --vmcore-dmesg-path /var/crash/127.0.0.1-2026-11-24-12:01:20/vmcore-dmesg.txt \
+  --debug-symbols /home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko \
+  --kernel-source-root /root/kernel-sources/9/5.14.0-362.24.1.el9_3/BUILD/kernel-5.14.0-362.24.1.el9_3/linux-5.14.0-362.24.1.el9.x86_64
 ```
 
 `--kernel-source-root` 是可选的；第 5 步说明如何准备它所指向的源码目录。
@@ -359,23 +357,54 @@ Gate 是分析状态机中的验证检查点。Gate 是否关闭由执行器根�
 
 [`src/mcp_tools/crash/`](./vmcore-analysis-agent/src/mcp_tools/crash/) 提供常驻 PTY 会话池（`session_pool.py`）与可选的跨进程守护进程（`daemon.py`），`run_crash_command` / `run_crash_script` 签名保持不变，因此 `crash`、`stack_canary`、`lock_hang`、`scsishow` 全部自动受益。
 
-### 三种执行模式
+### 两种执行模式
 
 | 模式 | 运行方式 | 适用场景 |
 |---|---|---|
-| `pool`（默认） | 各 MCP Server 在进程内维护常驻 PTY 会话池（`crash --no_scroll`） | 本地开发调试、单次 CLI 分析（零额外运维） |
-| `daemon` | 独立运行 `python -m src.mcp_tools.crash.daemon` 托管全局 `CrashSessionPool`；所有 MCP Server 与并发 Worker 通过 Unix Domain Socket（`0600`）或 HTTP 共享 | 生产多客户端并发、多 MCP 协同分析（同一 `vmcore` 全程仅冷启动 1 次，内存 1×） |
+| `daemon`（默认） | 独立运行 `python -m src.mcp_tools.crash.daemon` 托管全局 `CrashSessionPool`；所有 MCP Server 与并发 Worker 通过 Unix Domain Socket（`0600`）或 HTTP 共享 | 生产多客户端并发、多 MCP 协同分析（同一 `vmcore` 全程仅冷启动 1 次，内存 1×） |
 | `oneshot` | 回退为旧版每条命令独立 `subprocess.Popen` | 紧急回滚或非 POSIX（Windows）开发/CI 机 |
 
-### 生产启动共享守护进程
+> 旧值 `pool` 已移除：stdio 架构下 MCP 子进程每轮 `async with session()` 起停，进程内会话池无法跨 ReAct 轮次存活（"整个分析只冷启动 1 次"的目标只有 `daemon` 能达成）。显式配置 `pool` 会回退为 `daemon`；`CrashSessionPool` 类保留，仅作为 daemon 进程的核心引擎。daemon 不可达时工具调用快速失败并提示启动命令，不再提供进程内池回退。
+
+### 生产启动共享守护进程（daemon 模式必读）
+
+`daemon` 是默认执行模式，**必须先完成本节步骤，再启动主服务**（`.env` 中保持 `CRASH_EXECUTION_MODE=daemon`，客户端 `CRASH_MCP_URL` 留空走 stdio）。守护进程未启动时工具调用会直接报错并提示启动命令（快速失败，不再静默回退进程内池，避免会话池分裂导致内存翻倍）。
 
 ```bash
-# 1) 启动跨进程共享守护服务（Unix Socket 自动收紧为 0600 权限）
-uv run python -m src.mcp_tools.crash.daemon --endpoint unix:///tmp/vmcore_crashd.sock
+# 1) 后台启动跨进程共享守护服务（Unix Socket 自动收紧为 0600 权限；
+#    重复执行不会重复启动；需要 TCP 时先 export CRASH_DAEMON_ENDPOINT=http://127.0.0.1:8765）
+bash tools/crash-daemon.sh start
 
-# 2) 在 .env 中切换为 daemon 模式
-CRASH_EXECUTION_MODE=daemon
-CRASH_DAEMON_ENDPOINT=unix:///tmp/vmcore_crashd.sock
+# 查看运行状态、会话池健康信息和日志
+bash tools/crash-daemon.sh status    # PID / endpoint / 运行状态
+bash tools/crash-daemon.sh health    # /health：活跃会话、VmRSS、命中/淘汰统计
+bash tools/crash-daemon.sh logs      # 持续跟踪日志（Ctrl-C 只退出查看，不停服务）
+
+# 验证修复生效：启动日志中应出现
+#   [crash spawner] resident spawner thread started (tid=...)
+# 运行分析后 health 中 restart_count 应保持 0（crash 不再退出）
+bash tools/crash-daemon.sh logs | grep "crash spawner"
+```
+
+| 脚本子命令 | 说明 |
+|---|---|
+| `start` | 后台启动（`nohup` + PID 文件防重复启动；启动失败自动打印最近 50 行日志） |
+| `stop` | 向守护进程发 `SIGTERM` 优雅停止（默认等 30s，超时才 `SIGKILL`），同时关闭其持有的 crash 会话 |
+| `restart` | `stop` + `start`，会关闭并重新创建所有 crash 会话（升级代码后用这个） |
+| `run` | 前台运行，适合 systemd 托管或直接调试 |
+| `status` / `health` / `logs` | 进程状态 / 会话池健康 / 日志跟踪 |
+
+脚本环境变量（均可选）：`CRASH_DAEMON_ENDPOINT`（默认 `unix:///tmp/vmcore_crashd.sock`，支持 `http://127.0.0.1:8765`）、`CRASH_DAEMON_RUN_DIR`（PID 目录，默认 `logs/`）、`CRASH_DAEMON_LOG_FILE`（默认 `logs/crash-daemon.log`）、`CRASH_DAEMON_STOP_TIMEOUT`（默认 30s）。
+
+```bash
+# 不使用脚本时的前台启动方式
+uv run python -m src.mcp_tools.crash.daemon --endpoint unix:///tmp/vmcore_crashd.sock
+```
+
+```bash
+# 代码更新后的标准流程（重启 daemon 使新代码生效）
+bash tools/crash-daemon.sh restart
+bash tools/crash-daemon.sh health   # 确认会话池正常
 
 # 3) 可选：将 crash MCP Server 独立为常驻 streamable-http 服务
 CRASH_MCP_TRANSPORT=streamable-http CRASH_MCP_HOST=127.0.0.1 CRASH_MCP_PORT=8766 \
@@ -423,7 +452,7 @@ ai-app-hub/                       # 仓库根目录（包含多个项目）
 - **模型网关报错 `400 unsupported_parameter: 'thinking'`**：部分严格校验 `/v1/chat/completions` 的网关不接受 DeepSeek 私有的 `thinking` 字段，请在 `.env` 中设置 `REASONING_PARAM_PROFILE=openai`，并将 `REASONING_EFFORT` 设为网关支持的值。
 - **执行 crash 脚本提示 `shell control flow is not executable by crash` 或语法被拦截**：`run_script` 的每个参数仅执行单条 crash 原生命令，不支持 `for`/`while`/`if` 循环、分号、`&&`、重定向（如 `2>/dev/null`）或 shell 变量。应将循环展开为逐行独立的 crash 命令（支持在同一次 `run_script` 中批量传入多行以减少交互步数）。
 - **执行 crash 脚本提示 `gdb request failed` 或结构体无法识别**：若引用的结构体属于第三方或内核模块私有类型，由于每次 `run_script` 都是独立的 crash 进程会话，脚本中需在读取该类型前显式执行 `mod -s <module>` 加载模块符号。
-- **Windows / 非 POSIX 环境使用 `pool` 或 `unix://` 报错**：常驻 PTY 会话依赖 POSIX `pty`/`termios`，`unix://` 依赖 `AF_UNIX`。Windows 开发/CI 请设置 `CRASH_EXECUTION_MODE=oneshot`（或用 `http://` 测试 TCP 守护模式）。
+- **Windows / 非 POSIX 环境使用 `daemon`（`unix://`）报错**：常驻 PTY 会话依赖 POSIX `pty`/`termios`，`unix://` 依赖 `AF_UNIX`。Windows 开发/CI 请设置 `CRASH_EXECUTION_MODE=oneshot`（或用 `http://` 测试 TCP 守护模式）。
 - **`daemon` 模式下高并发触发获取槽位超时**：所有 MCP 进程共享守护进程侧的 `CRASH_POOL_MAX_SESSIONS`；请配合池容量调小 `CRASH_MCP_MAX_CONCURRENCY`，或按宿主机可用内存适当调大 `CRASH_POOL_MAX_SESSIONS`。
 - **文件不存在**：传给 API 的路径在服务端解析，不是运行 CLI 的客户端本地路径。
 - **crash 命令或扩展不可用**：确认服务主机已安装 `crash`，符号文件与 vmcore 对应；仓库脚本只适用于 x86_64 的 crash 8.0/9.0。

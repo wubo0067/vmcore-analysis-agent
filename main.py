@@ -443,6 +443,8 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
             #   executor 的 COMMAND_TIMEOUT=120s 会终止进程，但在此期间
             #   SSE 连接需保持活跃。）
             event_queue: asyncio.Queue = asyncio.Queue()
+            graph_task = None
+            last_node = "<not started>"
 
             async def _run_graph():
                 try:
@@ -452,7 +454,11 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
                         stream_mode="updates",
                     ):
                         await event_queue.put(("event", ev))
+                except asyncio.CancelledError:
+                    logger.info("[analysis] graph task cancelled: task_id=%s", task_id)
+                    raise
                 except Exception as exc:
+                    logger.exception("[analysis] graph task failed: task_id=%s", task_id)
                     await event_queue.put(("error", exc))
                 finally:
                     await event_queue.put(("done", None))
@@ -478,6 +484,7 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
                     # kind == "event"
                     for node_name, node_output in payload.items():
                         if node_name != "__end__":
+                            last_node = node_name
                             snapshot = app_state["agent_graph"].get_state(
                                 cast(RunnableConfig, thread)
                             )
@@ -498,7 +505,21 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
             yield f"data: {json.dumps({'event': 'complete', 'agent_answer': markdown_report, 'audit_report': audit_report, 'token_usage': final_values.get('token_usage', 0), 'error': final_values.get('error')})}\n\n"
 
         except asyncio.CancelledError:
-            logger.warning(f"Stream task {task_id} was cancelled.")
+            logger.warning(
+                "[analysis] SSE stream cancelled: task_id=%s last_node=%s "
+                "graph_task_done=%s",
+                task_id,
+                last_node,
+                graph_task.done() if graph_task is not None else None,
+            )
+            if graph_task is not None and not graph_task.done():
+                graph_task.cancel()
+                await asyncio.gather(graph_task, return_exceptions=True)
+                logger.info(
+                    "[analysis] graph task cleanup complete: task_id=%s cancelled=%s",
+                    task_id,
+                    graph_task.cancelled(),
+                )
             yield f"data: {json.dumps({'event': 'error', 'error': 'Task cancelled'})}\n\n"
             raise
 

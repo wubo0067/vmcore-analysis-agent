@@ -268,13 +268,15 @@ layer0 2.4a 则给出各里程碑必须达成的目标：
 
 ### `crash/` —— 常驻 PTY 会话池与跨进程共享守护服务
 
-`crash/` 既对外暴露 51 个注册子命令 + `run_script` / `inspect_slab_object` / `compare_memory_blocks`，也是 `stack_canary/`、`lock_hang/`、`scsishow.py` 共享的底层执行入口。为了消除大型 `vmcore` 每步冷启动与多 MCP 进程重复加载的内存开销，执行层采用**透明三模式路由**，保持 `run_crash_command` / `run_crash_script` 签名 100% 不变：
+`crash/` 既对外暴露 51 个注册子命令 + `run_script` / `inspect_slab_object` / `compare_memory_blocks`，也是 `stack_canary/`、`lock_hang/`、`scsishow.py` 共享的底层执行入口。为了消除大型 `vmcore` 每步冷启动与多 MCP 进程重复加载的内存开销，执行层采用**透明双模式路由**（`daemon` / `oneshot`），保持 `run_crash_command` / `run_crash_script` 签名 100% 不变：
 
 ```
-executor.py      统一入口；按 CRASH_EXECUTION_MODE 延迟路由至 daemon / pool / oneshot
-session_pool.py  PersistentCrashSession（PTY + 哨兵帧 + mod -s 缓存 + 3s SIGINT 自愈）
+executor.py      统一入口；按 CRASH_EXECUTION_MODE 延迟路由至 daemon（默认）或 oneshot
+                 （不再暴露进程内 pool 模式；旧配置 pool 回退 daemon 并告警，daemon 不可达快速失败）
+session_pool.py  daemon 内部引擎：PersistentCrashSession（PTY + 哨兵帧 + mod -s 缓存 + 3s SIGINT 自愈
+                 + 常驻 _CrashProcessSpawner 线程规避 PR_SET_PDEATHSIG）
                  + CrashSessionPool（Condition 细粒度锁 + 严格全局 LRU + ReaperThread）
-daemon.py        零外部依赖多线程守护服务（unix:// 0600 或 http://）+ CrashDaemonClient
+daemon.py        零外部依赖有界线程池守护服务（_ThreadPoolMixIn，unix:// 0600 或 http://）+ CrashDaemonClient
 server.py        FastMCP 外壳；asyncio.to_thread + WeakKeyDictionary 按 loop 隔离 Semaphore；
                  CRASH_MCP_TRANSPORT 透传给 fastmcp.run()，前者为 stdio 时走 stdio 分支，
                  其余值（streamable-http / http / sse）走 HTTP 分支并读取 CRASH_MCP_HOST/PORT
@@ -292,10 +294,11 @@ client.py        未配置 CRASH_MCP_URL 保持 stdio；配置后切换 streamab
 | **3s 统一恢复预算与诊断** | `_try_interrupt_recover(budget_sec=3.0)` 向进程组发 `SIGINT`、读回 `crash> ` 并短暂排空残余；全模块零 `assert`；超时/启动失败异常均携带 `exit_code` | 超时不断链保留已加载符号；120s 启动超时可区分“仍在加载大符号”与“crash 已崩溃退出” |
 | **并发、严格 LRU 与无锁快照** | 池锁仅保护槽位表（不锁命令执行），不同 `vmcore` 真并行；`_evict_lru_idle_locked` 在全部空闲槽中取 `min(last_used_at)`；`loaded_modules_snapshot()` 读取原子替换的 `tuple` 快照 | 支持多槽位严格 LRU，消除 `stats()` 与 `_io_lock` 的跨锁读撕裂 |
 | **Loop 隔离信号量与 UDS 加固** | `server.py` 用 `WeakKeyDictionary[AbstractEventLoop, asyncio.Semaphore]`；`daemon.py` 绑定 `unix://` 时 `umask(0o077)` + `chmod 0o600`；`request_stop()` / `shutdown()` 幂等退出 | 彻底消除跨 event loop 信号量死锁与同机其他用户借 `!` 逃逸命令越权执行的风险 |
+| **常驻孵化线程防 `PR_SET_PDEATHSIG`** | `session_pool.py` 由进程级常驻 `_CrashProcessSpawner` 守护线程统一 `Popen` 孵化 `crash`；`daemon.py` 使用有界 `_ThreadPoolMixIn` 替代短命 `ThreadingMixIn` | 避免 Linux 内核在短命 HTTP 请求线程退出时向 `crash` 发送 `PDEATHSIG` 导致会话意外 `exit_code=1` |
 
 #### 跨进程测试
 
-`tests/test_crash_session_pool.py` 分为两组：`CrashSessionCrossPlatformUnitTests`（Windows 与 Linux CI 必跑，覆盖 `_clean_output`、`_mod_load_failed`、`_prepare_lines`、多槽位严格 LRU、TCP Daemon 及跨 loop 信号量）和 `CrashPersistentPtyIntegrationTests`（仅 POSIX 运行，使用真实 `pty.openpty()` 驱动 mock `crash` REPL，覆盖常驻复用、伪提示符、`SIGINT` 3s 恢复、`SIGKILL` 重建、多 `vmcore` 真并行与 UDS `0600` 权限校验）。
+`tests/test_crash_session_pool.py` 分为三组：`CrashSessionCrossPlatformUnitTests`（Windows 与 Linux CI 必跑，覆盖 `_clean_output`、`_mod_load_failed`、`_prepare_lines`、多槽位严格 LRU、TCP Daemon 及跨 loop 信号量）、`TestExecutionModeConfig`（验证默认 `daemon`、旧 `pool` 值告警回退、不可达快速失败及环境变量白名单清理）和 `CrashPersistentPtyIntegrationTests`（仅 POSIX 运行，使用真实 `pty.openpty()` 驱动 mock `crash` REPL，覆盖常驻复用、伪提示符、`SIGINT` 3s 恢复、`SIGKILL` 重建、多 `vmcore` 真并行与 UDS `0600` 权限校验）。
 
 ### `lock_hang/` —— 锁 / 挂死确定性分析
 
@@ -397,7 +400,7 @@ is_idle = (
 | 改锁 owner 位掩码/reader-owned 语义 | `lock_hang/analyzer.py` 的 `LOCK_OWNER_FLAG_MASK` + `decode_lock_owner_word` |
 | 改常驻 `crash` PTY 通信、哨兵帧、`mod -s` 缓存或 LRU/TTL | `crash/session_pool.py`（`PersistentCrashSession` / `CrashSessionPool`） |
 | 改跨进程 Crash Daemon 端点或 UDS 权限 | `crash/daemon.py`（`CrashDaemonServer` / `CrashDaemonClient`） |
-| 改 `crash` 执行模式路由（`pool`/`daemon`/`oneshot`） | `crash/executor.py`（`get_crash_execution_mode` / `_execute_via_pool_or_daemon`） |
+| 改 `crash` 执行模式路由（`daemon`/`oneshot`） | `crash/executor.py`（`get_crash_execution_mode` / `_execute_via_daemon`） |
 | 改 `crash` MCP 并发上限或 HTTP 传输模式 | `crash/server.py`（`_get_concurrency_semaphore`）与 `crash/client.py`（`_build_mcp_server_config`） |
 | 改 `lock_hang` 工具参数或描述 | `lock_hang/server.py` 的 `@tool` 签名与 `Annotated[..., Field(description=...)]` |
 | 让模型优先调用锁/挂死分析器 | `react/sop_fragments.py` 加 `lock_hang_fast_path` + `prompt_builder._select_sop_fragments` 触发条件（见 `INTEGRATION.md`） |

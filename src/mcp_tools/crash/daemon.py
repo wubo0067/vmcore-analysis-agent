@@ -21,8 +21,9 @@ import signal
 import socket
 import socketserver
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from urllib.parse import urlparse
 
 from .session_pool import CrashSessionConfig, CrashSessionPool, _get_logger
@@ -42,7 +43,7 @@ class _UnixHTTPConnection(http.client.HTTPConnection):
     def connect(self) -> None:
         if not _UNIX_SOCKET_AVAILABLE:
             raise RuntimeError("Unix domain sockets are not supported on this platform")
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock = socket.socket(getattr(socket, "AF_UNIX"), socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
         sock.connect(self._socket_path)
         self.sock = sock
@@ -140,8 +141,8 @@ def _make_handler(pool: CrashSessionPool) -> type[BaseHTTPRequestHandler]:
                 return str(self.client_address[0])
             return "unix-client"
 
-        def log_message(self, fmt: str, *args: Any) -> None:
-            _get_logger().debug("CrashDaemon: " + fmt, *args)
+        def log_message(self, format: str, *args: Any) -> None:
+            _get_logger().debug("CrashDaemon: " + format, *args)
 
         def _send_json(self, status: int, payload: dict[str, Any]) -> None:
             encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -223,10 +224,23 @@ def _make_handler(pool: CrashSessionPool) -> type[BaseHTTPRequestHandler]:
                 return
 
             if self.path == "/execute":
+                command = "<unavailable>"
+                vmcore_path = "<unavailable>"
                 try:
                     body = self._read_json()
+                    command = str(body.get("command", ""))
+                    vmcore_path = str(body.get("vmcore_path", ""))
+                    _get_logger().info(
+                        "[daemon execute] request from %s: vmcore=%s command=%r "
+                        "(is_script=%s timeout=%s)",
+                        self.address_string(),
+                        vmcore_path,
+                        command[:120],
+                        bool(body.get("is_script", False)),
+                        body.get("timeout"),
+                    )
                     output = pool.execute(
-                        command_or_script=str(body.get("command", "")),
+                        command_or_script=command,
                         vmcore_path=str(body["vmcore_path"]),
                         vmlinux_path=str(body["vmlinux_path"]),
                         is_script=bool(body.get("is_script", False)),
@@ -235,6 +249,14 @@ def _make_handler(pool: CrashSessionPool) -> type[BaseHTTPRequestHandler]:
                     )
                     self._send_json(200, {"ok": True, "output": output})
                 except Exception as exc:
+                    _get_logger().exception(
+                        "[daemon execute] failed for client=%s vmcore=%s "
+                        "command=%r: %s",
+                        self.address_string(),
+                        vmcore_path,
+                        command[:120],
+                        exc,
+                    )
                     self._send_json(500, {"ok": False, "error": str(exc)})
                 return
 
@@ -243,18 +265,72 @@ def _make_handler(pool: CrashSessionPool) -> type[BaseHTTPRequestHandler]:
     return CrashDaemonRequestHandler
 
 
+class _ThreadPoolMixIn:
+    """固定大小常驻线程池处理 HTTP 请求，避免每请求创建/销毁 OS 线程。
+
+    短命的每请求线程（ThreadingMixIn 默认语义）会成为 crash 子进程的内核
+    real_parent，其退出会触发 PR_SET_PDEATHSIG 陷阱；池内工作线程常驻不退出，
+    从结构上规避该问题（crash 的 Popen 已另由 _CrashProcessSpawner 常驻线程
+    统一孵化，此为第二道防线）。
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=_daemon_worker_count(),
+            thread_name_prefix="crash-daemon-worker",
+        )
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        try:
+            self._executor.submit(self.process_request_thread, request, client_address)
+        except RuntimeError:
+            # executor 已关闭（进程退出路径）：回退到 ThreadingMixIn 语义，
+            # 在独立线程中同步处理，避免阻塞 accept 循环
+            thread = threading.Thread(
+                target=self.process_request_thread,
+                args=(request, client_address),
+                daemon=True,
+            )
+            thread.start()
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            self.finish_request(request, client_address)  # type: ignore[attr-defined]
+        except Exception:
+            self.handle_error(request, client_address)  # type: ignore[attr-defined]
+        finally:
+            self.shutdown_request(request)  # type: ignore[attr-defined]
+
+    def server_close(self) -> None:
+        super().server_close()  # type: ignore[misc]
+        self._executor.shutdown(wait=True)
+
+
+def _daemon_worker_count() -> int:
+    """HTTP 处理线程池大小：至少 8，覆盖并发 worker 的 4 路初始化并发。"""
+    try:
+        raw = os.environ.get("CRASH_DAEMON_HTTP_WORKERS", "")
+        if raw.strip():
+            return max(4, int(raw))
+    except ValueError:
+        pass
+    return max(8, (os.cpu_count() or 4))
+
+
 if _UNIX_SOCKET_AVAILABLE:
 
     class _ThreadingUnixHTTPServer(
-        socketserver.ThreadingMixIn, socketserver.UnixStreamServer  # type: ignore[misc]
+        _ThreadPoolMixIn, socketserver.UnixStreamServer  # type: ignore[misc]
     ):
-        daemon_threads = True
-        allow_reuse_address = True
+        pass
 
 
-class _ThreadingTCPHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+class _ThreadingTCPHTTPServer(_ThreadPoolMixIn, socketserver.TCPServer):
+    pass
 
 
 class CrashDaemonServer:
@@ -279,7 +355,8 @@ class CrashDaemonServer:
         """返回实际绑定的 endpoint（TCP 传 port=0 时返回真实分配端口）。"""
         if self._unix_socket_path:
             return f"unix://{self._unix_socket_path}"
-        host, port = self._server.server_address[:2]
+        address = self._server.server_address
+        host, port = address[-2]  # type: ignore[index]
         return f"http://{host}:{port}"
 
     def _create_server(self) -> socketserver.BaseServer:
