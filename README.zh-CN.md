@@ -159,10 +159,21 @@ CRASH_MCP_MAX_CONCURRENCY=8
 
 ### 3. 启动服务
 
-在 `vmcore-analysis-agent` 目录执行：
+在 `vmcore-analysis-agent` 目录使用 `vmcore_agent.bash` 统一启停和控制服务（在默认 `CRASH_EXECUTION_MODE=daemon` 下会自动先拉起并健康检查 `crash-daemon`，再启动监听 `0.0.0.0:8000` 的 agent）：
 
 ```bash
-uv run uvicorn main:app --host 0.0.0.0 --port 8000
+# 后台启动（推荐）：按模式联动启动 crash-daemon 与 agent
+bash vmcore_agent.bash start
+
+# 或前台运行：自动拉起/复用 crash-daemon 并前台运行 agent
+bash vmcore_agent.bash run
+
+# 常用运维控制命令
+bash vmcore_agent.bash status   # 查看 agent 与 crash-daemon 状态和日志路径
+bash vmcore_agent.bash health   # 查看 crash-daemon 会话池健康状态
+bash vmcore_agent.bash logs     # 持续跟踪 agent 与 daemon 日志（Ctrl-C 仅退出查看）
+bash vmcore_agent.bash restart  # 重启服务（修改 .env 或更新代码后使用）
+bash vmcore_agent.bash stop     # 先停 agent 再停 crash-daemon
 ```
 
 - 健康检查：<http://localhost:8000/health>
@@ -371,30 +382,30 @@ Gate 是分析状态机中的验证检查点。Gate 是否关闭由执行器根�
 `daemon` 是默认执行模式，**必须先完成本节步骤，再启动主服务**（`.env` 中保持 `CRASH_EXECUTION_MODE=daemon`，客户端 `CRASH_MCP_URL` 留空走 stdio）。守护进程未启动时工具调用会直接报错并提示启动命令（快速失败，不再静默回退进程内池，避免会话池分裂导致内存翻倍）。
 
 ```bash
-# 1) 后台启动跨进程共享守护服务（Unix Socket 自动收紧为 0600 权限；
+# 1) 后台启动跨进程共享守护服务（或一键启动 daemon + agent；Unix Socket 自动收紧为 0600 权限；
 #    重复执行不会重复启动；需要 TCP 时先 export CRASH_DAEMON_ENDPOINT=http://127.0.0.1:8765）
-bash tools/crash-daemon.sh start
+bash vmcore_agent.bash start daemon   # 或直接: bash vmcore_agent.bash start
 
 # 查看运行状态、会话池健康信息和日志
-bash tools/crash-daemon.sh status    # PID / endpoint / 运行状态
-bash tools/crash-daemon.sh health    # /health：活跃会话、VmRSS、命中/淘汰统计
-bash tools/crash-daemon.sh logs      # 持续跟踪日志（Ctrl-C 只退出查看，不停服务）
+bash vmcore_agent.bash status        # PID / endpoint / 运行状态
+bash vmcore_agent.bash health        # /health：活跃会话、VmRSS、命中/淘汰统计
+bash vmcore_agent.bash logs daemon   # 持续跟踪日志（Ctrl-C 只退出查看，不停服务）
 
 # 验证修复生效：启动日志中应出现
 #   [crash spawner] resident spawner thread started (tid=...)
 # 运行分析后 health 中 restart_count 应保持 0（crash 不再退出）
-bash tools/crash-daemon.sh logs | grep "crash spawner"
+bash vmcore_agent.bash logs daemon | grep "crash spawner"
 ```
 
 | 脚本子命令 | 说明 |
 |---|---|
-| `start` | 后台启动（`nohup` + PID 文件防重复启动；启动失败自动打印最近 50 行日志） |
-| `stop` | 向守护进程发 `SIGTERM` 优雅停止（默认等 30s，超时才 `SIGKILL`），同时关闭其持有的 crash 会话 |
-| `restart` | `stop` + `start`，会关闭并重新创建所有 crash 会话（升级代码后用这个） |
-| `run` | 前台运行，适合 systemd 托管或直接调试 |
-| `status` / `health` / `logs` | 进程状态 / 会话池健康 / 日志跟踪 |
+| `start [all\|daemon\|agent]` | 后台启动（`setsid` + PID 文件防重复启动；启动失败自动打印最近 50 行日志） |
+| `stop [all\|daemon\|agent]` | 向进程组发 `SIGTERM` 优雅停止（默认等 30s，超时才 `SIGKILL`），先停 agent 再停 daemon |
+| `restart [all\|daemon\|agent]` | `stop` + `start`，会关闭并重新创建 crash 会话（升级代码后用这个） |
+| `run [agent\|daemon]` | 前台运行（默认 `agent` 自动拉起/复用 daemon；`daemon` 适合 systemd 托管或直接调试） |
+| `status` / `health` / `logs [agent\|daemon\|all]` | 进程状态 / 会话池健康 / 日志跟踪 |
 
-脚本环境变量（均可选）：`CRASH_DAEMON_ENDPOINT`（默认 `unix:///tmp/vmcore_crashd.sock`，支持 `http://127.0.0.1:8765`）、`CRASH_DAEMON_RUN_DIR`（PID 目录，默认 `logs/`）、`CRASH_DAEMON_LOG_FILE`（默认 `logs/crash-daemon.log`）、`CRASH_DAEMON_STOP_TIMEOUT`（默认 30s）。
+脚本环境变量（均可选）：`CRASH_DAEMON_ENDPOINT`（默认 `unix:///tmp/vmcore_crashd.sock`，支持 `http://127.0.0.1:8765`）、`VMCORE_RUN_DIR`（PID 目录，默认 `logs/`）、`CRASH_DAEMON_LOG_FILE`（默认 `logs/crash-daemon.log`）、`VMCORE_STOP_TIMEOUT`（默认 30s）。
 
 ```bash
 # 不使用脚本时的前台启动方式
@@ -403,8 +414,8 @@ uv run python -m src.mcp_tools.crash.daemon --endpoint unix:///tmp/vmcore_crashd
 
 ```bash
 # 代码更新后的标准流程（重启 daemon 使新代码生效）
-bash tools/crash-daemon.sh restart
-bash tools/crash-daemon.sh health   # 确认会话池正常
+bash vmcore_agent.bash restart daemon
+bash vmcore_agent.bash health   # 确认会话池正常
 
 # 3) 可选：将 crash MCP Server 独立为常驻 streamable-http 服务
 CRASH_MCP_TRANSPORT=streamable-http CRASH_MCP_HOST=127.0.0.1 CRASH_MCP_PORT=8766 \
@@ -428,6 +439,7 @@ ai-app-hub/                       # 仓库根目录（包含多个项目）
 ├── README.zh-CN.md
 └── vmcore-analysis-agent/         # 本文档介绍的组件
     ├── main.py                   # FastAPI 入口
+    ├── vmcore_agent.bash         # 统一启停与运维控制脚本（联动 agent 与 crash-daemon）
     ├── client/                   # CLI 与 HTTP/SSE 客户端
     ├── src/
     │   ├── llm/                  # 模型初始化

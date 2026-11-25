@@ -279,8 +279,8 @@ def _execute_via_daemon(
     except OSError as exc:
         raise RuntimeError(
             f"CrashDaemon ({endpoint}) is unreachable: {exc}. "
-            "Start it via 'tools/crash-daemon.sh start' or set "
-            "CRASH_EXECUTION_MODE=oneshot."
+            "Start it via 'bash vmcore_agent.bash start daemon' (or 'bash vmcore_agent.bash start') "
+            "or set CRASH_EXECUTION_MODE=oneshot."
         ) from exc
 
 

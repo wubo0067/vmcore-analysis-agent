@@ -159,10 +159,21 @@ Process environment variables take precedence over `.env`. The service fails dur
 
 ### 3. Start the service
 
-From the `vmcore-analysis-agent` directory:
+From the `vmcore-analysis-agent` directory, use `vmcore_agent.bash` to start and manage the service (under the default `CRASH_EXECUTION_MODE=daemon`, it automatically starts and health-checks `crash-daemon` before launching the agent on `0.0.0.0:8000`):
 
 ```bash
-uv run uvicorn main:app --host 0.0.0.0 --port 8000
+# Background mode (recommended): starts crash-daemon (if daemon mode) + agent
+bash vmcore_agent.bash start
+
+# Or foreground mode: auto-starts/reuses crash-daemon and runs agent in the foreground
+bash vmcore_agent.bash run
+
+# Common lifecycle operations
+bash vmcore_agent.bash status   # check PIDs and log paths
+bash vmcore_agent.bash health   # check crash-daemon session pool health
+bash vmcore_agent.bash logs     # tail agent + daemon logs (Ctrl-C only exits log view)
+bash vmcore_agent.bash restart  # stop and restart (use after editing .env or updating code)
+bash vmcore_agent.bash stop     # gracefully stop agent and crash-daemon
 ```
 
 - Health check: <http://localhost:8000/health>
@@ -371,31 +382,31 @@ This repository does **not** currently enable a lock/hang fast path in `src/reac
 `daemon` is the default execution mode — **complete this section before starting the agent service** (keep `CRASH_EXECUTION_MODE=daemon` in `.env` and leave `CRASH_MCP_URL` empty for stdio). If the daemon is not running, crash tool calls fail fast with a startup hint (no silent fallback to an in-process pool, preventing split pools and doubled memory).
 
 ```bash
-# 1) Start the shared crash session daemon in the background
+# 1) Start the shared crash session daemon (or start both daemon and agent together)
 #    (Unix socket permissions locked to 0600; safe to re-run; for TCP, first
 #     export CRASH_DAEMON_ENDPOINT=http://127.0.0.1:8765)
-bash tools/crash-daemon.sh start
+bash vmcore_agent.bash start daemon   # or: bash vmcore_agent.bash start
 
 # Inspect the process, pool health, and daemon logs
-bash tools/crash-daemon.sh status   # PID / endpoint / running state
-bash tools/crash-daemon.sh health   # /health: sessions, VmRSS, hits/evictions
-bash tools/crash-daemon.sh logs     # tail -f the log (Ctrl-C leaves the daemon running)
+bash vmcore_agent.bash status        # PID / endpoint / running state
+bash vmcore_agent.bash health        # /health: sessions, VmRSS, hits/evictions
+bash vmcore_agent.bash logs daemon   # tail -f the log (Ctrl-C leaves the daemon running)
 
 # Verify the fix is active — startup log should show:
 #   [crash spawner] resident spawner thread started (tid=...)
 # After an analysis run, health should show restart_count == 0 (crash no longer exits)
-bash tools/crash-daemon.sh logs | grep "crash spawner"
+bash vmcore_agent.bash logs daemon | grep "crash spawner"
 ```
 
 | Script subcommand | Description |
 |---|---|
-| `start` | Background start (`nohup` + PID-file duplicate guard; prints the last 50 log lines on failure) |
-| `stop` | Graceful `SIGTERM` shutdown (waits up to 30s before `SIGKILL`); also closes crash sessions it owns |
-| `restart` | `stop` + `start`; closes and recreates all crash sessions (use after code updates) |
-| `run` | Foreground mode for systemd or direct debugging |
-| `status` / `health` / `logs` | Process state / pool health / log tailing |
+| `start [all\|daemon\|agent]` | Background start (`setsid` + PID-file duplicate guard; prints the last 50 log lines on failure) |
+| `stop [all\|daemon\|agent]` | Graceful `SIGTERM` shutdown (waits up to 30s before `SIGKILL`); stops agent then crash-daemon |
+| `restart [all\|daemon\|agent]` | `stop` + `start`; closes and recreates crash sessions (use after code updates) |
+| `run [agent\|daemon]` | Foreground mode (default `agent` auto-starts/reuses daemon; `daemon` for systemd or debugging) |
+| `status` / `health` / `logs [agent\|daemon\|all]` | Process state / pool health / log tailing |
 
-Optional script environment variables: `CRASH_DAEMON_ENDPOINT` (default `unix:///tmp/vmcore_crashd.sock`, also `http://127.0.0.1:8765`), `CRASH_DAEMON_RUN_DIR` (PID dir, default `logs/`), `CRASH_DAEMON_LOG_FILE` (default `logs/crash-daemon.log`), `CRASH_DAEMON_STOP_TIMEOUT` (default 30s).
+Optional script environment variables: `CRASH_DAEMON_ENDPOINT` (default `unix:///tmp/vmcore_crashd.sock`, also `http://127.0.0.1:8765`), `VMCORE_RUN_DIR` (PID dir, default `logs/`), `CRASH_DAEMON_LOG_FILE` (default `logs/crash-daemon.log`), `VMCORE_STOP_TIMEOUT` (default 30s).
 
 ```bash
 # Foreground startup without the helper script
@@ -404,8 +415,8 @@ uv run python -m src.mcp_tools.crash.daemon --endpoint unix:///tmp/vmcore_crashd
 
 ```bash
 # Standard flow after a code update (restart the daemon to pick up new code)
-bash tools/crash-daemon.sh restart
-bash tools/crash-daemon.sh health   # confirm the pool is healthy
+bash vmcore_agent.bash restart daemon
+bash vmcore_agent.bash health   # confirm the pool is healthy
 
 # 3) Optional: run the crash MCP server as a persistent streamable-http service
 CRASH_MCP_TRANSPORT=streamable-http CRASH_MCP_HOST=127.0.0.1 CRASH_MCP_PORT=8766 \
@@ -429,6 +440,7 @@ ai-app-hub/                       # Repository root (contains multiple projects)
 ├── README.zh-CN.md
 └── vmcore-analysis-agent/         # Component described here
     ├── main.py                   # FastAPI entry point
+    ├── vmcore_agent.bash         # Unified start/stop/status/health/logs script (agent + crash-daemon)
     ├── client/                   # CLI and HTTP/SSE client
     ├── src/
     │   ├── llm/                  # Model initialization

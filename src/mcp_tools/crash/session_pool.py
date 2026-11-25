@@ -263,6 +263,33 @@ class _CrashProcessSpawner:
 _process_spawner = _CrashProcessSpawner()
 
 
+_CRASH_CHILD_ENV_KEYS = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "TERM",
+        "TZ",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LD_LIBRARY_PATH",
+        "TERMINFO",
+        "USER",
+        "LOGNAME",
+    }
+)
+_CRASH_CHILD_ENV_PREFIXES = ("LC_", "LANG", "CRASH_")
+
+
+def _crash_child_env() -> dict[str, str]:
+    """仅向 crash 子进程透传运行时白名单环境变量，隔离 API Key 等敏感配置。"""
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k in _CRASH_CHILD_ENV_KEYS or k.startswith(_CRASH_CHILD_ENV_PREFIXES)
+    }
+
+
 def _default_command_builder(
     crash_binary: str, vmlinux_path: str, vmcore_path: str
 ) -> list[str]:
@@ -394,6 +421,7 @@ class PersistentCrashSession:
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
+                env=_crash_child_env(),
                 close_fds=True,
                 start_new_session=True,
             )
@@ -1683,6 +1711,11 @@ class CrashSessionPool:
                 "max_total_sessions": self.config.max_total_sessions,
                 "slots_per_vmcore": self.config.slots_per_vmcore,
                 "idle_ttl_sec": self.config.idle_ttl_sec,
+                "command_timeout_sec": self.config.command_timeout_sec,
+                "startup_timeout_sec": self.config.startup_timeout_sec,
+                "acquire_timeout_sec": self.config.acquire_timeout_sec,
+                "max_output_chars": self.config.max_output_chars,
+                "crash_binary": self.config.crash_binary,
                 "hits": self._hits,
                 "misses": self._misses,
                 "evictions": self._evictions,

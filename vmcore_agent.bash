@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# vmcore-agent.sh - 统一启停控制脚本（根据 CRASH_EXECUTION_MODE 自动联动 crash-daemon 与 agent）
-# 放置路径建议：tools/vmcore-agent.sh（需 chmod +x tools/vmcore-agent.sh）
+# vmcore_agent.bash - 统一启停控制脚本（根据 CRASH_EXECUTION_MODE 自动联动 crash-daemon 与 agent）
+# 放置于项目根目录（需 chmod +x vmcore_agent.bash）
 
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${VMCORE_ENV_FILE:-${PROJECT_ROOT}/.env}"
 
 # 安全读取 .env 中的单个键（仅在进程环境变量未显式设置时生效，与 src/utils/settings.py 优先级一致）
@@ -84,10 +84,11 @@ DAEMON_LOG_FILE="${CRASH_DAEMON_LOG_FILE:-${RUN_DIR}/crash-daemon.log}"
 
 STOP_TIMEOUT="${VMCORE_STOP_TIMEOUT:-${CRASH_DAEMON_STOP_TIMEOUT:-30}}"
 AGENT_START_WAIT_SEC="${VMCORE_AGENT_START_WAIT_SEC:-2}"
+DAEMON_START_WAIT_SEC="${CRASH_DAEMON_START_WAIT_SEC:-10}"
 
 usage() {
     cat <<EOF
-用法: $0 {start|stop|restart|status|health|logs [agent|daemon|all]|run}
+用法: $0 {start|stop|restart|status|health|logs|run} [目标]
 
 当前生效配置:
   CRASH_EXECUTION_MODE = ${EXECUTION_MODE}
@@ -95,25 +96,26 @@ usage() {
   RUN_DIR               = ${RUN_DIR}
 
 子命令:
-  start    按 CRASH_EXECUTION_MODE 一键后台启动服务：
-             - daemon  模式：先启动并等待 crash-daemon 就绪，再启动 agent (uv run main.py)
-             - oneshot 模式：仅启动 agent (uv run main.py)
-  stop     优雅停止 agent；若 crash-daemon 在运行也会一并优雅停止（先停 agent 后停 daemon）
-  restart  先 stop 再 start（修改 .env 切换模式后可直接 restart 生效）
-  status   查看 agent 与 crash-daemon 的 PID、运行状态与日志路径
-  health   查看 crash-daemon /health 会话池状态（oneshot 模式下仅显示 agent 状态）
-  logs     持续跟踪日志，可选参数: agent | daemon | all（默认 all）
-  run      前台运行 agent（daemon 模式下若守护进程未启动会自动拉起，退出时自动清理）
+  start [all|daemon|agent]    后台启动服务（默认 all）：
+                                - daemon 模式：先启动并等待 crash-daemon 就绪，再启动 agent (uv run main.py)
+                                - oneshot 模式：仅启动 agent（若显式指定 daemon 则提示跳过）
+  stop [all|daemon|agent]     优雅停止服务（默认 all，先停 agent 后停 daemon）
+  restart [all|daemon|agent]  先 stop 再 start（修改 .env 切换模式后可直接 restart 生效）
+  status                      查看 agent 与 crash-daemon 的 PID、运行状态与日志路径
+  health                      查看 crash-daemon /health 会话池状态（oneshot 模式下仅显示 agent 状态）
+  logs [agent|daemon|all]     持续跟踪日志（默认 all）
+  run [agent|daemon]          前台运行（默认 agent：daemon 模式下自动拉起/复用守护进程；daemon：仅前台运行守护进程）
 
 环境变量（进程环境变量优先于 .env）:
-  CRASH_EXECUTION_MODE       daemon（默认）或 oneshot
-  CRASH_DAEMON_ENDPOINT      默认 unix:///tmp/vmcore_crashd.sock
-  VMCORE_ENV_FILE            指定 .env 路径，默认 ${PROJECT_ROOT}/.env
-  VMCORE_RUN_DIR             PID 与日志目录，默认 ${PROJECT_ROOT}/logs
-  VMCORE_AGENT_LOG_FILE      agent 日志路径，默认 <run-dir>/vmcore-agent.log
-  CRASH_DAEMON_LOG_FILE      daemon 日志路径，默认 <run-dir>/crash-daemon.log
-  VMCORE_STOP_TIMEOUT        优雅停止等待秒数，默认 30
+  CRASH_EXECUTION_MODE        daemon（默认）或 oneshot
+  CRASH_DAEMON_ENDPOINT       默认 unix:///tmp/vmcore_crashd.sock
+  VMCORE_ENV_FILE             指定 .env 路径，默认 ${PROJECT_ROOT}/.env
+  VMCORE_RUN_DIR              PID 与日志目录，默认 ${PROJECT_ROOT}/logs
+  VMCORE_AGENT_LOG_FILE       agent 日志路径，默认 <run-dir>/vmcore-agent.log
+  CRASH_DAEMON_LOG_FILE       daemon 日志路径，默认 <run-dir>/crash-daemon.log
+  VMCORE_STOP_TIMEOUT         优雅停止等待秒数，默认 30
   VMCORE_AGENT_START_WAIT_SEC agent 启动存活复核秒数，默认 2
+  CRASH_DAEMON_START_WAIT_SEC daemon 健康检查等待秒数，默认 10
 EOF
 }
 
@@ -198,7 +200,7 @@ stop_process_by_pid_file() {
     echo "${name} 优雅停止超时（${STOP_TIMEOUT}s），强制终止 PID=${pid}" >&2
     signal_process_or_group KILL "${pid}"
     rm -f -- "${pid_file}"
-    return 1
+    return 0
 }
 
 daemon_health_check() {
@@ -243,7 +245,9 @@ start_daemon() {
     printf '%s\n' "${pid}" > "${DAEMON_PID_FILE}"
 
     local attempt
-    for attempt in {1..50}; do
+    local daemon_checks=$(( DAEMON_START_WAIT_SEC * 5 ))
+    (( daemon_checks < 1 )) && daemon_checks=1
+    for ((attempt = 0; attempt < daemon_checks; attempt++)); do
         if ! pid_is_running "${pid}"; then
             wait "${pid}" 2>/dev/null || true
             rm -f -- "${DAEMON_PID_FILE}"
@@ -259,7 +263,7 @@ start_daemon() {
         sleep 0.2
     done
 
-    echo "crash-daemon 进程已启动但健康检查超时: PID=${pid}, 请查看 ${DAEMON_LOG_FILE}" >&2
+    echo "crash-daemon 进程已启动但健康检查超时（${DAEMON_START_WAIT_SEC}s）: PID=${pid}, 请查看 ${DAEMON_LOG_FILE}" >&2
     return 1
 }
 
@@ -302,23 +306,61 @@ start_agent() {
 }
 
 cmd_start() {
-    echo "=== 启动服务 (CRASH_EXECUTION_MODE=${EXECUTION_MODE}) ==="
-    if [[ "${EXECUTION_MODE}" == "daemon" ]]; then
-        start_daemon
-    else
-        echo "当前为 oneshot 模式，跳过启动 crash-daemon"
-    fi
-    start_agent
+    local target="${1:-all}"
+    case "${target}" in
+        all)
+            echo "=== 启动服务 (CRASH_EXECUTION_MODE=${EXECUTION_MODE}) ==="
+            if [[ "${EXECUTION_MODE}" == "daemon" ]]; then
+                start_daemon
+            else
+                echo "当前为 oneshot 模式，跳过启动 crash-daemon"
+            fi
+            start_agent
+            ;;
+        daemon)
+            if [[ "${EXECUTION_MODE}" != "daemon" ]]; then
+                echo "当前为 ${EXECUTION_MODE} 模式，跳过启动 crash-daemon"
+                return 0
+            fi
+            start_daemon
+            ;;
+        agent)
+            start_agent
+            ;;
+        *)
+            echo "未知启动目标: ${target}（可选: all | daemon | agent）" >&2
+            exit 2
+            ;;
+    esac
 }
 
 cmd_stop() {
-    echo "=== 停止服务 (CRASH_EXECUTION_MODE=${EXECUTION_MODE}) ==="
+    local target="${1:-all}"
     local rc=0
-    # 反序优雅停止：先停 agent，再停 crash-daemon
-    stop_process_by_pid_file "vmcore-agent" "${AGENT_PID_FILE}" || rc=1
-    if [[ "${EXECUTION_MODE}" == "daemon" ]] || [[ -r "${DAEMON_PID_FILE}" ]]; then
-        stop_process_by_pid_file "crash-daemon" "${DAEMON_PID_FILE}" || rc=1
-    fi
+    case "${target}" in
+        all)
+            echo "=== 停止服务 (CRASH_EXECUTION_MODE=${EXECUTION_MODE}) ==="
+            # 反序优雅停止：先停 agent，再停 crash-daemon
+            stop_process_by_pid_file "vmcore-agent" "${AGENT_PID_FILE}" || rc=1
+            if [[ "${EXECUTION_MODE}" == "daemon" ]] || [[ -r "${DAEMON_PID_FILE}" ]]; then
+                stop_process_by_pid_file "crash-daemon" "${DAEMON_PID_FILE}" || rc=1
+            fi
+            ;;
+        daemon)
+            if [[ "${EXECUTION_MODE}" == "daemon" ]] || [[ -r "${DAEMON_PID_FILE}" ]]; then
+                stop_process_by_pid_file "crash-daemon" "${DAEMON_PID_FILE}" || rc=1
+            else
+                echo "crash-daemon 未运行"
+            fi
+            ;;
+        agent)
+            stop_process_by_pid_file "vmcore-agent" "${AGENT_PID_FILE}" || rc=1
+            ;;
+        *)
+            echo "未知停止目标: ${target}（可选: all | daemon | agent）" >&2
+            exit 2
+            ;;
+    esac
     return "${rc}"
 }
 
@@ -390,50 +432,68 @@ cmd_logs() {
 }
 
 cmd_run() {
-    echo "=== 前台运行 (CRASH_EXECUTION_MODE=${EXECUTION_MODE}) ==="
-    local started_daemon_here=0
-    if [[ "${EXECUTION_MODE}" == "daemon" ]]; then
-        if ! running_pid_from_file "${DAEMON_PID_FILE}" >/dev/null; then
-            start_daemon
-            started_daemon_here=1
-        else
-            echo "复用已运行的 crash-daemon (endpoint=${ENDPOINT})"
-        fi
-    fi
-
+    local target="${1:-agent}"
     cd "${PROJECT_ROOT}"
-    if (( started_daemon_here == 1 )); then
-        cleanup_on_exit() {
-            echo ""
-            echo "前台 agent 已退出，正在停止本次自动拉起的 crash-daemon..."
-            stop_process_by_pid_file "crash-daemon" "${DAEMON_PID_FILE}" || true
-        }
-        trap cleanup_on_exit EXIT INT TERM
+    case "${target}" in
+        daemon)
+            echo "=== 前台运行 crash-daemon (endpoint=${ENDPOINT}) ==="
+            if command -v uv >/dev/null 2>&1; then
+                exec uv run python -m src.mcp_tools.crash.daemon --endpoint "${ENDPOINT}"
+            else
+                exec python3 -m src.mcp_tools.crash.daemon --endpoint "${ENDPOINT}"
+            fi
+            ;;
+        agent)
+            echo "=== 前台运行 (CRASH_EXECUTION_MODE=${EXECUTION_MODE}) ==="
+            local started_daemon_here=0
+            if [[ "${EXECUTION_MODE}" == "daemon" ]]; then
+                if ! running_pid_from_file "${DAEMON_PID_FILE}" >/dev/null; then
+                    start_daemon
+                    started_daemon_here=1
+                else
+                    echo "复用已运行的 crash-daemon (endpoint=${ENDPOINT})"
+                fi
+            fi
 
-        if command -v uv >/dev/null 2>&1; then
-            uv run main.py
-        else
-            python3 main.py
-        fi
-    else
-        if command -v uv >/dev/null 2>&1; then
-            exec uv run main.py
-        else
-            exec python3 main.py
-        fi
-    fi
+            if (( started_daemon_here == 1 )); then
+                cleanup_on_exit() {
+                    trap - EXIT
+                    echo ""
+                    echo "前台 agent 已退出，正在停止本次自动拉起的 crash-daemon..."
+                    stop_process_by_pid_file "crash-daemon" "${DAEMON_PID_FILE}" || true
+                }
+                trap cleanup_on_exit EXIT
+
+                if command -v uv >/dev/null 2>&1; then
+                    uv run main.py
+                else
+                    python3 main.py
+                fi
+            else
+                if command -v uv >/dev/null 2>&1; then
+                    exec uv run main.py
+                else
+                    exec python3 main.py
+                fi
+            fi
+            ;;
+        *)
+            echo "未知前台运行目标: ${target}（可选: agent | daemon）" >&2
+            exit 2
+            ;;
+    esac
 }
 
 case "${1:-}" in
     start)
-        cmd_start
+        cmd_start "${2:-all}"
         ;;
     stop)
-        cmd_stop
+        cmd_stop "${2:-all}"
         ;;
     restart)
-        cmd_stop
-        cmd_start
+        cmd_stop "${2:-all}"
+        cmd_start "${2:-all}"
         ;;
     status)
         cmd_status
@@ -445,7 +505,7 @@ case "${1:-}" in
         cmd_logs "${2:-all}"
         ;;
     run)
-        cmd_run
+        cmd_run "${2:-agent}"
         ;;
     *)
         usage

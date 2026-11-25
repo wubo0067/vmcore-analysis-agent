@@ -23,10 +23,15 @@ import socketserver
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
+from pathlib import Path
 from typing import Any, Optional, cast
 from urllib.parse import urlparse
 
+from dotenv import load_dotenv
+
 from .session_pool import CrashSessionConfig, CrashSessionPool, _get_logger
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 _UNIX_SOCKET_AVAILABLE = hasattr(socket, "AF_UNIX") and hasattr(
     socketserver, "UnixStreamServer"
@@ -416,7 +421,15 @@ class CrashDaemonServer:
             self.pool.close_all()
 
 
+def _load_env() -> None:
+    """加载 .env 到进程环境（进程环境变量优先），支持 VMCORE_ENV_FILE 覆盖路径。"""
+    override_file = os.environ.get("VMCORE_ENV_FILE", "").strip()
+    env_path = Path(override_file) if override_file else (_PROJECT_ROOT / ".env")
+    load_dotenv(env_path, override=False)
+
+
 def main() -> None:
+    _load_env()
     parser = argparse.ArgumentParser(description="Shared Persistent Crash Session Pool Daemon")
     parser.add_argument(
         "--endpoint",
@@ -426,6 +439,21 @@ def main() -> None:
     args = parser.parse_args()
 
     server = CrashDaemonServer(endpoint=args.endpoint)
+    cfg = server.pool.config
+    _get_logger().info(
+        "[daemon config] endpoint=%s max_sessions=%d slots_per_vmcore=%d "
+        "idle_ttl=%.1fs command_timeout=%.1fs startup_timeout=%.1fs "
+        "acquire_timeout=%.1fs max_output_chars=%d crash_binary=%s",
+        server.bound_endpoint,
+        cfg.max_total_sessions,
+        cfg.slots_per_vmcore,
+        cfg.idle_ttl_sec,
+        cfg.command_timeout_sec,
+        cfg.startup_timeout_sec,
+        cfg.acquire_timeout_sec,
+        cfg.max_output_chars,
+        cfg.crash_binary,
+    )
 
     def _handle_signal(_signum: int, _frame: Any) -> None:
         server.request_stop()

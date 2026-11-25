@@ -150,7 +150,7 @@ class CrashSessionCrossPlatformUnitTests(unittest.TestCase):
 
             with self.assertRaises(RuntimeError) as ctx:
                 executor.run_crash_command("sys", "/tmp/a.vmcore", "/tmp/vmlinux")
-            self.assertIn("tools/crash-daemon.sh start", str(ctx.exception))
+            self.assertIn("bash vmcore_agent.bash start daemon", str(ctx.exception))
         finally:
             os.environ.clear()
             os.environ.update(old_env)
@@ -580,6 +580,87 @@ class CrashSessionCrossPlatformUnitTests(unittest.TestCase):
         t2.join(timeout=3.0)
         self.assertEqual(results.get("r1"), "loop1_ok")
         self.assertEqual(results.get("r2"), "loop2_ok")
+
+    def test_daemon_load_env_respects_vmcore_env_file_and_process_precedence(self) -> None:
+        from src.mcp_tools.crash import daemon as daemon_mod
+
+        with tempfile.TemporaryDirectory(prefix="daemon_env_test_") as tmpdir:
+            env_file = os.path.join(tmpdir, "custom.env")
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write(
+                    "CRASH_POOL_MAX_SESSIONS=9\n"
+                    "CRASH_COMMAND_TIMEOUT_SEC=240\n"
+                    "CRASH_DAEMON_ENDPOINT=http://127.0.0.1:9999\n"
+                )
+
+            old_env = os.environ.copy()
+            try:
+                for key in (
+                    "CRASH_POOL_MAX_SESSIONS",
+                    "CRASH_COMMAND_TIMEOUT_SEC",
+                    "CRASH_DAEMON_ENDPOINT",
+                ):
+                    os.environ.pop(key, None)
+                os.environ["VMCORE_ENV_FILE"] = env_file
+                # 进程已显式设置的值不得被 .env 覆盖（override=False）
+                os.environ["CRASH_POOL_MAX_SESSIONS"] = "12"
+
+                daemon_mod._load_env()
+
+                self.assertEqual(os.environ.get("CRASH_POOL_MAX_SESSIONS"), "12")
+                self.assertEqual(os.environ.get("CRASH_COMMAND_TIMEOUT_SEC"), "240")
+                self.assertEqual(
+                    os.environ.get("CRASH_DAEMON_ENDPOINT"), "http://127.0.0.1:9999"
+                )
+                cfg = CrashSessionConfig.from_env()
+                self.assertEqual(cfg.max_total_sessions, 12)
+                self.assertEqual(cfg.command_timeout_sec, 240.0)
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
+
+    def test_crash_child_env_filters_secrets_and_keeps_runtime(self) -> None:
+        from src.mcp_tools.crash.session_pool import _crash_child_env
+
+        old_env = os.environ.copy()
+        try:
+            os.environ["REASONING_API_KEY"] = "sk-secret-value"
+            os.environ["OPENAI_API_KEY"] = "sk-openai-secret"
+            os.environ["CRASH_BINARY"] = "/usr/bin/crash"
+            os.environ["TMPDIR"] = "/tmp"
+            os.environ["LANG"] = "C.UTF-8"
+
+            child_env = _crash_child_env()
+            self.assertNotIn("REASONING_API_KEY", child_env)
+            self.assertNotIn("OPENAI_API_KEY", child_env)
+            self.assertEqual(child_env.get("CRASH_BINARY"), "/usr/bin/crash")
+            self.assertEqual(child_env.get("TMPDIR"), "/tmp")
+            self.assertEqual(child_env.get("LANG"), "C.UTF-8")
+            self.assertIn("PATH", child_env)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_pool_stats_exposes_runtime_config_fields(self) -> None:
+        cfg = CrashSessionConfig(
+            max_total_sessions=6,
+            command_timeout_sec=240.0,
+            startup_timeout_sec=150.0,
+            acquire_timeout_sec=90.0,
+            max_output_chars=50000,
+            crash_binary="/opt/bin/crash",
+        )
+        pool = CrashSessionPool(cfg, start_reaper=False)
+        try:
+            st = pool.stats()
+            self.assertEqual(st["max_total_sessions"], 6)
+            self.assertEqual(st["command_timeout_sec"], 240.0)
+            self.assertEqual(st["startup_timeout_sec"], 150.0)
+            self.assertEqual(st["acquire_timeout_sec"], 90.0)
+            self.assertEqual(st["max_output_chars"], 50000)
+            self.assertEqual(st["crash_binary"], "/opt/bin/crash")
+        finally:
+            pool.close_all()
 
 
 @unittest.skipUnless(is_pty_available(), "Requires POSIX pty/termios")
