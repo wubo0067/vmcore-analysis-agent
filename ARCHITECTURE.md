@@ -259,7 +259,7 @@ layer0 2.4a 则给出各里程碑必须达成的目标：
 
 只有 `_REQUIRED_GATES` 中列出的必需门控阻止定论；额外出现的可选门控只作展示/审计，不影响收敛。没有专属执行器闭合规则的必需门控只记录 `weak_gate_closure` telemetry，保持未决；提示词会说明不要仅为关闭这类门控而重复探测，相关分析仍为非定论，直到补上事实抽取和门控规则。未知或未登记门控策略的签名（当前包括 `unknown` 与 `stack_corruption`）也不能定论。`n/a` 目前没有执行器判定规则，因此 LLM 的请求会被拒绝并写入审计记录。
 
-证据事实前缀（`evidence.extract_evidence_facts`）：`rd_word:`、`struct_`、`dis_`、`sym:`、`vtop_`、`kmem_`、`kmem_slab_state:0x<addr>=allocated|free`、`kmem_vmap_range:`、`lifetime_signal:kasan_use_after_free_unbound`（telemetry，不构成生命周期证明）。
+证据事实前缀（`evidence.extract_evidence_facts`）：`rd_word:`、`struct_`、`dis_`、`sym:`、`vtop_`、`kmem_`、`kmem_slab_state:0x<addr>=allocated|free`、`kmem_vmap_range:`、`lifetime_signal:kasan_use_after_free_unbound`（telemetry，不构成生命周期证明）；锁/挂死签名另有 `bt_task:`、`bt_frame:`、`lock_holder_task:`、`lock_owner_word:`、`spinlock_contender:`、`cpu_lockup_no_spinlock:`、`cpu_lockup_irq_softirq:`、`rcu_*`、`ps_task_state:`、`runq_` 等前缀（详见 `evidence.py` 的 `_parse_bt` / `_parse_ps` / `_parse_struct_values` / `_parse_runq` / `_parse_lock_hang_json`）。
 
 ## 工具层（`src/mcp_tools/`）
 
@@ -430,6 +430,6 @@ $mods = Get-ChildItem tests -Filter 'test_*.py' | ForEach-Object { 'tests.' + $_
 - `n/a` 是预留状态，目前没有执行器适用性规则会产生该状态；LLM 请求会被拒绝。
 - `local_corruption_exclusion` 是代码级门控名，措辞上仍是 exclusion；prompt 侧已统一为 discrimination 语义，重命名标识符需同步 `state_manager`/`schema`/`report_generator` 与测试。
 - `lock_hang` 的 `irq_or_softirq_cpus` 只覆盖软中断与停顿检测原语，不含硬件中断（字段名沿用旧称以避免破坏消费方）；纯硬件中断上下文不计入 `active_or_suspected_cpus`，只在无其它线索时触发兜底建议。
-- `soft_lockup` / `hard_lockup` / `rcu_stall` / `hung_task` 的签名门控（`lock_holder`、`wait_chain` 等）在 `evidence._GATE_COMPLETION_CRITERIA` 里**没有**对应条款，因此这些签名当前无法由执行器判定定论；`lock_hang` 提供的是取证加速，不是门控闭合规则的替代。
+- ~~`soft_lockup` / `hard_lockup` / `rcu_stall` / `hung_task` 的签名门控（`lock_holder`、`wait_chain` 等）在 `evidence._GATE_COMPLETION_CRITERIA` 里没有对应条款~~（已解决）：四类签名的必需门控（`lock_holder`、`rcu_stall_trace`、`blocked_task_context`、`wait_chain`、`stack_integrity`、`nmi_watchdog_evidence`、`cpu_progress_state`）已注册确定性执行器闭合规则，可由 `bt` / `dis` / `ps` / `ps -m` / `runq` / `struct` / lock_hang JSON 事实闭合。注意 `lock_holder` 仅对 `{"rcu_stall", "soft_lockup"}` 注册确定性规则，`hung_task` 及无签名场景下仍为 telemetry-only。仍无闭合规则的必需门控仅有 `warn_on` 的 `warning_site` / `warning_timeline`。
 - `crash/daemon.py` 的 `http://` 端点无内置鉴权，仅限可信单租户主机；多用户主机必须使用 `unix://`（已自动收紧为 `0600` 权限），避免本地其他用户借 `crash` 的 `!` shell 逃逸执行任意命令。
 - `daemon` 模式下，所有 MCP Server 共享守护进程侧的 `CRASH_POOL_MAX_SESSIONS × CRASH_POOL_SLOTS_PER_VMCORE` 槽位；若各 MCP Server 的 `CRASH_MCP_MAX_CONCURRENCY` 之和远大于池容量，超出请求会在 `CRASH_POOL_ACQUIRE_TIMEOUT_SEC` 处排队超时，生产部署应按池容量同步调优。
