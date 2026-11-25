@@ -108,7 +108,16 @@ class CrashDaemonClient:
         timeout: Optional[float] = None,
         verbose: bool = False,
     ) -> str:
-        req_timeout = (timeout or 180.0) + 15.0
+        try:
+            default_cmd_timeout = max(1.0, float(os.environ.get("CRASH_COMMAND_TIMEOUT_SEC", "180.0")))
+        except ValueError:
+            default_cmd_timeout = 180.0
+        try:
+            acquire_timeout = max(0.5, float(os.environ.get("CRASH_POOL_ACQUIRE_TIMEOUT_SEC", "120.0")))
+        except ValueError:
+            acquire_timeout = 120.0
+        effective_cmd_timeout = timeout if timeout is not None else default_cmd_timeout
+        req_timeout = effective_cmd_timeout + acquire_timeout + 30.0
         data = self._request_json(
             "POST",
             "/execute",
@@ -361,7 +370,7 @@ class CrashDaemonServer:
         if self._unix_socket_path:
             return f"unix://{self._unix_socket_path}"
         address = self._server.server_address
-        host, port = address[-2]  # type: ignore[index]
+        host, port = address[:2]  # type: ignore[index]
         return f"http://{host}:{port}"
 
     def _create_server(self) -> socketserver.BaseServer:

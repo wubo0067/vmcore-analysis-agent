@@ -471,27 +471,26 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIn("line=3", commands[0])
 
 
-def test_run_script_promotion_uses_structured_parameters(self) -> None:
-        import types
-        from unittest import mock
+def test_run_script_promotion_uses_structured_parameters() -> None:
+    import types
+    from unittest import mock
 
-        from src.react import output_parser
-        from src.react.schema import ToolCall
+    from src.react import output_parser
+    from src.react.schema import ToolCall
 
-        action = ToolCall(command_name="run_script", arguments=["read_source fs/proc/base.c 3"])
-        step = types.SimpleNamespace(
-            action=action, reasoning="", signature_class=None, additional_notes=None
-        )
-        provider = types.SimpleNamespace(package_name="kernel_source")
-        with mock.patch.object(
-            output_parser, "get_registered_tool_provider", lambda name: provider
-        ):
-            result = output_parser._lift_standalone_mcp_tool_out_of_run_script(step)
-        self.assertEqual(result.action.command_name, "read_source")
-        self.assertEqual(
-            result.action.parameters, {"file": "fs/proc/base.c", "line": 3}
-        )
-        self.assertEqual(result.action.arguments, [])
+    action = ToolCall(command_name="run_script", arguments=["read_source fs/proc/base.c 3"])
+    step = types.SimpleNamespace(
+        action=action, reasoning="", signature_class=None, additional_notes=None
+    )
+    provider = types.SimpleNamespace(package_name="kernel_source")
+    with mock.patch.object(
+        output_parser, "get_registered_tool_provider", lambda name: provider
+    ):
+        result = output_parser._lift_standalone_mcp_tool_out_of_run_script(step)
+    assert result.action.command_name == "read_source"
+    assert result.action.parameters == {"file": "fs/proc/base.c", "line": 3}
+    assert result.action.arguments == []
+
 
 
 class FindStructTests(KernelSourceTestCase):

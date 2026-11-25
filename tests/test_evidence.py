@@ -336,18 +336,18 @@ class EvidenceExtractionTests(unittest.TestCase):
         )
 
         self.assertEqual(evaluated["lock_holder"].status, "open")
-        self.assertTrue(
+        # lock_holder 已有确定性闭合规则，但通用 rd_word 事实不构成弱闭合信号，
+        # 只应留在证据增量中等待规则要求的 holder 证据。
+        self.assertFalse(
             any(item["event"] == "weak_gate_closure" for item in transitions)
         )
 
     def test_evidence_goal_skips_telemetry_only_and_optional_gates(self) -> None:
+        # lock_holder 在未指定锁类签名时没有确定性闭合规则，属于 telemetry-only。
         telemetry_only = {
-            "stack_integrity": GateEntry(
-                required_for=["soft_lockup"], status="open"
-            ),
-            "lock_holder": GateEntry(required_for=["soft_lockup"], status="open"),
+            "lock_holder": GateEntry(required_for=[], status="open"),
         }
-        self.assertIsNone(_build_evidence_goal(telemetry_only, "soft_lockup"))
+        self.assertIsNone(_build_evidence_goal(telemetry_only, "unknown"))
 
         optional_only = {
             "register_provenance": GateEntry(

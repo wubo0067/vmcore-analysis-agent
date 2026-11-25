@@ -213,6 +213,34 @@ def _build_evidence_goal(
             ],
             "local_corruption_exclusion": ["local_writer", "stack_or_object_lifetime"],
             "field_type_classification": ["field_type", "struct_layout"],
+            "rcu_stall_trace": [
+                "rcu_node_or_reader_state",
+                "stalled_task_bt_or_dis",
+            ],
+            "lock_holder": [
+                "lock_owner_or_rcu_reader_identity",
+                "holder_bt_or_dis",
+            ],
+            "blocked_task_context": [
+                "blocked_task_bt",
+                "task_un_state_or_wait_graph",
+            ],
+            "wait_chain": [
+                "wait_graph_edges_or_lock_owner",
+                "corroborating_bt_or_struct",
+            ],
+            "stack_integrity": [
+                "stalled_cpu_bt_frames",
+                "dis_or_sym_corroboration",
+            ],
+            "nmi_watchdog_evidence": [
+                "nmi_or_watchdog_frame",
+                "stalled_cpu_bt_or_dis",
+            ],
+            "cpu_progress_state": [
+                "runq_or_cpu_lockup_progress",
+                "stalled_cpu_bt_or_dis",
+            ],
         }.get(gate_name, ["gate_evidence"])
         return {
             "goal_id": gate_name,

@@ -6,6 +6,7 @@ from typing import Any, List, Optional
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
+from src.mcp_tools.crash.client import crash_stdio_env
 from src.utils.logging import logger
 
 MCP_SERVER_NAME = "stack_canary"
@@ -16,6 +17,7 @@ canary_client = MultiServerMCPClient(
             "command": sys.executable,
             "args": ["-m", "src.mcp_tools.stack_canary.server"],
             "transport": "stdio",
+            "env": crash_stdio_env(),
         }
     }
 )

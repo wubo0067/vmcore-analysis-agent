@@ -70,13 +70,29 @@ class GraphLoggingCallback(BaseCallbackHandler):
         """当工具开始执行时调用"""
         tool_name = serialized.get("name", "unknown_tool")
         logger.info(f"  🔧 Tool '{tool_name}' started")
-        logger.debug(f"    Input: {input_str[:200]}...")  # 只显示前 200 字符
+        logger.debug(f"    Input: {input_str}")
 
-    def on_tool_end(self, output: str, **kwargs: Any) -> None:
+    def on_tool_end(self, output: Any, **kwargs: Any) -> None:
         """当工具执行结束时调用"""
-        # logger.info(f"  ✓ Tool completed")
-        # logger.debug(f"    Output: {output[:200]}...")  # 只显示前 200 字符
-        pass
+        tool_name = kwargs.get("name") or "tool"
+        rendered = self._format_tool_output(output)
+        logger.info(
+            f"  ✓ Tool '{tool_name}' completed ({len(rendered)} chars):\n{rendered}"
+        )
+
+    @staticmethod
+    def _format_tool_output(output: Any) -> str:
+        """提取工具返回的完整文本内容（兼容 str、ToolMessage 与 MCP content blocks）。"""
+        raw = getattr(output, "content", output)
+        if isinstance(raw, list):
+            parts = []
+            for item in raw:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                else:
+                    parts.append(str(item))
+            return "".join(parts).strip()
+        return str(raw)
 
     def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
         """当工具执行出错时调用"""

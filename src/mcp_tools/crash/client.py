@@ -37,14 +37,18 @@ _CRASH_SERVER_ENV_KEYS = frozenset(
 )
 
 
-def _crash_stdio_env() -> dict[str, str]:
-    """仅向 stdio MCP 子进程转发 crash 配置，不传递 API 密钥等无关变量。"""
+def crash_stdio_env() -> dict[str, str]:
+    """仅向依赖 crash/executor 的 stdio MCP 子进程转发 crash 配置，不传递 API 密钥等无关变量。"""
+    load_dotenv(_PROJECT_ROOT / ".env", override=False)
     env = {key: os.environ[key] for key in _CRASH_SERVER_ENV_KEYS if key in os.environ}
     # PATH 用于查找 crash；PYTHONPATH 用于支持直接运行客户端时的 src.* 导入。
     for key in ("PATH", "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
         if key in os.environ:
             env[key] = os.environ[key]
     return env
+
+
+_crash_stdio_env = crash_stdio_env
 
 
 def _build_mcp_server_config() -> dict[str, Any]:

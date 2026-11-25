@@ -98,22 +98,22 @@ class ReportGateSeparationTests(unittest.TestCase):
         report = generate_markdown_report(
             _base_state(
                 report_language="zh",
-                current_signature_class="soft_lockup",
+                current_signature_class="warn_on",
                 managed_gates={
-                    "stack_integrity": {
-                        "required_for": ["soft_lockup"],
+                    "warning_site": {
+                        "required_for": ["warn_on"],
                         "status": "open",
                         "closure_basis": None,
                     },
-                    "lock_holder": {
-                        "required_for": ["soft_lockup"],
+                    "warning_timeline": {
+                        "required_for": ["warn_on"],
                         "status": "open",
                         "closure_basis": None,
                     },
                 },
             )
         )
-        self.assertIn("stack_integrity", report)
+        self.assertIn("warning_site", report)
         self.assertIn("规则能力限制", report)
         self.assertIn("本次分析无法形成定论", report)
 
@@ -157,17 +157,17 @@ class ReportGateSeparationTests(unittest.TestCase):
 
     def test_report_discloses_required_gate_without_closure_rule(self) -> None:
         gates = {
-            "stack_integrity": GateEntry(
-                required_for=["soft_lockup"], status="open"
+            "warning_site": GateEntry(
+                required_for=["warn_on"], status="open"
             ),
-            "lock_holder": GateEntry(
-                required_for=["soft_lockup"], status="open"
+            "warning_timeline": GateEntry(
+                required_for=["warn_on"], status="open"
             ),
         }
         report = generate_markdown_report(
             _base_state(
                 report_language="zh",
-                current_signature_class="soft_lockup",
+                current_signature_class="warn_on",
                 managed_gates=gates,
             )
         )

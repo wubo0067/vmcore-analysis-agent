@@ -370,18 +370,20 @@ class ReplanProbeMenuTests(unittest.TestCase):
         self.assertNotIn("external_corruption_gate still pending", rendered)
 
     def test_telemetry_only_required_gate_does_not_invite_repeated_probing(self) -> None:
+        # warn_on 的必需门控尚无确定性闭合规则，属于 telemetry-only。
         gates = {
-            "stack_integrity": GateEntry(
+            "warning_site": GateEntry(
                 status="open",
-                required_for=["soft_lockup"],
+                required_for=["warn_on"],
             ),
-            "lock_holder": GateEntry(
-                status="open",
-                required_for=["soft_lockup"],
+            "warning_timeline": GateEntry(
+                status="closed",
+                closure_basis="executor_evidence",
+                required_for=["warn_on"],
             ),
         }
         rendered = _render(
-            current_signature_class="soft_lockup",
+            current_signature_class="warn_on",
             current_root_cause_class=None,
             managed_gates=gates,
             current_evidence_goal=None,
@@ -391,7 +393,7 @@ class ReplanProbeMenuTests(unittest.TestCase):
             replan_required=False,
             evidence_facts=[],
         )
-        self.assertIn("stack_integrity is telemetry-only", rendered)
+        self.assertIn("warning_site is telemetry-only", rendered)
         self.assertIn("Do not keep probing solely to close this gate", rendered)
         self.assertIn("result remains non-conclusive", rendered)
 

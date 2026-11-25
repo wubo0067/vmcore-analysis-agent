@@ -276,6 +276,12 @@ def _execute_via_daemon(
             is_script=is_script,
             verbose=verbose,
         )
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"CrashDaemon ({endpoint}) request timed out: {exc}. "
+            "Increase CRASH_COMMAND_TIMEOUT_SEC / CRASH_POOL_ACQUIRE_TIMEOUT_SEC "
+            "or narrow the crash command."
+        ) from exc
     except OSError as exc:
         raise RuntimeError(
             f"CrashDaemon ({endpoint}) is unreachable: {exc}. "

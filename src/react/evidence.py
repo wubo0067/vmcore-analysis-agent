@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Iterable, Mapping
 
@@ -54,6 +55,118 @@ _SOURCE_GIT_RE = re.compile(
     r"SOURCE_GIT\s+file=(?P<file>\S+)\s+range=(?P<range>\S+)"
 )
 
+# 锁 / 挂死类（rcu_stall / hung_task / soft_lockup / hard_lockup）确定性运行时事实解析正则
+_BT_TASK_HEADER_RE = re.compile(
+    rf'^\s*PID:\s*(?P<pid>\d+)\s+TASK:\s*(?P<task>{_HEX})\s+CPU:\s*(?P<cpu>\d+)\s+COMMAND:\s*"(?P<comm>[^"]+)"',
+    re.IGNORECASE,
+)
+_BT_FRAME_RE = re.compile(
+    rf"^\s*#\d+\s+\[{_HEX}\]\s+(?P<symbol>[A-Za-z_][A-Za-z0-9_.]*)\s+at\s+{_HEX}"
+)
+_NMI_WATCHDOG_FRAME_TOKENS = (
+    "nmi_handle",
+    "exc_nmi",
+    "asm_exc_nmi",
+    "do_nmi",
+    "watchdog_overflow_callback",
+    "watchdog_timer_fn",
+    "hardlockup_detector",
+    "perf_event_overflow",
+)
+_STRUCT_PID_RE = re.compile(r"^\s*pid\s*=\s*(?P<pid>\d+)\s*,?\s*$")
+_STRUCT_TASK_STATE_RE = re.compile(
+    r"^\s*(?:__state|state)\s*=\s*(?P<val>\d+|0x[0-9a-fA-F]+)\s*,?\s*$"
+)
+_STRUCT_RCU_NESTING_RE = re.compile(
+    r"^\s*rcu_read_lock_nesting\s*=\s*(?P<val>-?\d+)\s*,?\s*$"
+)
+_STRUCT_RCU_BLOCKED_NODE_RE = re.compile(
+    rf"^\s*rcu_blocked_node\s*=\s*(?P<addr>{_HEX})\b"
+)
+_STRUCT_RCU_GP_TASKS_RE = re.compile(
+    rf"^\s*gp_tasks\s*=\s*(?P<addr>{_HEX})\b"
+)
+_STRUCT_RCU_GP_SEQ_RE = re.compile(
+    r"^\s*gp_seq\s*=\s*(?P<val>-?\d+|0x[0-9a-fA-F]+)\s*,?\s*$"
+)
+_STRUCT_RCU_QSMASK_RE = re.compile(
+    r"^\s*qsmask\s*=\s*(?P<val>\d+|0x[0-9a-fA-F]+)\s*,?\s*$"
+)
+_STRUCT_BLKD_TASKS_NEXT_RE = re.compile(
+    rf"blkd_tasks\s*=\s*\{{[^}}]*?next\s*=\s*(?P<addr>{_HEX})",
+    re.DOTALL,
+)
+_STRUCT_LOCK_OWNER_RE = re.compile(
+    rf"(?:^|\s)owner\s*=\s*(?:\{{\s*counter\s*=\s*(?P<counter>-?\d+|{_HEX})\s*\}}|(?P<ptr>{_HEX}))"
+)
+_PRINT_RCU_VAR_RE = re.compile(
+    r"^\s*(?P<name>sysctl_panic_on_rcu_stall|rcu_cpu_stall_timeout)\s*=\s*\$\d+\s*=\s*(?P<val>-?\d+)\s*$"
+)
+_RCU_STATE_GP_SEQ_CMD_RE = re.compile(r"^p\s+rcu_state\.gp_seq\b", re.IGNORECASE)
+_GDB_DOLLAR_INT_RE = re.compile(r"^\s*\$\d+\s*=\s*(?P<val>-?\d+)\s*$")
+_RUNQ_CPU_HEADER_RE = re.compile(r"^\s*CPU\s+(?P<cpu>\d+)\s+RUNQUEUE:", re.IGNORECASE)
+_RUNQ_CURRENT_PID_RE = re.compile(r"^\s*CURRENT:\s*PID:\s*(?P<pid>\d+)\b", re.IGNORECASE)
+_PS_TASK_LINE_RE = re.compile(
+    rf"^\s*(?:>\s*)?(?P<pid>\d+)\s+\d+\s+\d+\s+{_HEX}\s+(?P<state>UN|RU|IN|ZO|ST)\b"
+)
+_PS_M_TASK_LINE_RE = re.compile(
+    rf"^\s*\[[^\]]+\]\s+\[(?P<state>UN|RU|IN|ZO|ST)\]\s+PID:\s+(?P<pid>\d+)\b"
+)
+
+_RCU_TRACE_STATE_PREFIXES = (
+    "rcu_reader_nesting:",
+    "rcu_blocked_node:",
+    "rcu_node_gp_tasks:",
+    "rcu_node_blkd_tasks:",
+    "rcu_gp_seq:",
+    "rcu_qsmask:",
+    "rcu_stall_cpu_trace:",
+)
+_RCU_HOLDER_IDENTITY_PREFIXES = (
+    "rcu_reader_nesting:",
+    "rcu_blocked_node:",
+    "rcu_node_gp_tasks:",
+    "lock_holder_task:",
+    "lock_owner_word:",
+)
+_SOFT_LOCKUP_HOLDER_PREFIXES = (
+    "lock_holder_task:",
+    "lock_owner_word:",
+    "spinlock_contender:",
+)
+_SOFT_LOCKUP_NO_LOCK_PREFIXES = (
+    "cpu_lockup_no_spinlock:",
+    "cpu_lockup_irq_softirq:",
+)
+_HUNG_TASK_STATE_PREFIXES = (
+    "task_state:",
+    "ps_task_state:",
+    "wait_graph_edge:",
+    "wait_graph_blocker:",
+    "wait_graph_cycle:",
+    "wait_graph_unresolved:",
+)
+_WAIT_CHAIN_PREFIXES = (
+    "wait_graph_edge:",
+    "wait_graph_cycle:",
+    "wait_graph_blocker:",
+    "lock_holder_task:",
+    "lock_owner_word:",
+)
+_CPU_PROGRESS_PREFIXES = (
+    "cpu_lockup_cpu:",
+    "cpu_lockup_irq_softirq:",
+    "spinlock_contender:",
+    "runq_cpu:",
+)
+_EXECUTION_CONTEXT_PREFIXES = (
+    "bt_task:",
+    "bt_frame:",
+    "dis_instruction:",
+    "dis_symbol:",
+)
+
+
 _GATE_COMPLETION_CRITERIA: dict[str, list[str]] = {
     "register_provenance": [
         "faulting register value is present",
@@ -72,6 +185,34 @@ _GATE_COMPLETION_CRITERIA: dict[str, list[str]] = {
     "field_type_classification": [
         "struct field layout evidence is present",
         "a type or symbol observation corroborates the field classification",
+    ],
+    "rcu_stall_trace": [
+        "RCU grace-period or stalled reader/CPU state is observed (rcu_node gp_tasks/blkd_tasks/gp_seq/qsmask, task_struct rcu_read_lock_nesting/rcu_blocked_node, or analyze_cpu_lockup_rcu)",
+        "stalled task or CPU execution context is observed via backtrace or disassembly (bt / dis)",
+    ],
+    "lock_holder": [
+        "the blocking RCU reader, lock owner, or lock-free CPU busy-loop state is observed (rcu_read_lock_nesting/rcu_blocked_node/gp_tasks, lock owner word, spinlock contender, lock_hang owner resolution, or lock-free softirq/CPU stall confirmation)",
+        "holder or stalled CPU execution context is observed via backtrace or disassembly (bt / dis)",
+    ],
+    "blocked_task_context": [
+        "blocked task execution context is observed via backtrace (bt_task and stack frames)",
+        "blocked task state or wait-graph membership is observed (task_struct __state, ps UN state, or analyze_lock_wait_graph)",
+    ],
+    "wait_chain": [
+        "lock/wait dependency chain or blocker identity is observed (analyze_lock_wait_graph edges/cycles/root_blockers or lock owner word)",
+        "independent execution or structure evidence corroborates the chain (bt, struct, dis, or rd)",
+    ],
+    "stack_integrity": [
+        "stalled CPU/task backtrace frames are observed (bt_task + bt_frame or analyze_cpu_lockup_rcu)",
+        "disassembly or symbol resolution corroborates the execution site (dis / sym)",
+    ],
+    "nmi_watchdog_evidence": [
+        "NMI or watchdog frame / hard-lockup stall context is observed (bt NMI/watchdog frame or analyze_cpu_lockup_rcu irq/softirq stall)",
+        "stalled CPU task or disassembly context is observed (bt / dis)",
+    ],
+    "cpu_progress_state": [
+        "CPU runqueue or lockup progress state is observed (runq, analyze_cpu_lockup_rcu active/suspected CPUs, or spinlock contenders)",
+        "stalled CPU execution context is observed via backtrace or disassembly (bt / dis)",
     ],
 }
 
@@ -267,6 +408,16 @@ def gate_completion_criteria(
             "the executor rule requires local_corruption_exclusion to be verified and an "
             "external_source fact, but extraction of external_source facts is not implemented; "
             "a protocol-template decode alone therefore cannot close this optional gate"
+        ]
+    if gate_name == "lock_holder" and not (
+        signature_classes & {"rcu_stall", "soft_lockup"}
+    ):
+        return [
+            "no executor closure rule is defined; structured facts are telemetry only"
+        ]
+    if gate_name == "stack_integrity" and "soft_lockup" not in signature_classes:
+        return [
+            "no executor closure rule is defined; structured facts are telemetry only"
         ]
     criteria = _GATE_COMPLETION_CRITERIA.get(gate_name)
     if criteria is not None:
@@ -470,6 +621,92 @@ def _gate_criteria_satisfied(
             return False
         return any(fact.startswith("external_source:") for fact in facts)
 
+    signature_classes = set(required_for)
+
+    if gate_name == "rcu_stall_trace":
+        has_rcu_state = any(
+            fact.startswith(_RCU_TRACE_STATE_PREFIXES) for fact in facts
+        )
+        has_exec_ctx = any(
+            fact.startswith(_EXECUTION_CONTEXT_PREFIXES) for fact in facts
+        )
+        return has_rcu_state and has_exec_ctx
+
+    if gate_name == "lock_holder":
+        has_holder_ctx = any(
+            fact.startswith(("bt_task:", "dis_instruction:", "dis_symbol:"))
+            for fact in facts
+        )
+        if "rcu_stall" in signature_classes:
+            has_rcu_holder = any(
+                fact.startswith(_RCU_HOLDER_IDENTITY_PREFIXES) for fact in facts
+            )
+            return has_rcu_holder and has_holder_ctx
+        if "soft_lockup" in signature_classes:
+            has_lock_owner = any(
+                fact.startswith(_SOFT_LOCKUP_HOLDER_PREFIXES) for fact in facts
+            )
+            if has_lock_owner and has_holder_ctx:
+                return True
+            # 无外部锁争抢的纯死循环 / softirq 忙等：需同时具备 CPU 停滞诊断 + bt + dis
+            has_lock_free_diag = any(
+                fact.startswith(_SOFT_LOCKUP_NO_LOCK_PREFIXES) for fact in facts
+            )
+            has_bt = any(fact.startswith("bt_task:") for fact in facts)
+            has_dis = any(fact.startswith("dis_") for fact in facts)
+            return has_lock_free_diag and has_bt and has_dis
+        return False
+
+    if gate_name == "blocked_task_context":
+        has_bt_task = any(fact.startswith("bt_task:") for fact in facts)
+        has_bt_frames = any(
+            fact.startswith(("bt_frame:", "dis_symbol:", "dis_instruction:"))
+            for fact in facts
+        )
+        has_blocked_state = any(
+            fact.startswith(_HUNG_TASK_STATE_PREFIXES) for fact in facts
+        )
+        return has_bt_task and has_bt_frames and has_blocked_state
+
+    if gate_name == "wait_chain":
+        has_chain = any(fact.startswith(_WAIT_CHAIN_PREFIXES) for fact in facts)
+        has_corroboration = any(
+            fact.startswith(
+                ("bt_task:", "struct_field:", "struct_type:", "dis_", "rd_word:")
+            )
+            for fact in facts
+        )
+        return has_chain and has_corroboration
+
+    if gate_name == "stack_integrity":
+        if "soft_lockup" not in signature_classes:
+            return False
+        has_stack = (
+            any(fact.startswith("bt_task:") for fact in facts)
+            and any(fact.startswith("bt_frame:") for fact in facts)
+        ) or any(fact.startswith("cpu_lockup_cpu:") for fact in facts)
+        has_code_ref = any(fact.startswith(("dis_", "sym:")) for fact in facts)
+        return has_stack and has_code_ref
+
+    if gate_name == "nmi_watchdog_evidence":
+        has_nmi = any(
+            fact.startswith(("nmi_watchdog_frame:", "cpu_lockup_irq_softirq:"))
+            for fact in facts
+        )
+        has_ctx = any(
+            fact.startswith(("bt_task:", "dis_instruction:", "dis_symbol:"))
+            for fact in facts
+        )
+        return has_nmi and has_ctx
+
+    if gate_name == "cpu_progress_state":
+        has_progress = any(fact.startswith(_CPU_PROGRESS_PREFIXES) for fact in facts)
+        has_ctx = any(
+            fact.startswith(("bt_task:", "dis_instruction:", "dis_symbol:"))
+            for fact in facts
+        )
+        return has_progress and has_ctx
+
     # 统计当前事实集合中命中了哪些维度的证据类别：
     # - "rd": 内存读取证据（以 "rd_word:" 开头，记录指定地址的字值）
     # - "struct": 结构体布局证据（以 "struct_" 开头，记录结构体类型、字段偏移和大小）
@@ -506,8 +743,13 @@ def _gate_criteria_satisfied(
 def has_executor_closure_rule(
     gate_name: str, required_for: Iterable[str] = ()
 ) -> bool:
-    if gate_name == "object_lifetime" and "page_not_present" in set(required_for):
+    signature_classes = set(required_for)
+    if gate_name == "object_lifetime" and "page_not_present" in signature_classes:
         return False
+    if gate_name == "lock_holder":
+        return bool(signature_classes & {"rcu_stall", "soft_lockup"})
+    if gate_name == "stack_integrity":
+        return "soft_lockup" in signature_classes
     # external_corruption_gate 的规则已定义，但 external_source 事实抽取尚未实现，
     # 因此当前没有可执行能力；接入抽取器后把该门控加回此集合。
     return gate_name in {
@@ -515,6 +757,11 @@ def has_executor_closure_rule(
         "object_lifetime",
         "local_corruption_exclusion",
         "field_type_classification",
+        "rcu_stall_trace",
+        "blocked_task_context",
+        "wait_chain",
+        "nmi_watchdog_evidence",
+        "cpu_progress_state",
     }
 
 
@@ -582,6 +829,9 @@ def extract_evidence_facts(
             f"source_git:{history.group('file')}:{history.group('range')}"
         )
 
+    if tool_name in {"analyze_cpu_lockup_rcu", "analyze_lock_wait_graph"}:
+        facts.update(_parse_lock_hang_json(tool_name, output))
+
     for command in commands:
         # 提取命令的第一个单词（命令名），转为小写以统一匹配
         # 例如 "rd 0x100 8" → "rd"，"struct task_struct" → "struct"
@@ -592,6 +842,16 @@ def extract_evidence_facts(
         elif name == "struct":
             # 解析结构体定义输出，提取类型名、字段偏移和总大小
             facts.update(_parse_struct(output))
+            # 解析结构体实例字段值（task_struct RCU/状态字段、rcu_node 队列字段、锁 owner）
+            facts.update(_parse_struct_values(output))
+        elif name == "bt":
+            facts.update(_parse_bt(output))
+        elif name == "p":
+            facts.update(_parse_print_vars(command, output))
+        elif name == "runq":
+            facts.update(_parse_runq(output))
+        elif name == "ps":
+            facts.update(_parse_ps(output))
         elif name == "dis":
             # 解析反汇编输出，提取指令助记符和符号
             facts.update(_parse_dis(output))
@@ -986,6 +1246,270 @@ def _parse_kmem(output: str) -> set[str]:
     return facts
 
 
+def _parse_bt(output: str) -> set[str]:
+    """解析 crash ``bt`` 输出中的任务头、调用栈帧与 NMI/watchdog 关键帧。
+
+    按每个 ``PID:`` 任务块独立限制帧数（每任务前 6 帧，总计最多 48 帧），
+    避免多核 ``bt -a`` 时前几个 idle CPU 吃满配额导致后续卡死 CPU 栈帧丢失。
+    """
+    facts: set[str] = set()
+    task_frame_count = 0
+    total_frame_count = 0
+    max_frames_per_task = 6
+    max_total_frames = 48
+    for line in output.splitlines():
+        header = _BT_TASK_HEADER_RE.match(line)
+        if header:
+            pid = header.group("pid")
+            task_addr = _to_int(header.group("task"))
+            cpu = header.group("cpu")
+            comm = header.group("comm").strip()
+            facts.add(f"bt_task:pid={pid}:task=0x{task_addr:x}:cpu={cpu}:comm={comm}")
+            task_frame_count = 0
+            continue
+        frame = _BT_FRAME_RE.match(line)
+        if frame:
+            sym = frame.group("symbol")
+            if task_frame_count < max_frames_per_task and total_frame_count < max_total_frames:
+                facts.add(f"bt_frame:{sym}")
+                task_frame_count += 1
+                total_frame_count += 1
+            sym_low = sym.lower()
+            if any(tok in sym_low for tok in _NMI_WATCHDOG_FRAME_TOKENS):
+                facts.add(f"nmi_watchdog_frame:{sym}")
+    return facts
+
+
+def _parse_struct_values(output: str) -> set[str]:
+    """解析 crash ``struct <type>.<field> <addr>`` 实例字段值（RCU / 任务状态 / 锁 owner）。"""
+    facts: set[str] = set()
+    pid_val: str | None = None
+    nesting_vals: list[int] = []
+    state_vals: list[int] = []
+
+    for line in output.splitlines():
+        pid_m = _STRUCT_PID_RE.match(line)
+        if pid_m:
+            pid_val = pid_m.group("pid")
+            continue
+
+        state_m = _STRUCT_TASK_STATE_RE.match(line)
+        if state_m:
+            raw_s = state_m.group("val")
+            s_val = int(raw_s, 16) if raw_s.lower().startswith("0x") else int(raw_s, 10)
+            state_vals.append(s_val)
+            continue
+
+        nest_m = _STRUCT_RCU_NESTING_RE.match(line)
+        if nest_m:
+            val = int(nest_m.group("val"), 10)
+            if val > 0:
+                nesting_vals.append(val)
+            continue
+
+        blkd_node_m = _STRUCT_RCU_BLOCKED_NODE_RE.match(line)
+        if blkd_node_m:
+            addr = _to_int(blkd_node_m.group("addr"))
+            if addr != 0:
+                facts.add(f"rcu_blocked_node:0x{addr:x}")
+            continue
+
+        gp_tasks_m = _STRUCT_RCU_GP_TASKS_RE.match(line)
+        if gp_tasks_m:
+            addr = _to_int(gp_tasks_m.group("addr"))
+            if addr != 0:
+                facts.add(f"rcu_node_gp_tasks:0x{addr:x}")
+            continue
+
+        gp_seq_m = _STRUCT_RCU_GP_SEQ_RE.match(line)
+        if gp_seq_m:
+            raw_v = gp_seq_m.group("val")
+            val = int(raw_v, 16) if raw_v.lower().startswith("0x") else int(raw_v, 10)
+            facts.add(f"rcu_gp_seq:{val}")
+            continue
+
+        qsmask_m = _STRUCT_RCU_QSMASK_RE.match(line)
+        if qsmask_m:
+            raw_v = qsmask_m.group("val")
+            val = int(raw_v, 16) if raw_v.lower().startswith("0x") else int(raw_v, 10)
+            facts.add(f"rcu_qsmask:{val}")
+            continue
+
+        owner_m = _STRUCT_LOCK_OWNER_RE.search(line)
+        if owner_m:
+            raw_owner = owner_m.group("counter") or owner_m.group("ptr")
+            if raw_owner is not None:
+                try:
+                    if raw_owner.lower().startswith("0x"):
+                        owner_int = int(raw_owner, 16)
+                    elif raw_owner.lstrip("-").isdigit():
+                        owner_int = int(raw_owner, 10) & ((1 << 64) - 1)
+                    else:
+                        owner_int = int(raw_owner, 16)
+                except ValueError:
+                    owner_int = 0
+                if owner_int != 0:
+                    facts.add(f"lock_owner_word:0x{owner_int:x}")
+
+    for val in nesting_vals:
+        if pid_val is not None:
+            facts.add(f"rcu_reader_nesting:pid={pid_val}={val}")
+        else:
+            facts.add(f"rcu_reader_nesting:{val}")
+
+    for s_val in state_vals:
+        if pid_val is not None:
+            facts.add(f"task_state:pid={pid_val}={s_val}")
+        else:
+            facts.add(f"task_state:{s_val}")
+
+    blkd_m = _STRUCT_BLKD_TASKS_NEXT_RE.search(output)
+    if blkd_m:
+        addr = _to_int(blkd_m.group("addr"))
+        if addr != 0:
+            facts.add(f"rcu_node_blkd_tasks:0x{addr:x}")
+
+    return facts
+
+
+def _parse_print_vars(command: str, output: str) -> set[str]:
+    """解析 crash ``p`` 输出中的 RCU 全局参数/宽限期变量。"""
+    facts: set[str] = set()
+    for line in output.splitlines():
+        m = _PRINT_RCU_VAR_RE.match(line)
+        if m:
+            facts.add(f"rcu_sysctl:{m.group('name')}={m.group('val')}")
+            continue
+        if _RCU_STATE_GP_SEQ_CMD_RE.match(command.strip()):
+            dm = _GDB_DOLLAR_INT_RE.match(line)
+            if dm:
+                val = int(dm.group("val"), 10)
+                if val > 0:
+                    facts.add(f"rcu_gp_seq:{val}")
+    return facts
+
+
+def _parse_runq(output: str) -> set[str]:
+    """解析 crash ``runq`` 输出中的各 CPU 当前运行任务。"""
+    facts: set[str] = set()
+    current_cpu: str | None = None
+    for line in output.splitlines():
+        cpu_m = _RUNQ_CPU_HEADER_RE.match(line)
+        if cpu_m:
+            current_cpu = cpu_m.group("cpu")
+            continue
+        if current_cpu is not None:
+            pid_m = _RUNQ_CURRENT_PID_RE.match(line)
+            if pid_m:
+                facts.add(f"runq_cpu:cpu={current_cpu}:pid={pid_m.group('pid')}")
+                current_cpu = None
+    return facts
+
+
+def _parse_ps(output: str) -> set[str]:
+    """解析 crash ``ps`` 与 ``ps -m`` 输出中的 UN（不可中断睡眠）等任务状态（有界抽取）。"""
+    facts: set[str] = set()
+    for line in output.splitlines():
+        m = _PS_M_TASK_LINE_RE.match(line) or _PS_TASK_LINE_RE.match(line)
+        if not m:
+            continue
+        state = m.group("state").upper()
+        if state == "UN":
+            facts.add(f"ps_task_state:pid={m.group('pid')}={state}")
+            if len(facts) >= 16:
+                break
+    return facts
+
+
+def _parse_lock_hang_json(tool_name: str, output: str) -> set[str]:
+    """解析 lock_hang MCP 工具返回的真实 JSON 摘要，抽取确定性 RCU / 锁 / CPU 停滞事实。"""
+    facts: set[str] = set()
+    stripped = output.strip()
+    if not stripped.startswith("{"):
+        return facts
+    try:
+        data = json.loads(stripped)
+    except (ValueError, TypeError):
+        return facts
+    if not isinstance(data, dict):
+        return facts
+
+    if tool_name == "analyze_cpu_lockup_rcu":
+        if data.get("rcu_stall_detected"):
+            facts.add("rcu_stall_cpu_trace:detected=true")
+
+        rcu_summary = data.get("rcu_state_summary")
+        if isinstance(rcu_summary, dict) and rcu_summary:
+            if "gp_seq" in rcu_summary and rcu_summary["gp_seq"] is not None:
+                facts.add(f"rcu_gp_seq:{rcu_summary['gp_seq']}")
+            facts.add("rcu_stall_cpu_trace:rcu_state_summary=present")
+
+        contenders = data.get("spinlock_contenders") or []
+        for contender in contenders[:8]:
+            if isinstance(contender, dict) and "cpu" in contender:
+                pid = contender.get("pid")
+                facts.add(
+                    f"spinlock_contender:cpu={contender['cpu']}"
+                    + (f":pid={pid}" if pid is not None else "")
+                )
+                facts.add(f"rcu_stall_cpu_trace:spinlock_cpu={contender['cpu']}")
+
+        irq_cpus = data.get("irq_or_softirq_cpus") or []
+        for item in irq_cpus[:8]:
+            if isinstance(item, dict) and "cpu" in item:
+                facts.add(f"cpu_lockup_irq_softirq:cpu={item['cpu']}")
+
+        suspected = data.get("active_or_suspected_cpus") or []
+        for cpu_item in suspected[:8]:
+            if isinstance(cpu_item, dict) and "cpu" in cpu_item:
+                cat = cpu_item.get("wait_category") or "active"
+                facts.add(f"cpu_lockup_cpu:cpu={cpu_item['cpu']}={cat}")
+                facts.add(f"rcu_stall_cpu_trace:cpu={cpu_item['cpu']}={cat}")
+                for fr in (cpu_item.get("top_frames") or [])[:6]:
+                    if isinstance(fr, str) and any(
+                        tok in fr.lower() for tok in _NMI_WATCHDOG_FRAME_TOKENS
+                    ):
+                        facts.add(f"nmi_watchdog_frame:{fr}")
+
+        # 若明确完成全核扫描且无自旋锁争抢，同时存在活跃/疑似卡死 CPU，记为无锁死循环线索
+        if (
+            isinstance(data.get("total_cpus_parsed"), int)
+            and data["total_cpus_parsed"] > 0
+            and data.get("spinlock_contender_count") == 0
+            and (suspected or irq_cpus)
+        ):
+            facts.add("cpu_lockup_no_spinlock:true")
+
+    elif tool_name == "analyze_lock_wait_graph":
+        for cycle in (data.get("deadlock_cycles") or [])[:4]:
+            if isinstance(cycle, list) and cycle:
+                facts.add("wait_graph_cycle:" + "->".join(str(p) for p in cycle))
+        for blocker in (data.get("root_blockers") or [])[:8]:
+            if isinstance(blocker, dict) and blocker.get("pid") is not None:
+                facts.add(f"wait_graph_blocker:pid={blocker['pid']}")
+                facts.add(f"lock_holder_task:pid={blocker['pid']}")
+        for edge in (data.get("wait_edges") or [])[:8]:
+            if not isinstance(edge, dict):
+                continue
+            wpid = edge.get("waiter_pid")
+            opid = edge.get("owner_pid")
+            ltype = edge.get("lock_type") or "lock"
+            if wpid is not None:
+                facts.add(
+                    f"wait_graph_edge:waiter={wpid}:owner={opid if opid is not None else 'unresolved'}:{ltype}"
+                )
+            if opid is not None:
+                facts.add(f"lock_holder_task:pid={opid}")
+        for unres in (data.get("non_sleep_lock_or_unresolved_tasks") or [])[:8]:
+            if isinstance(unres, dict) and unres.get("pid") is not None:
+                facts.add(f"wait_graph_unresolved:pid={unres['pid']}")
+        # 兼容 --lock-addr 单锁解析输出
+        if data.get("owner_pid") is not None:
+            facts.add(f"lock_holder_task:pid={data['owner_pid']}")
+            facts.add(f"wait_graph_blocker:pid={data['owner_pid']}")
+    return facts
+
+
 def _fact_supports_gate(fact: str, gate_name: str) -> bool:
     """
     判断某个事实（fact）是否与指定的门控（gate）相关，即是否可作为该门控的证据。
@@ -1026,9 +1550,46 @@ def _fact_supports_gate(fact: str, gate_name: str) -> bool:
         return fact.startswith(("kmem_slab_state:", "rd_word:"))
     if gate_name == "external_corruption_gate":
         return fact.startswith("external_source:")
+    if gate_name == "rcu_stall_trace":
+        return fact.startswith(
+            _RCU_TRACE_STATE_PREFIXES
+            + _EXECUTION_CONTEXT_PREFIXES
+            + ("rcu_sysctl:",)
+        )
+    if gate_name == "lock_holder":
+        return fact.startswith(
+            _RCU_HOLDER_IDENTITY_PREFIXES
+            + _SOFT_LOCKUP_HOLDER_PREFIXES
+            + _SOFT_LOCKUP_NO_LOCK_PREFIXES
+            + _EXECUTION_CONTEXT_PREFIXES
+            + ("rd_word:",)
+        )
+    if gate_name == "blocked_task_context":
+        return fact.startswith(
+            _HUNG_TASK_STATE_PREFIXES + _EXECUTION_CONTEXT_PREFIXES
+        )
+    if gate_name == "wait_chain":
+        return fact.startswith(
+            _WAIT_CHAIN_PREFIXES
+            + _EXECUTION_CONTEXT_PREFIXES
+            + ("struct_", "rd_word:")
+        )
+    if gate_name == "stack_integrity":
+        return fact.startswith(
+            _EXECUTION_CONTEXT_PREFIXES + ("sym:", "cpu_lockup_cpu:")
+        )
+    if gate_name == "nmi_watchdog_evidence":
+        return fact.startswith(
+            ("nmi_watchdog_frame:", "cpu_lockup_irq_softirq:")
+            + _EXECUTION_CONTEXT_PREFIXES
+        )
+    if gate_name == "cpu_progress_state":
+        return fact.startswith(
+            _CPU_PROGRESS_PREFIXES + _EXECUTION_CONTEXT_PREFIXES
+        )
     # 兜底：未知门控接受所有已知前缀的事实。
     # source_* 事实刻意不在这里：没有执行器闭合规则的门控（warning_site、
-    # lock_holder 等）拿到源码事实只会多出一条 weak_gate_closure 遥测噪音。
+    # mce_log 等）拿到源码事实只会多出一条 weak_gate_closure 遥测噪音。
     return fact.startswith(
         ("rd_word:", "rd_ascii:", "struct_", "dis_", "sym:", "vtop_", "kmem_")
     )
