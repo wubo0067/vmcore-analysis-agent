@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="520" height="200" viewBox="0 0 520 200" role="img" aria-labelledby="title description" xmlns:c2pa="http://c2pa.org/manifest">
   <title id="title">VMCore Analysis Agent</title>
-  <desc id="description">A penguin, the Linux mascot, inside a hexagonal kernel shell; an orange scan line from its head points at a breach in the shell.</desc>
+  <desc id="description">A streamlined penguin-shaped kernel core inside a hexagonal shell; an orange scan line points at a breach in the shell.</desc>
   <style>
     .wm  { fill: #0F172A; }
     .tag { fill: #475569; }
@@ -22,6 +22,10 @@
       <stop stop-color="#CFFAFE"/>
       <stop offset="1" stop-color="#22D3EE"/>
     </linearGradient>
+    <linearGradient id="penguinBody" x1="98" y1="70" x2="158" y2="184" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1E3A5F"/>
+      <stop offset="1" stop-color="#0A1728"/>
+    </linearGradient>
     <radialGradient id="glow">
       <stop stop-color="#22D3EE" stop-opacity=".38"/>
       <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
@@ -41,18 +45,19 @@
 
     <!-- outer shell, open at the breach -->
     <path d="M177.9 76.8 197.3 88V168L128 208 58.7 168V88L128 48 147.4 59.2" fill="none" stroke="url(#ring)" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
-    <!-- core: stylized penguin, the Linux mascot -->
-    <g transform="translate(0 -4)">
-      <ellipse cx="92" cy="134" rx="7.5" ry="21" transform="rotate(14 92 134)" fill="url(#coreFill)"/>
-      <ellipse cx="164" cy="134" rx="7.5" ry="21" transform="rotate(-14 164 134)" fill="url(#coreFill)"/>
-      <ellipse cx="113" cy="177" rx="11" ry="5" fill="#FBBF24"/>
-      <ellipse cx="143" cy="177" rx="11" ry="5" fill="#FBBF24"/>
-      <ellipse cx="128" cy="136" rx="29" ry="36" fill="url(#coreFill)"/>
-      <ellipse cx="128" cy="98" rx="19" ry="20" fill="url(#coreFill)"/>
-      <ellipse cx="128" cy="143" rx="18" ry="26" fill="#ECFEFF"/>
-      <circle cx="120.5" cy="94" r="3" fill="#0A1322"/>
-      <circle cx="135.5" cy="94" r="3" fill="#0A1322"/>
-      <path d="M120 101.5Q128 98 136 101.5L128 110Z" fill="#FBBF24" stroke="#FBBF24" stroke-width="2" stroke-linejoin="round"/>
+    <!-- core: a friendly, original penguin -->
+    <g transform="translate(0 -2)">
+      <ellipse cx="114" cy="184" rx="12" ry="5.5" fill="#FBBF24"/>
+      <ellipse cx="142" cy="184" rx="12" ry="5.5" fill="#FBBF24"/>
+      <ellipse cx="93" cy="146" rx="8.5" ry="23" transform="rotate(16 93 146)" fill="url(#penguinBody)"/>
+      <ellipse cx="163" cy="146" rx="8.5" ry="23" transform="rotate(-16 163 146)" fill="url(#penguinBody)"/>
+      <path d="M128 70C112 70 102 82 102 96c0 8 3 14 6 19-9 7-14 19-14 33 0 20 14 34 34 34s34-14 34-34c0-14-5-26-14-33 3-5 6-11 6-19 0-14-10-26-26-26Z" fill="url(#penguinBody)" stroke="url(#ring)" stroke-width="3" stroke-linejoin="round"/>
+      <ellipse cx="128" cy="148" rx="21" ry="27" fill="url(#coreFill)"/>
+      <circle cx="119" cy="93" r="5.5" fill="#ECFEFF"/>
+      <circle cx="137" cy="93" r="5.5" fill="#ECFEFF"/>
+      <circle cx="119.5" cy="94" r="2.6" fill="#0A1728"/>
+      <circle cx="137.5" cy="94" r="2.6" fill="#0A1728"/>
+      <path d="M121 101q7-3 14 0l-7 9Z" fill="#FBBF24" stroke="#FBBF24" stroke-width="1.5" stroke-linejoin="round"/>
     </g>
 
     <!-- scan line to the fault -->
