@@ -32,18 +32,29 @@ kernel_source_server = FastMCP(
 
 
 @kernel_source_server.tool()
-def source_status(source_root: str = "") -> str:
+def source_status(
+    source_root: str = "", module_source_roots: str = ""
+) -> str:
     """Report which kernel source tree is configured (version, git availability).
 
-    `source_root` is injected by the runtime from the analysis request
-    (--kernel-source-root); do not set it yourself.
+    `source_root` and `module_source_roots` are injected by the runtime from
+    the analysis request (--kernel-source-root / --debug-symbols); do not set
+    them yourself.
 
     Call this before the first source lookup. If it reports configured=false,
-    source code cannot be verified for this dump: say so instead of quoting
-    kernel code from memory.
+    kernel-tree source code cannot be verified for this dump: say so instead of
+    quoting kernel code from memory. Third-party module source under the listed
+    module_source_roots can still be read with read_source.
     """
 
-    return source_status_impl(source_root=source_root)
+    parsed_roots = (
+        [r.strip() for r in module_source_roots.split(",") if r.strip()]
+        if module_source_roots
+        else None
+    )
+    return source_status_impl(
+        source_root=source_root, module_source_roots=parsed_roots
+    )
 
 
 @kernel_source_server.tool()
@@ -53,24 +64,34 @@ def read_source(
     line: int = 0,
     context: int = 20,
     source_root: str = "",
+    module_source_roots: str = "",
 ) -> str:
     """Read numbered kernel source around a file:line.
 
     Args:
         file: Path as printed by `dis -s`, relative to the kernel tree root
-            (absolute paths are rejected). A trailing ":<line>" is accepted.
+            (absolute paths are rejected unless the file is co-located with a
+            debug_symbol_paths entry). A trailing ":<line>" is accepted.
         kver: Kernel release from `sys` (`RELEASE:`; the `KERNEL:` line is the vmlinux
             path). A tree from a different release is rejected.
         line: Center line. 0 reads the beginning of the file.
         context: Lines before and after `line` (max 80).
         source_root: Injected by the runtime; do not set it yourself.
+        module_source_roots: Injected by the runtime; do not set it yourself.
 
     The output starts with a SOURCE_REF line; quote that SOURCE_REF when citing
     the code in the analysis.
     """
 
+    # module_source_roots arrives as a comma-separated string from the payload.
+    parsed_roots = (
+        [r.strip() for r in module_source_roots.split(",") if r.strip()]
+        if module_source_roots
+        else None
+    )
     return read_source_impl(
-        file=file, kver=kver, line=line, context=context, source_root=source_root
+        file=file, kver=kver, line=line, context=context,
+        source_root=source_root, module_source_roots=parsed_roots,
     )
 
 

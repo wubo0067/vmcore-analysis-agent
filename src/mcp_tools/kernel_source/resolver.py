@@ -403,3 +403,87 @@ def relative_name(tree: SourceTree, path: Path) -> str:
         return path.resolve().relative_to(tree.root).as_posix()
     except ValueError:
         return path.name
+
+
+# ---------------------------------------------------------------------------
+# Module source support — read third-party .ko source code
+# ---------------------------------------------------------------------------
+
+_MODULE_SOURCE_SUFFIXES = frozenset({".c", ".h", ".S", ".cc"})
+
+
+def derive_module_source_roots(debug_symbol_paths: list[str] | tuple[str, ...] | None) -> list[Path]:
+    """Derive allowed module source directories from ``debug_symbol_paths``.
+
+    Each ``.ko`` / ``.ko.debug`` path implies that the directory directly
+    containing it is trusted for source-level reading.  Only the immediate
+    parent is trusted (never grandparents) so that a request like
+    ``--debug-symbols /data/case/drv.ko`` cannot widen read access to ``/data``.
+    The caller (the analysis request) already validated that the debug symbol
+    files exist on disk, so their parent directories are also accessible.
+
+    Returns deduplicated, resolved ``Path`` objects.
+    """
+
+    if not debug_symbol_paths:
+        return []
+    seen: set[Path] = set()
+    roots: list[Path] = []
+    for raw in debug_symbol_paths:
+        try:
+            p = Path(raw).expanduser().resolve()
+        except OSError:
+            continue
+        candidate = p.parent
+        if candidate not in seen and candidate.is_dir():
+            seen.add(candidate)
+            roots.append(candidate)
+    return roots
+
+
+def resolve_module_source_file(
+    file: str,
+    module_source_roots: list[Path],
+) -> Path:
+    """Resolve an absolute module source path against the allowed roots.
+
+    Raises ``SourceTreeError`` when the path is outside every allowed root,
+    is not a source file, or does not exist.
+    """
+
+    raw = str(file or "").strip().strip("'\"").replace("\\", "/")
+    if not (raw.startswith("/") or re.match(r"^[A-Za-z]:/", raw)):
+        raise SourceTreeError(
+            f"resolve_module_source_file expects an absolute path, got: {raw!r}"
+        )
+
+
+    try:
+        path = Path(raw).resolve()
+    except OSError as exc:
+        raise SourceTreeError(f"cannot resolve module source path: {exc}") from None
+
+    # Suffix check: only allow source files.
+    if path.suffix not in _MODULE_SOURCE_SUFFIXES:
+        raise SourceTreeError(
+            f"module source file must be a source file ({', '.join(sorted(_MODULE_SOURCE_SUFFIXES))}), "
+            f"got: {path.name!r}"
+        )
+
+    # Containment check: the resolved path must sit inside at least one
+    # resolved root (roots may be symlinked, so resolve them here too).
+    for raw_root in module_source_roots:
+        try:
+            root = Path(raw_root).resolve()
+        except OSError:
+            continue
+        if path == root or root in path.parents:
+            if not path.is_file():
+                raise SourceTreeError(f"module source file not found: {raw}")
+            return path
+
+    allowed_str = ", ".join(str(r) for r in module_source_roots)
+    raise SourceTreeError(
+        f"module source path {raw!r} is outside the allowed module source roots "
+        f"({allowed_str}); only source files co-located with debug_symbol_paths are permitted"
+    )

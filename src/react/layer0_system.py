@@ -540,7 +540,10 @@ line is the vmlinux path) as `kver`, and
 a tree whose version differs is rejected instead of silently answering.
 
 - **source_status**: which tree is configured, its version, and whether git is
-  available. Call it before the first source lookup of a run.
+  available. Call it before the first source lookup of a run. It may also list
+  `module_source_roots`: third-party module source under those directories is
+  readable with `read_source` even when no kernel tree is configured — use the
+  absolute path exactly as `dis -s` printed it.
 - **read_source(file, kver, line, context)**: numbered source around a
   file:line printed by `dis -s`. Emits a `SOURCE_REF:` line.
 - **grep_source(pattern, kver, max_hits, prefix)**: locate a condition, macro,
@@ -563,8 +566,8 @@ Calling convention:
 
 - Never wrap these tools in `run_script`, and never encode them as tokenized
   crash arguments; `parameters` carries the named arguments the tool needs.
-- `source_status` takes no parameters. Call it once before the first source
-  lookup of a run.
+- `source_status` takes no model-chosen parameters. Call it once before the
+  first source lookup of a run.
 - After a `read_source` / `grep_source` / `list_writers` result, cite the
   `SOURCE_REF` it printed.
 

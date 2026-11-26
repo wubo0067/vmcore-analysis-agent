@@ -645,5 +645,252 @@ class EvidenceHookTests(unittest.TestCase):
         )
 
 
+class ModuleSourceTests(unittest.TestCase):
+    """Tests for reading third-party module source via absolute paths."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        # Simulate a module source directory (like simulate-crash/rcu_stall/)
+        self.mod_dir = self.base / "simulate-crash" / "rcu_stall"
+        self.mod_dir.mkdir(parents=True, exist_ok=True)
+        self.mod_source = self.mod_dir / "rcu_stall_mod.c"
+        self.mod_source.write_text(
+            "\n".join([
+                "#include <linux/module.h>",
+                "#include <linux/kthread.h>",
+                "",
+                "static int rcu_stall_thread(void *data)",
+                "{",
+                "    rcu_read_lock();",
+                "    schedule_timeout_interruptible(msecs_to_jiffies(70000));",
+                "    rcu_read_unlock();",
+                "    return 0;",
+                "}",
+                "",
+                "MODULE_LICENSE(\"GPL\");",
+            ]),
+            encoding="utf-8",
+        )
+        self.mod_ko = self.mod_dir / "rcu_stall_mod.ko"
+        self.mod_ko.write_bytes(b"\x7fELF")  # dummy .ko file
+        self.mod_ko_debug = self.mod_dir / "rcu_stall_mod.ko.debug"
+        self.mod_ko_debug.write_bytes(b"\x7fELF")
+
+    def test_read_module_source_with_allowed_root(self) -> None:
+        """Absolute path works when it falls inside module_source_roots."""
+        output = tools.read_source_impl(
+            str(self.mod_source),
+            module_source_roots=[str(self.mod_dir)],
+        )
+        self.assertIn("[module-source]", output)
+        self.assertIn("SOURCE_REF:", output)
+        self.assertIn("rcu_read_lock", output)
+        self.assertIn("third-party module source", output)
+
+    def test_read_module_source_with_line_number(self) -> None:
+        """Can read around a specific line in module source."""
+        output = tools.read_source_impl(
+            str(self.mod_source),
+            line=6,
+            context=2,
+            module_source_roots=[str(self.mod_dir)],
+        )
+        self.assertIn("SOURCE_REF: rcu_stall/rcu_stall_mod.c:6", output)
+        self.assertIn("rcu_read_lock", output)
+
+    def test_read_module_source_rejects_path_outside_roots(self) -> None:
+        """Absolute path outside the allowed roots is rejected."""
+        other_dir = self.base / "other"
+        other_dir.mkdir()
+        output = tools.read_source_impl(
+            str(self.mod_source),
+            module_source_roots=[str(other_dir)],
+        )
+        self.assertIn("SOURCE_ERROR", output)
+        self.assertIn("outside the allowed module source roots", output)
+
+    def test_read_module_source_rejects_non_source_file(self) -> None:
+        """Non-source file extensions are rejected even inside allowed roots."""
+        output = tools.read_source_impl(
+            str(self.mod_ko),
+            module_source_roots=[str(self.mod_dir)],
+        )
+        self.assertIn("SOURCE_ERROR", output)
+        self.assertIn("source file", output)
+
+    def test_read_module_source_rejects_path_traversal(self) -> None:
+        """Path traversal with .. is caught by resolve()."""
+        sneaky = str(self.mod_dir / ".." / ".." / "etc" / "passwd")
+        output = tools.read_source_impl(
+            sneaky,
+            module_source_roots=[str(self.mod_dir)],
+        )
+        self.assertIn("SOURCE_ERROR", output)
+
+    def test_absolute_path_without_module_roots_still_rejected(self) -> None:
+        """When no module_source_roots are configured, absolute paths are rejected."""
+        output = tools.read_source_impl(str(self.mod_source))
+        self.assertIn("SOURCE_ERROR", output)
+
+    def test_derive_module_source_roots_from_ko_paths(self) -> None:
+        """derive_module_source_roots produces only the immediate parent dir."""
+        from src.mcp_tools.kernel_source.resolver import derive_module_source_roots
+
+        roots = derive_module_source_roots([str(self.mod_ko)])
+        root_set = {r.resolve() for r in roots}
+        self.assertIn(self.mod_dir.resolve(), root_set)
+        self.assertNotIn(self.mod_dir.parent.resolve(), root_set)
+        self.assertEqual(len(roots), 1)
+
+    def test_derive_module_source_roots_deduplicates(self) -> None:
+        """Multiple .ko files in the same directory produce deduplicated roots."""
+        from src.mcp_tools.kernel_source.resolver import derive_module_source_roots
+
+        roots = derive_module_source_roots([
+            str(self.mod_ko),
+            str(self.mod_ko_debug),
+        ])
+        # Same dir, so roots should be deduplicated to a single parent.
+        self.assertEqual(len(roots), 1)
+
+    def test_build_tool_payload_injects_module_source_roots(self) -> None:
+        """build_tool_payload auto-injects module_source_roots for read_source."""
+        from src.mcp_tools.kernel_source.client import build_tool_payload
+
+        payload = build_tool_payload(
+            "read_source",
+            {"file": "/some/abs/path/mod.c", "line": 10},
+            {"debug_symbol_paths": [str(self.mod_ko)]},
+        )
+        self.assertIn("module_source_roots", payload)
+        self.assertIn(str(self.mod_dir.resolve()), payload["module_source_roots"])
+
+    def test_build_tool_payload_injects_module_source_roots_for_source_status(self) -> None:
+        """source_status also receives module roots so it can advertise them."""
+        from src.mcp_tools.kernel_source.client import build_tool_payload
+
+        payload = build_tool_payload(
+            "source_status",
+            {},
+            {"debug_symbol_paths": [str(self.mod_ko)]},
+        )
+        self.assertIn("module_source_roots", payload)
+        self.assertIn(str(self.mod_dir.resolve()), payload["module_source_roots"])
+
+    def test_build_tool_payload_does_not_inject_for_grep(self) -> None:
+        """module_source_roots is only injected for read_source, not other tools."""
+        from src.mcp_tools.kernel_source.client import build_tool_payload
+
+        payload = build_tool_payload(
+            "grep_source",
+            {"pattern": "rcu_read_lock"},
+            {"debug_symbol_paths": [str(self.mod_ko)]},
+        )
+        self.assertNotIn("module_source_roots", payload)
+
+    def test_model_cannot_inject_module_source_roots(self) -> None:
+        """Model-supplied module_source_roots is stripped by build_tool_payload."""
+        from src.mcp_tools.kernel_source.client import build_tool_payload
+
+        payload = build_tool_payload(
+            "read_source",
+            {"file": "a.c", "module_source_roots": "/evil/path"},
+            {},
+        )
+        self.assertNotIn("module_source_roots", payload)
+
+    def test_read_module_source_with_colon_line_suffix(self) -> None:
+        """Accept crash's 'file:line' format for module source."""
+        output = tools.read_source_impl(
+            f"{self.mod_source}:6",
+            module_source_roots=[str(self.mod_dir)],
+        )
+        self.assertIn("SOURCE_REF: rcu_stall/rcu_stall_mod.c:6", output)
+
+    def test_source_status_lists_module_roots_when_kernel_tree_missing(self) -> None:
+        """Without a kernel tree but with module roots, source_status points at them."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            output = tools.source_status_impl(
+                source_root="", module_source_roots=[str(self.mod_dir)]
+            )
+        self.assertIn("SOURCE_STATUS configured=false", output)
+        self.assertIn("module_source_roots=", output)
+        self.assertIn(str(self.mod_dir), output)
+        self.assertIn("read_source", output)
+
+    def test_source_status_lists_module_roots_when_tree_configured(self) -> None:
+        """With a kernel tree and module roots, source_status shows both."""
+        tree_base = self.base / "tree"
+        tree_base.mkdir()
+        _write_tree(tree_base)
+        with mock.patch.dict(
+            os.environ,
+            {"KERNEL_SOURCE_ROOT": str(tree_base)},
+        ):
+            output = tools.source_status_impl(
+                source_root=str(tree_base),
+                module_source_roots=[str(self.mod_dir)],
+            )
+        self.assertIn("SOURCE_STATUS configured=true", output)
+        self.assertIn("module_source_roots=", output)
+
+    def test_absolute_path_without_module_roots_gets_debug_symbols_hint(self) -> None:
+        """The rejection explains the --debug-symbols requirement."""
+        output = tools.read_source_impl(str(self.mod_source))
+        self.assertIn("SOURCE_ERROR", output)
+        self.assertIn("--debug-symbols", output)
+
+    def test_whitespace_only_module_roots_falls_back_to_hint(self) -> None:
+        """Empty-string roots don't enter the module branch; hint still fires."""
+        output = tools.read_source_impl(
+            str(self.mod_source), module_source_roots=[""]
+        )
+        self.assertIn("SOURCE_ERROR", output)
+        self.assertIn("--debug-symbols", output)
+
+    def test_server_read_source_wrapper_deserializes_module_roots(self) -> None:
+        """The FastMCP server wrapper parses the comma-joined root string."""
+        from src.mcp_tools.kernel_source import server
+
+        # @kernel_source_server.tool() wraps functions as FunctionTool; the
+        # underlying callable is exposed as `.fn`. Guard with getattr so the
+        # test works whether or not the decorator rewrote the function.
+        read_source = getattr(server.read_source, "fn", server.read_source)
+        output = read_source(
+            file=str(self.mod_source),
+            module_source_roots=str(self.mod_dir),
+        )
+        self.assertIn("[module-source]", output)
+        self.assertIn("SOURCE_REF: rcu_stall/rcu_stall_mod.c", output)
+
+    def test_server_source_status_wrapper_deserializes_module_roots(self) -> None:
+        """The FastMCP source_status wrapper accepts the joined root string."""
+        from src.mcp_tools.kernel_source import server
+
+        status_fn = getattr(server.source_status, "fn", server.source_status)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            output = status_fn(module_source_roots=str(self.mod_dir))
+        self.assertIn("module_source_roots=", output)
+        self.assertIn(str(self.mod_dir), output)
+
+    def test_resolve_module_source_file_accepts_symlinked_root(self) -> None:
+        """A symlinked root still admits resolved paths inside it."""
+        if os.name == "nt":
+            # Creating symlinks on Windows requires elevated privileges.
+            self.skipTest("symlink creation requires privileges on Windows")
+        from src.mcp_tools.kernel_source.resolver import resolve_module_source_file
+
+        link_dir = self.base / "link-to-module"
+        if link_dir.exists() or link_dir.is_symlink():
+            link_dir.unlink()
+        link_dir.symlink_to(self.mod_dir)
+        path = resolve_module_source_file(
+            str(self.mod_source), [link_dir]
+        )
+        self.assertEqual(path, self.mod_source.resolve())
+
+
 if __name__ == "__main__":
     unittest.main()

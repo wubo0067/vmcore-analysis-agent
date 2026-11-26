@@ -20,7 +20,9 @@ from .resolver import (
     ENV_VAR,
     SourceTree,
     SourceTreeError,
+    derive_module_source_roots,
     relative_name,
+    resolve_module_source_file,
     resolve_relative_file,
     resolve_tree,
 )
@@ -105,6 +107,11 @@ def _trim(text: str, limit: int = 200) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def _is_absolute_path(path: str) -> bool:
+    """True for ``/foo/bar`` and ``C:/foo/bar`` (DWARF embeds both forms)."""
+    return path.startswith("/") or re.match(r"^[A-Za-z]:/", path) is not None
+
+
 def _split_file_line(file: str) -> tuple[str, int]:
     """Accept the ``path:line`` form that crash prints in ``dis -s`` output."""
 
@@ -115,7 +122,21 @@ def _split_file_line(file: str) -> tuple[str, int]:
     return raw, 0
 
 
-def _not_configured() -> str:
+def _not_configured(module_source_roots: list[str] | None = None) -> str:
+    roots = [r for r in (module_source_roots or []) if r]
+    if roots:
+        return (
+            "SOURCE_STATUS configured=false\n"
+            "reason=no source root was supplied (--kernel-source-root) and "
+            f"{ENV_VAR} is not set; kernel source could not be verified for this "
+            "dump\n"
+            "module_source_roots=" + ",".join(roots) + "\n"
+            "guidance=Kernel tree source is unavailable, but third-party module "
+            "source files (e.g. from `dis -s` output) under the listed "
+            "module_source_roots CAN be read with read_source using their "
+            "absolute paths. State clearly whether a snippet is module source or "
+            "kernel source."
+        )
     return (
         "SOURCE_STATUS configured=false\n"
         f"reason=no source root was supplied (--kernel-source-root) and {ENV_VAR} is "
@@ -130,13 +151,15 @@ def _not_configured() -> str:
 # ---------------------------------------------------------------------------
 
 
-def source_status_impl(source_root: str = "") -> str:
+def source_status_impl(
+    source_root: str = "", module_source_roots: list[str] | None = None
+) -> str:
     try:
         tree = resolve_tree(requested_root=source_root)
     except SourceTreeError as exc:
         message = str(exc)
         if message.startswith("no kernel source tree"):
-            return _not_configured()
+            return _not_configured(module_source_roots)
         return f"SOURCE_STATUS configured=true\nerror={message}"
 
     lines = [
@@ -146,6 +169,9 @@ def source_status_impl(source_root: str = "") -> str:
         f"git={str(tree.has_git).lower()}",
         f"root={tree.root}",
     ]
+    roots = [r for r in (module_source_roots or []) if r]
+    if roots:
+        lines.append("module_source_roots=" + ",".join(roots))
     if tree.note:
         lines.append(f"note={tree.note}")
     lines.append(
@@ -344,16 +370,126 @@ def _resolve_referenced_macros(
     return [resolved[name] for name in candidates if name in resolved][:8]
 
 
+def _compute_line_window(total: int, line: int, context: int) -> tuple[int, int]:
+    """Return the ``(start, end)`` 1-based line window for a snippet."""
+
+    span = max(0, min(int(context or 20), 80))
+    if line == 0:
+        return 1, min(total, min(2 * span + 1, MAX_LINES_PER_READ))
+    start = max(1, line - span)
+    end = min(total, line + span)
+    if end - start + 1 > MAX_LINES_PER_READ:
+        end = start + MAX_LINES_PER_READ - 1
+    return start, end
+
+
+def _render_source_snippet(
+    lines: list[str],
+    line: int,
+    context: int,
+    display_name: str,
+    header_prefix: str = "",
+    note: str = "",
+    footer: str = "",
+) -> str:
+    """Render a numbered source snippet shared by kernel-tree and module reads.
+
+    ``display_name`` is used in error messages and the SOURCE_REF (include one
+    parent directory when ambiguity is possible, e.g. ``rcu_stall/mod.c``).
+    ``footer`` is appended to the body before the single output-size
+    truncation, so it is never double-truncated or orphaned after
+    ``[truncated]``.
+    """
+
+    total = len(lines)
+    if total == 0:
+        return f"SOURCE_ERROR empty file: {display_name}"
+
+    line = max(0, int(line or 0))
+    if line > total:
+        return (
+            f"SOURCE_ERROR line {line} is outside {display_name} (1..{total}); "
+            "dis -s may have been resolved against a different build"
+        )
+
+    start, end = _compute_line_window(total, line, context)
+
+    anchor = line if line > 0 else start
+    body = "\n".join(
+        f"{number:6d}| {lines[number - 1]}" for number in range(start, end + 1)
+    )
+    header = (
+        f"{header_prefix}"
+        f"file={display_name} lines={start}-{end}/{total}\n"
+        f"SOURCE_REF: {display_name}:{anchor}\n"
+        f"{note}"
+    )
+    output = f"{header}{body}{footer}"
+    if len(output) > MAX_OUTPUT_CHARS:
+        output = output[:MAX_OUTPUT_CHARS] + "\n[truncated]"
+    return output
+
+
 def read_source_impl(
     file: str,
     kver: str = "",
     line: int = 0,
     context: int = 20,
     source_root: str = "",
+    module_source_roots: list[str] | None = None,
 ) -> str:
     file, line_hint = _split_file_line(file)
     line = int(line or 0) or line_hint
 
+    # --- Module source fallback for absolute paths ---
+    # Third-party .ko modules compiled from an external source tree embed
+    # absolute build paths in DWARF.  ``dis -s`` prints those paths verbatim,
+    # and the agent passes them here.  When the path is absolute *and* falls
+    # inside one of the allowed module_source_roots (derived from
+    # debug_symbol_paths), we read it directly instead of going through the
+    # kernel tree resolver.
+    raw_file = str(file or "").strip().strip("'\"").replace("\\", "/")
+    roots = [Path(r) for r in (module_source_roots or []) if r]
+    if _is_absolute_path(raw_file) and roots:
+        try:
+            path = resolve_module_source_file(raw_file, roots)
+            raw = path.read_bytes()
+        except SourceTreeError as exc:
+            return f"SOURCE_ERROR {exc}"
+        except OSError as exc:
+            return f"SOURCE_ERROR cannot read module source {raw_file!r}: {exc}"
+
+        if not _is_probably_text(raw):
+            display = (
+                f"{path.parent.name}/{path.name}" if path.parent.name else path.name
+            )
+            return f"SOURCE_ERROR not a text source file: {display}"
+
+        lines = raw.decode("utf-8", errors="replace").splitlines()
+        # Keep one parent directory in the ref to disambiguate same-named files
+        # across modules (main.c / core.c are common).
+        display = (
+            f"{path.parent.name}/{path.name}" if path.parent.name else path.name
+        )
+        return _render_source_snippet(
+            lines,
+            line,
+            context,
+            display,
+            header_prefix=f"[module-source] path={raw_file}\n",
+            note="note=this is third-party module source (not from the kernel tree)\n",
+        )
+
+    if _is_absolute_path(raw_file) and not roots:
+        # dis -s prints absolute paths for third-party module DWARF info.
+        # Point the caller at the runtime flag that whitelists those files.
+        return (
+            f"SOURCE_ERROR absolute paths are only readable for module source "
+            f"files co-located with a --debug-symbols .ko; "
+            f"no debug symbol paths were provided for this request: {raw_file!r}"
+        )
+
+    # --- Standard kernel-tree path resolution ---
     tree, error = _tree_or_error(kver, source_root)
     if tree is None:
         return f"SOURCE_ERROR {error}"
@@ -370,48 +506,29 @@ def read_source_impl(
         return f"SOURCE_ERROR not a text source file: {relative_name(tree, path)}"
 
     lines = raw.decode("utf-8", errors="replace").splitlines()
-    total = len(lines)
-    if total == 0:
-        return f"SOURCE_ERROR empty file: {relative_name(tree, path)}"
-
-    line = max(0, int(line or 0))
     rel = relative_name(tree, path)
-    if line > total:
-        return (
-            f"SOURCE_ERROR line {line} is outside {rel} (1..{total}); "
-            "dis -s may have been resolved against a different build"
-        )
 
-    span = max(0, min(int(context or 20), 80))
-    if line == 0:
-        start = 1
-        end = min(total, min(2 * span + 1, MAX_LINES_PER_READ))
-    else:
-        start = max(1, line - span)
-        end = min(total, line + span)
-        if end - start + 1 > MAX_LINES_PER_READ:
-            end = start + MAX_LINES_PER_READ - 1
-
-    anchor = line if line > 0 else start
+    # Compute the window once; shared by the snippet renderer and macro
+    # resolution so the two can never disagree.
+    total = len(lines)
+    start, end = _compute_line_window(total, max(0, int(line or 0)), context)
     snippet_slice = lines[start - 1 : end]
-    body = "\n".join(
-        f"{number:6d}| {lines[number - 1]}" for number in range(start, end + 1)
-    )
     macro_defs = _resolve_referenced_macros(tree, path, lines, snippet_slice)
     macro_footer = (
         "\n[macro-constants]\n" + "\n".join(f"- {item}" for item in macro_defs)
         if macro_defs
         else ""
     )
-    header = (
-        f"{_status_block(tree)}\n"
-        f"file={rel} lines={start}-{end}/{total}\n"
-        f"SOURCE_REF: {rel}:{anchor}\n"
+
+    snippet = _render_source_snippet(
+        lines,
+        line,
+        context,
+        rel,
+        header_prefix=f"{_status_block(tree)}\n",
+        footer=macro_footer,
     )
-    output = f"{header}{body}{macro_footer}"
-    if len(output) > MAX_OUTPUT_CHARS:
-        output = output[:MAX_OUTPUT_CHARS] + "\n[truncated]"
-    return output
+    return snippet
 
 
 def grep_source_impl(

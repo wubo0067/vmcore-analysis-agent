@@ -105,6 +105,8 @@ def build_tool_payload(
     for key, value in raw_args.items():
         if key == "source_root":
             continue  # runtime-owned; never let the model choose a path
+        if key == "module_source_roots":
+            continue  # runtime-owned; derived from debug_symbol_paths
         if value is None:
             continue
         if isinstance(value, str) and not value.strip():
@@ -119,6 +121,19 @@ def build_tool_payload(
     source_root = str(state.get("kernel_source_root") or "").strip()
     if source_root:
         payload["source_root"] = source_root
+
+    # Inject module source roots derived from debug_symbol_paths.
+    # These allow read_source to handle absolute paths from third-party module
+    # DWARF info (dis -s prints the compile-time source path of .ko modules).
+    # The model never controls these paths: they come from the analysis request.
+    debug_symbol_paths = state.get("debug_symbol_paths")
+    if debug_symbol_paths and tool_name in ("read_source", "source_status"):
+        from .resolver import derive_module_source_roots
+
+        roots = derive_module_source_roots(list(debug_symbol_paths))
+        if roots:
+            payload["module_source_roots"] = ",".join(str(r) for r in roots)
+
     return payload
 
 
