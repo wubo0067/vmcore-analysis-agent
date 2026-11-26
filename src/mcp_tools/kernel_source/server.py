@@ -63,10 +63,12 @@ def read_source(
     kver: str = "",
     line: int = 0,
     context: int = 20,
+    start_line: int = 0,
+    end_line: int = 0,
     source_root: str = "",
     module_source_roots: str = "",
 ) -> str:
-    """Read numbered kernel source around a file:line.
+    """Read numbered kernel or module source around a file:line or explicit line range.
 
     Args:
         file: Path as printed by `dis -s`, relative to the kernel tree root
@@ -74,13 +76,18 @@ def read_source(
             debug_symbol_paths entry). A trailing ":<line>" is accepted.
         kver: Kernel release from `sys` (`RELEASE:`; the `KERNEL:` line is the vmlinux
             path). A tree from a different release is rejected.
-        line: Center line. 0 reads the beginning of the file.
-        context: Lines before and after `line` (max 80).
+        line: Center line. 0 reads the beginning of the file. Ignored when
+            `start_line` or `end_line` is set.
+        context: Lines before and after `line` (max 100; total capped at 200 lines).
+        start_line: Optional 1-based start line for sequential range reads (avoids overlap).
+        end_line: Optional 1-based end line (inclusive; capped at start_line + 199).
         source_root: Injected by the runtime; do not set it yourself.
         module_source_roots: Injected by the runtime; do not set it yourself.
 
-    The output starts with a SOURCE_REF line; quote that SOURCE_REF when citing
-    the code in the analysis.
+    The output header includes `lines=start-end/total` and a `SOURCE_REF: file:line`
+    window anchor. When citing specific statements in your analysis, cite the EXACT
+    evidence line number(s) from the numbered listing (e.g. `file.c:228,240`), not
+    the window center line.
     """
 
     # module_source_roots arrives as a comma-separated string from the payload.
@@ -90,8 +97,14 @@ def read_source(
         else None
     )
     return read_source_impl(
-        file=file, kver=kver, line=line, context=context,
-        source_root=source_root, module_source_roots=parsed_roots,
+        file=file,
+        kver=kver,
+        line=line,
+        context=context,
+        start_line=start_line,
+        end_line=end_line,
+        source_root=source_root,
+        module_source_roots=parsed_roots,
     )
 
 
@@ -102,20 +115,29 @@ def grep_source(
     max_hits: int = 25,
     prefix: str = "",
     source_root: str = "",
+    module_source_roots: str = "",
 ) -> str:
-    """Search kernel source for a regex and return file:line matches.
+    """Search kernel or third-party module source for a regex and return file:line matches.
 
     Use it to locate the condition, macro, or call site named in reasoning.
-    `prefix` narrows the search to a subtree such as drivers/net.
-    `source_root` is injected by the runtime; do not set it yourself.
+    `prefix` narrows the search to a kernel subtree (e.g. `kernel/rcu` or `drivers/net`),
+    a specific file, or an absolute path under `module_source_roots`. An invalid `prefix`
+    returns SOURCE_ERROR instead of silently scanning the entire kernel tree.
+    `source_root` and `module_source_roots` are injected by the runtime; do not set them yourself.
     """
 
+    parsed_roots = (
+        [r.strip() for r in module_source_roots.split(",") if r.strip()]
+        if module_source_roots
+        else None
+    )
     return grep_source_impl(
         pattern=pattern,
         kver=kver,
         max_hits=max_hits,
         prefix=prefix,
         source_root=source_root,
+        module_source_roots=parsed_roots,
     )
 
 

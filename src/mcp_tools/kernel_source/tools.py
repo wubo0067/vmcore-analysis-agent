@@ -27,7 +27,7 @@ from .resolver import (
     resolve_tree,
 )
 
-MAX_LINES_PER_READ = 160
+MAX_LINES_PER_READ = 200
 MAX_OUTPUT_CHARS = 14_000
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_SCANNED_FILES = 40_000
@@ -68,6 +68,14 @@ def _iter_source_files(tree: SourceTree, prefix: str) -> Iterator[Path]:
     if prefix:
         candidate = (tree.root / prefix.replace("\\", "/")).resolve()
         if candidate == tree.root or tree.root in candidate.parents:
+            if candidate.is_file():
+                if candidate.suffix in _SOURCE_SUFFIXES:
+                    try:
+                        if candidate.stat().st_size <= MAX_FILE_BYTES:
+                            yield candidate
+                    except OSError:
+                        pass
+                return
             start = candidate if candidate.is_dir() else candidate.parent
 
     scanned = 0
@@ -370,14 +378,38 @@ def _resolve_referenced_macros(
     return [resolved[name] for name in candidates if name in resolved][:8]
 
 
-def _compute_line_window(total: int, line: int, context: int) -> tuple[int, int]:
+def _compute_line_window(
+    total: int,
+    line: int,
+    context: int,
+    start_line: int = 0,
+    end_line: int = 0,
+) -> tuple[int, int]:
     """Return the ``(start, end)`` 1-based line window for a snippet."""
 
-    span = max(0, min(int(context or 20), 80))
+    s_req = max(0, int(start_line or 0))
+    e_req = max(0, int(end_line or 0))
+    if s_req > 0 or e_req > 0:
+        start = max(1, min(total, s_req or 1))
+        end = min(total, e_req if e_req > 0 else start + MAX_LINES_PER_READ - 1)
+        if end < start:
+            end = start
+        if end - start + 1 > MAX_LINES_PER_READ:
+            end = start + MAX_LINES_PER_READ - 1
+        return start, end
+
+    span = max(0, min(int(context or 20), 100))
+    target_len = min(total, min(2 * span + 1, MAX_LINES_PER_READ))
     if line == 0:
-        return 1, min(total, min(2 * span + 1, MAX_LINES_PER_READ))
+        return 1, target_len
     start = max(1, line - span)
     end = min(total, line + span)
+    # 触及文件首尾边界时，将未用完的上下文配额补向另一侧，避免 `line=1, context=80` 只返回 81 行
+    if end - start + 1 < target_len:
+        if start == 1:
+            end = min(total, start + target_len - 1)
+        elif end == total:
+            start = max(1, end - target_len + 1)
     if end - start + 1 > MAX_LINES_PER_READ:
         end = start + MAX_LINES_PER_READ - 1
     return start, end
@@ -391,6 +423,8 @@ def _render_source_snippet(
     header_prefix: str = "",
     note: str = "",
     footer: str = "",
+    start_line: int = 0,
+    end_line: int = 0,
 ) -> str:
     """Render a numbered source snippet shared by kernel-tree and module reads.
 
@@ -406,15 +440,24 @@ def _render_source_snippet(
         return f"SOURCE_ERROR empty file: {display_name}"
 
     line = max(0, int(line or 0))
-    if line > total:
+    s_req = max(0, int(start_line or 0))
+    if s_req > total:
+        return f"SOURCE_ERROR start_line {s_req} is outside {display_name} (1..{total})"
+    if s_req == 0 and line > total:
         return (
             f"SOURCE_ERROR line {line} is outside {display_name} (1..{total}); "
             "dis -s may have been resolved against a different build"
         )
 
-    start, end = _compute_line_window(total, line, context)
+    start, end = _compute_line_window(total, line, context, start_line=start_line, end_line=end_line)
 
-    anchor = line if line > 0 else start
+    e_req = max(0, int(end_line or 0))
+    clamp_note = (
+        f"note=requested end_line {e_req} clamped to EOF ({total})\n"
+        if e_req > total
+        else ""
+    )
+    anchor = start if (s_req > 0 or e_req > 0) else (line if line > 0 else start)
     body = "\n".join(
         f"{number:6d}| {lines[number - 1]}" for number in range(start, end + 1)
     )
@@ -422,7 +465,7 @@ def _render_source_snippet(
         f"{header_prefix}"
         f"file={display_name} lines={start}-{end}/{total}\n"
         f"SOURCE_REF: {display_name}:{anchor}\n"
-        f"{note}"
+        f"{note}{clamp_note}"
     )
     output = f"{header}{body}{footer}"
     if len(output) > MAX_OUTPUT_CHARS:
@@ -437,6 +480,8 @@ def read_source_impl(
     context: int = 20,
     source_root: str = "",
     module_source_roots: list[str] | None = None,
+    start_line: int = 0,
+    end_line: int = 0,
 ) -> str:
     file, line_hint = _split_file_line(file)
     line = int(line or 0) or line_hint
@@ -478,6 +523,8 @@ def read_source_impl(
             display,
             header_prefix=f"[module-source] path={raw_file}\n",
             note="note=this is third-party module source (not from the kernel tree)\n",
+            start_line=start_line,
+            end_line=end_line,
         )
 
     if _is_absolute_path(raw_file) and not roots:
@@ -511,7 +558,13 @@ def read_source_impl(
     # Compute the window once; shared by the snippet renderer and macro
     # resolution so the two can never disagree.
     total = len(lines)
-    start, end = _compute_line_window(total, max(0, int(line or 0)), context)
+    start, end = _compute_line_window(
+        total,
+        max(0, int(line or 0)),
+        context,
+        start_line=start_line,
+        end_line=end_line,
+    )
     snippet_slice = lines[start - 1 : end]
     macro_defs = _resolve_referenced_macros(tree, path, lines, snippet_slice)
     macro_footer = (
@@ -527,8 +580,76 @@ def read_source_impl(
         rel,
         header_prefix=f"{_status_block(tree)}\n",
         footer=macro_footer,
+        start_line=start_line,
+        end_line=end_line,
     )
     return snippet
+
+
+def _resolve_module_grep_target(
+    raw_prefix: str, module_roots: list[Path]
+) -> tuple[Optional[Path], Optional[Path]]:
+    """Resolve a grep `prefix` targeting a third-party module directory or file."""
+    norm = raw_prefix.strip().strip("'\"").replace("\\", "/")
+    if not norm or not module_roots:
+        return None, None
+    resolved_roots: list[Path] = []
+    for r in module_roots:
+        try:
+            resolved_roots.append(r.resolve())
+        except OSError:
+            continue
+
+    candidates: list[Path] = []
+    if _is_absolute_path(norm):
+        try:
+            candidates.append(Path(norm).resolve())
+        except OSError:
+            return None, None
+    else:
+        for root in resolved_roots:
+            # Match `<root_name>` or `<root_name>/<file>` or `<file>` directly under module root
+            if norm == root.name:
+                candidates.append(root)
+            elif norm.startswith(root.name + "/"):
+                candidates.append((root / norm[len(root.name) + 1 :]).resolve())
+            else:
+                cand = (root / norm).resolve()
+                if cand.exists():
+                    candidates.append(cand)
+
+    for cand in candidates:
+        for root in resolved_roots:
+            if (cand == root or root in cand.parents) and cand.exists():
+                return cand, root
+    return None, None
+
+
+def _iter_module_source_files(target: Path, root: Path) -> Iterator[Path]:
+    if target.is_file():
+        if target.suffix in _SOURCE_SUFFIXES:
+            try:
+                if target.stat().st_size <= MAX_FILE_BYTES:
+                    yield target
+            except OSError:
+                pass
+        return
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(target):
+        dirnames[:] = sorted(d for d in dirnames if d not in {".git", ".tmp_versions"})
+        for filename in sorted(filenames):
+            if Path(filename).suffix not in _SOURCE_SUFFIXES:
+                continue
+            path = Path(dirpath) / filename
+            try:
+                if path.stat().st_size > MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
+            scanned += 1
+            if scanned > 200:
+                return
+            yield path
 
 
 def grep_source_impl(
@@ -537,14 +658,11 @@ def grep_source_impl(
     max_hits: int = 25,
     prefix: str = "",
     source_root: str = "",
+    module_source_roots: list[str] | None = None,
 ) -> str:
     pattern = str(pattern or "").strip()
     if not pattern:
         return "SOURCE_ERROR pattern is required"
-
-    tree, error = _tree_or_error(kver, source_root)
-    if tree is None:
-        return f"SOURCE_ERROR {error}"
 
     try:
         regex = re.compile(pattern)
@@ -552,9 +670,73 @@ def grep_source_impl(
         regex = re.compile(re.escape(pattern))
 
     limit = max(1, min(int(max_hits or 25), 80))
-    hits: list[str] = []
+    raw_prefix = str(prefix or "").strip().strip("'\"").replace("\\", "/")
+    mod_roots = [Path(r) for r in (module_source_roots or []) if r]
+
+    # 1. Check whether `prefix` targets an allowed third-party module source root/file
+    if raw_prefix and mod_roots:
+        mod_target, mod_root = _resolve_module_grep_target(raw_prefix, mod_roots)
+        if mod_target is not None and mod_root is not None:
+            hits: list[str] = []
+            truncated = False
+            for path in _iter_module_source_files(mod_target, mod_root):
+                try:
+                    raw = path.read_bytes()
+                except OSError:
+                    continue
+                if not _is_probably_text(raw):
+                    continue
+                display = (
+                    f"{path.parent.name}/{path.name}" if path.parent.name else path.name
+                )
+                text = raw.decode("utf-8", errors="replace")
+                for number, line in enumerate(text.splitlines(), start=1):
+                    if regex.search(line) is None:
+                        continue
+                    hits.append(f"{display}:{number}: {_trim(line)}")
+                    if len(hits) >= limit:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+            header = (
+                f"[module-source] root={mod_root}\n"
+                f"SOURCE_GREP pattern={pattern} prefix={raw_prefix} hits={len(hits)} "
+                f"truncated={str(truncated).lower()}"
+            )
+            return "\n".join([header, *hits]) if hits else f"{header}\n(no match)"
+        if _is_absolute_path(raw_prefix):
+            allowed_str = ", ".join(str(r) for r in mod_roots)
+            return (
+                f"SOURCE_ERROR prefix {raw_prefix!r} is outside allowed module_source_roots "
+                f"({allowed_str}) and cannot be searched"
+            )
+
+    if raw_prefix and _is_absolute_path(raw_prefix):
+        return (
+            f"SOURCE_ERROR absolute prefix {raw_prefix!r} is not valid for kernel tree search; "
+            "use a relative kernel path (e.g. 'kernel/rcu') or provide module debug_symbol_paths"
+        )
+
+    tree, error = _tree_or_error(kver, source_root)
+    if tree is None:
+        return f"SOURCE_ERROR {error}"
+
+    # Validate explicit kernel-tree prefix instead of silently falling back to full-tree scan
+    if raw_prefix:
+        try:
+            candidate = (tree.root / raw_prefix).resolve()
+        except OSError:
+            return f"SOURCE_ERROR invalid prefix: {raw_prefix!r}"
+        if not (candidate == tree.root or tree.root in candidate.parents) or not candidate.exists():
+            return (
+                f"SOURCE_ERROR prefix {raw_prefix!r} not found under kernel source tree {tree.root}; "
+                "pass a valid relative kernel path (e.g. 'kernel/rcu') or an absolute path under module_source_roots"
+            )
+
+    hits = []
     truncated = False
-    for path in _iter_source_files(tree, prefix):
+    for path in _iter_source_files(tree, raw_prefix):
         try:
             raw = path.read_bytes()
         except OSError:

@@ -80,6 +80,20 @@ _GDB_NAMED_SCALAR_RE = re.compile(
     r"(?P<name>rcu_cpu_stall_timeout|sysctl_panic_on_rcu_stall|jiffies)\s*=\s*\$\d+\s*=\s*(?P<val>-?(?:0x)?[0-9a-fA-F]+)"
 )
 _GDB_SCALAR_LINE_RE = re.compile(r"^\s*\$\d+\s*=\s*(?P<val>-?(?:0x)?[0-9a-fA-F]+)\s*$")
+_GDB_PTR_OR_SCALAR_LINE_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_.\[\]]*\s*=\s*)?\$\d+\s*=\s*(?:\([^)]+\)\s*)?(?P<val>-?(?:0x)?[0-9a-fA-F]+)(?:\s+<[^>]+>)?\s*$"
+)
+_RCU_GP_STATE_NAMES: dict[int, str] = {
+    0: "RCU_GP_IDLE",
+    1: "RCU_GP_WAIT_GPS",
+    2: "RCU_GP_DONE_GPS",
+    3: "RCU_GP_ONOFF",
+    4: "RCU_GP_INIT",
+    5: "RCU_GP_WAIT_FQS",
+    6: "RCU_GP_DOING_FQS",
+    7: "RCU_GP_CLEANUP",
+    8: "RCU_GP_CLEANED",
+}
 _HEX_RE = re.compile(r"^(?:0x)?[0-9a-fA-F]+$")
 
 # 等待原语分类关键字
@@ -744,6 +758,10 @@ def _parse_tagged_scalar_blocks(text: str, tag_prefix: str = "===RCU_FIELD:") ->
             if m_scalar:
                 parsed[key] = m_scalar.group("val")
                 break
+            m_ptr = _GDB_PTR_OR_SCALAR_LINE_RE.match(s)
+            if m_ptr:
+                parsed[key] = m_ptr.group("val")
+                break
     return parsed
 
 
@@ -752,12 +770,27 @@ def parse_rcu_state(rcu_output: str) -> dict[str, str]:
     fields: dict[str, str] = {}
     tagged = _parse_tagged_scalar_blocks(rcu_output)
     if tagged:
-        for k in ("gp_seq", "gp_state", "gp_start", "jiffies_stall", "n_force_qs"):
+        for k in (
+            "gp_seq",
+            "gp_state",
+            "gp_start",
+            "jiffies_stall",
+            "n_force_qs",
+            "gp_flags",
+            "gp_kthread",
+        ):
             if k in tagged:
                 fields[k] = tagged[k]
-        return fields
-    for m in _RCU_FIELD_RE.finditer(rcu_output):
-        fields[m.group("name")] = m.group("val")
+    else:
+        for m in _RCU_FIELD_RE.finditer(rcu_output):
+            fields[m.group("name")] = m.group("val")
+    if "gp_state" in fields:
+        try:
+            gp_state_int = int(fields["gp_state"], 0)
+            if gp_state_int in _RCU_GP_STATE_NAMES:
+                fields["gp_state_name"] = _RCU_GP_STATE_NAMES[gp_state_int]
+        except ValueError:
+            pass
     return fields
 
 
@@ -919,6 +952,327 @@ def _inspect_rcu_pids(
     return records
 
 
+
+def _normalize_hex_addr(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    s = raw.strip().lower()
+    if s in ("0", "0x0"):
+        return "0x0"
+    try:
+        return hex(int(s, 16 if s.startswith("0x") else 0))
+    except ValueError:
+        return None
+
+
+def _parse_rcu_node_body(body: str) -> dict[str, object]:
+    info: dict[str, object] = {}
+    for key in ("level", "grplo", "grphi", "qsmask", "gp_seq"):
+        m = re.search(rf"\b{key}\s*=\s*(-?(?:0x)?[0-9a-fA-F]+)", body)
+        if m:
+            info[key] = m.group(1)
+    for key in ("gp_tasks", "exp_tasks"):
+        m = re.search(rf"\b{key}\s*=\s*(0x[0-9a-fA-F]+)", body)
+        if m:
+            info[key] = _normalize_hex_addr(m.group(1)) or m.group(1)
+    m_blkd = re.search(
+        r"blkd_tasks\s*=\s*\{[^}]*?next\s*=\s*(0x[0-9a-fA-F]+)",
+        body,
+        re.DOTALL,
+    )
+    if m_blkd:
+        info["blkd_tasks_next"] = _normalize_hex_addr(m_blkd.group(1)) or m_blkd.group(1)
+    return info
+
+
+def _parse_blkd_tasks_list(
+    list_output: str,
+    gp_tasks_addr: Optional[str] = None,
+    exp_tasks_addr: Optional[str] = None,
+    limit: int = 16,
+    rcu_node_entry_offset: Optional[int] = None,
+) -> tuple[list[dict[str, object]], bool]:
+    """解析 `list -H <blkd_tasks> -l task_struct.rcu_node_entry -s task_struct.pid,comm,rcu_read_lock_nesting` 输出。
+
+    注意：`-l task_struct.rcu_node_entry` 打印的是 `list_head` 成员地址（`rcu_node_entry_addr`，
+    与 `rnp->gp_tasks`/`rnp->blkd_tasks.next` 一致）；真实 `task_struct *` 需减去
+    `offsetof(struct task_struct, rcu_node_entry)`。
+    """
+    tasks: list[dict[str, object]] = []
+    truncated = False
+    gp_norm = _normalize_hex_addr(gp_tasks_addr)
+    exp_norm = _normalize_hex_addr(exp_tasks_addr)
+
+    current_addr: Optional[str] = None
+    current_lines: list[str] = []
+
+    def _flush() -> None:
+        nonlocal truncated
+        if current_addr is None:
+            return
+        if len(tasks) >= limit:
+            truncated = True
+            return
+        block = "\n".join(current_lines)
+        m_pid = _STRUCT_PID_RE.search(block)
+        m_comm = _STRUCT_COMM_RE.search(block)
+        m_nest = re.search(r"rcu_read_lock_nesting\s*=\s*(-?\d+)", block)
+        if not m_pid and not m_comm and not m_nest:
+            return
+        comm_val = m_comm.group("comm").split("\\000", 1)[0].rstrip("\x00") if m_comm else None
+        real_task_addr: Optional[str] = None
+        if rcu_node_entry_offset is not None and rcu_node_entry_offset >= 0:
+            try:
+                entry_int = int(current_addr, 16)
+                if entry_int >= rcu_node_entry_offset:
+                    real_task_addr = hex(entry_int - rcu_node_entry_offset)
+            except ValueError:
+                real_task_addr = None
+        tasks.append(
+            {
+                "task_addr": real_task_addr,
+                "rcu_node_entry_addr": current_addr,
+                "pid": int(m_pid.group("pid")) if m_pid else None,
+                "comm": comm_val,
+                "rcu_read_lock_nesting": int(m_nest.group(1)) if m_nest else None,
+                "is_gp_tasks_head": bool(gp_norm and gp_norm != "0x0" and current_addr == gp_norm),
+                "is_exp_tasks_head": bool(exp_norm and exp_norm != "0x0" and current_addr == exp_norm),
+            }
+        )
+
+    addr_line_re = re.compile(r"^\s*(?:0x)?(?P<addr>[0-9a-fA-F]{12,16})\s*$")
+    for line in list_output.splitlines():
+        s = line.strip()
+        if not s or "list:" in s.lower() or "invalid" in s.lower():
+            continue
+        m_addr = addr_line_re.match(s)
+        if m_addr:
+            _flush()
+            current_addr = _normalize_hex_addr("0x" + m_addr.group("addr"))
+            current_lines = []
+        elif current_addr is not None:
+            current_lines.append(line)
+    _flush()
+    return tasks, truncated
+
+
+def _inspect_rcu_tree(
+    tree_meta: dict[str, str],
+    gp_kthread_raw: Optional[str],
+    requested_pids: list[int],
+    vmcore_path: str,
+    vmlinux_path: str,
+    script_runner: Callable[[str, str, str, bool], str],
+    *,
+    max_nodes: int = 64,
+    max_tasks_per_node: int = 16,
+    max_total_tasks: int = 32,
+) -> Optional[dict[str, object]]:
+    """遍历完整 `rcu_state.node[]` 树，枚举全部 `blkd_tasks` 并检查 `gp_kthread` 健康度。"""
+    try:
+        num_nodes = int(tree_meta["rcu_num_nodes"], 0)
+        node0_addr = int(tree_meta["rcu_node0_addr"], 0)
+        node_size = int(tree_meta["rcu_node_size"], 0)
+    except (KeyError, ValueError, TypeError):
+        return None
+    if num_nodes <= 0 or node0_addr <= 0 or node_size <= 0:
+        return None
+
+    blkd_offset: Optional[int] = None
+    if "blkd_tasks_offset" in tree_meta:
+        try:
+            blkd_offset = int(tree_meta["blkd_tasks_offset"], 0)
+        except ValueError:
+            blkd_offset = None
+
+    rcu_node_entry_offset: Optional[int] = None
+    if "rcu_node_entry_offset" in tree_meta:
+        try:
+            rcu_node_entry_offset = int(tree_meta["rcu_node_entry_offset"], 0)
+        except ValueError:
+            rcu_node_entry_offset = None
+
+    nodes_to_scan = min(num_nodes, max_nodes)
+    scan_lines: list[str] = []
+    for idx in range(nodes_to_scan):
+        addr = node0_addr + idx * node_size
+        scan_lines.append(f"!echo ===RCU_TREE_NODE:{idx}:0x{addr:x}===")
+        scan_lines.append(
+            f"struct rcu_node.level,grplo,grphi,qsmask,gp_seq,gp_tasks,exp_tasks,blkd_tasks {addr:x}"
+        )
+
+    gp_kthread_norm = _normalize_hex_addr(gp_kthread_raw)
+    if gp_kthread_norm and gp_kthread_norm != "0x0":
+        bare_gp = gp_kthread_norm[2:]
+        scan_lines.append(f"!echo ===RCU_GP_KTHREAD:{gp_kthread_norm}===")
+        scan_lines.append(f"struct task_struct.pid,comm,__state {bare_gp}")
+        scan_lines.append("!echo ===RCU_GP_KTHREAD_BT===")
+        scan_lines.append(f"bt {bare_gp}")
+
+    scan_out = script_runner("\n".join(scan_lines), vmcore_path, vmlinux_path, False)
+
+    gp_kthread_info: Optional[dict[str, object]] = None
+    if "===RCU_GP_KTHREAD:" in scan_out:
+        scan_nodes_out, gp_rest = scan_out.split("===RCU_GP_KTHREAD:", 1)
+        gp_hdr, _, gp_body = gp_rest.partition("===")
+        gp_struct_part, gp_bt_part = (
+            gp_body.split("===RCU_GP_KTHREAD_BT===", 1)
+            if "===RCU_GP_KTHREAD_BT===" in gp_body
+            else (gp_body, "")
+        )
+        m_pid = _STRUCT_PID_RE.search(gp_struct_part)
+        m_comm = _STRUCT_COMM_RE.search(gp_struct_part)
+        m_state = _STRUCT_STATE_RE.search(gp_struct_part)
+        gp_frames = [
+            m.group("func")
+            for ln in gp_bt_part.splitlines()
+            if (m := _BT_FRAME_RE.match(ln))
+        ]
+        gp_kthread_info = {
+            "task_addr": gp_hdr.strip(),
+            "pid": int(m_pid.group("pid")) if m_pid else None,
+            "comm": m_comm.group("comm").split("\\000", 1)[0].rstrip("\x00") if m_comm else None,
+            "__state": int(m_state.group("state")) if m_state else None,
+            "bt_top_frames": gp_frames[:8],
+        }
+    else:
+        scan_nodes_out = scan_out
+
+    nodes_with_qsmask: list[dict[str, object]] = []
+    active_blkd_nodes: list[dict[str, object]] = []
+
+    for sec in scan_nodes_out.split("===RCU_TREE_NODE:")[1:]:
+        hdr, _, body = sec.partition("===")
+        parts = hdr.strip().split(":")
+        if len(parts) != 2:
+            continue
+        try:
+            idx = int(parts[0])
+            addr_int = int(parts[1], 16)
+        except ValueError:
+            continue
+        info = _parse_rcu_node_body(body)
+        if not info:
+            continue
+        node_entry: dict[str, object] = {
+            "node_index": idx,
+            "node_addr": f"0x{addr_int:x}",
+            **info,
+        }
+        qsmask_raw = info.get("qsmask")
+        qsmask_nonzero = False
+        if isinstance(qsmask_raw, str):
+            try:
+                qsmask_nonzero = int(qsmask_raw, 0) != 0
+            except ValueError:
+                qsmask_nonzero = False
+        if qsmask_nonzero:
+            nodes_with_qsmask.append(dict(node_entry))
+
+        gp_tasks = info.get("gp_tasks")
+        exp_tasks = info.get("exp_tasks")
+        blkd_next = info.get("blkd_tasks_next")
+        head_addr = (addr_int + blkd_offset) if blkd_offset is not None else None
+        blkd_non_empty = False
+        if head_addr is not None and isinstance(blkd_next, str):
+            try:
+                blkd_next_int = int(blkd_next, 16)
+                blkd_non_empty = blkd_next_int != 0 and blkd_next_int != head_addr
+            except ValueError:
+                blkd_non_empty = False
+        if (
+            blkd_non_empty
+            or (isinstance(gp_tasks, str) and gp_tasks != "0x0")
+            or (isinstance(exp_tasks, str) and exp_tasks != "0x0")
+        ):
+            if head_addr is not None:
+                node_entry["blkd_tasks_head"] = f"0x{head_addr:x}"
+            active_blkd_nodes.append(node_entry)
+
+    all_blocked_pids: list[int] = []
+    any_truncated = nodes_to_scan < num_nodes
+    total_collected = 0
+
+    if active_blkd_nodes:
+        list_lines: list[str] = []
+        for node_entry in active_blkd_nodes[:16]:
+            idx = node_entry["node_index"]
+            naddr = str(node_entry["node_addr"])
+            bare_naddr = naddr[2:] if naddr.startswith("0x") else naddr
+            head_str = node_entry.get("blkd_tasks_head")
+            if isinstance(head_str, str) and head_str.startswith("0x"):
+                list_lines.append(f"!echo ===RCU_BLKD_LIST:{idx}===")
+                list_lines.append(
+                    f"list -H {head_str[2:]} -l task_struct.rcu_node_entry -s task_struct.pid,comm,rcu_read_lock_nesting"
+                )
+            list_lines.append(f"!echo ===RCU_BOOST_TASKS:{idx}===")
+            list_lines.append(f"struct rcu_node.boost_tasks {bare_naddr}")
+
+        list_out = script_runner("\n".join(list_lines), vmcore_path, vmlinux_path, False)
+        list_by_idx: dict[int, str] = {}
+        boost_by_idx: dict[int, Optional[str]] = {}
+        for sec in list_out.split("===RCU_BLKD_LIST:")[1:]:
+            idx_s, _, rest = sec.partition("===")
+            body, _, _ = rest.partition("===RCU_BOOST_TASKS:")
+            try:
+                list_by_idx[int(idx_s.strip())] = body
+            except ValueError:
+                pass
+        for sec in list_out.split("===RCU_BOOST_TASKS:")[1:]:
+            idx_s, _, rest = sec.partition("===")
+            body, _, _ = rest.partition("===RCU_BLKD_LIST:")
+            try:
+                idx_i = int(idx_s.strip())
+            except ValueError:
+                continue
+            m_boost = re.search(r"\bboost_tasks\s*=\s*(0x[0-9a-fA-F]+)", body)
+            if m_boost:
+                boost_by_idx[idx_i] = _normalize_hex_addr(m_boost.group(1))
+
+        for node_entry in active_blkd_nodes:
+            idx = int(node_entry["node_index"])  # type: ignore[arg-type]
+            if idx in boost_by_idx:
+                node_entry["boost_tasks"] = boost_by_idx[idx]
+            remaining = max(0, max_total_tasks - total_collected)
+            if idx in list_by_idx and remaining > 0:
+                tasks, trunc = _parse_blkd_tasks_list(
+                    list_by_idx[idx],
+                    gp_tasks_addr=str(node_entry.get("gp_tasks") or ""),
+                    exp_tasks_addr=str(node_entry.get("exp_tasks") or ""),
+                    limit=min(max_tasks_per_node, remaining),
+                    rcu_node_entry_offset=rcu_node_entry_offset,
+                )
+                node_entry["blocked_tasks"] = tasks
+                total_collected += len(tasks)
+                if trunc:
+                    any_truncated = True
+                for t in tasks:
+                    pid = t.get("pid")
+                    if isinstance(pid, int) and pid not in all_blocked_pids:
+                        all_blocked_pids.append(pid)
+            else:
+                node_entry["blocked_tasks"] = []
+                if idx in list_by_idx and remaining == 0:
+                    any_truncated = True
+
+    requested_set = set(requested_pids)
+    discovered_not_in_dmesg = [p for p in all_blocked_pids if p not in requested_set]
+
+    return {
+        "rcu_num_nodes": num_nodes,
+        "nodes_scanned": nodes_to_scan,
+        "truncated": any_truncated,
+        "nodes_with_qsmask": nodes_with_qsmask[:16],
+        "nodes_with_blkd_tasks": active_blkd_nodes[:16],
+        "all_blocked_reader_pids": all_blocked_pids,
+        "discovered_not_in_dmesg": discovered_not_in_dmesg,
+        "total_blocked_readers": len(all_blocked_pids),
+        "is_sole_blocker_confirmed": (
+            nodes_to_scan == num_nodes and not any_truncated and len(all_blocked_pids) == 1
+        ),
+        "gp_kthread": gp_kthread_info,
+    }
+
 def analyze_cpu_lockup_rcu(
     vmcore_path: str,
     vmlinux_path: str,
@@ -939,6 +1293,7 @@ def analyze_cpu_lockup_rcu(
     marker_runq = "===LOCK_HANG_RUNQ==="
     marker_rcu = "===LOCK_HANG_RCU==="
     marker_ctrl = "===LOCK_HANG_RCU_CTRL==="
+    marker_tree = "===LOCK_HANG_RCU_TREE==="
     combined_script = "\n".join(
         [
             bt_cmd,
@@ -955,6 +1310,10 @@ def analyze_cpu_lockup_rcu(
             "p rcu_state.jiffies_stall",
             "!echo ===RCU_FIELD:n_force_qs===",
             "p rcu_state.n_force_qs",
+            "!echo ===RCU_FIELD:gp_flags===",
+            "p rcu_state.gp_flags",
+            "!echo ===RCU_FIELD:gp_kthread===",
+            "p rcu_state.gp_kthread",
             f"!echo {marker_ctrl}",
             "!echo ===RCU_FIELD:rcu_cpu_stall_timeout===",
             "p rcu_cpu_stall_timeout",
@@ -962,6 +1321,17 @@ def analyze_cpu_lockup_rcu(
             "p sysctl_panic_on_rcu_stall",
             "!echo ===RCU_FIELD:jiffies===",
             "p jiffies",
+            f"!echo {marker_tree}",
+            "!echo ===RCU_FIELD:rcu_num_nodes===",
+            "p rcu_num_nodes",
+            "!echo ===RCU_FIELD:rcu_node0_addr===",
+            "p &rcu_state.node[0]",
+            "!echo ===RCU_FIELD:rcu_node_size===",
+            "p sizeof(struct rcu_node)",
+            "!echo ===RCU_FIELD:blkd_tasks_offset===",
+            "p (unsigned long)&((struct rcu_node *)0)->blkd_tasks",
+            "!echo ===RCU_FIELD:rcu_node_entry_offset===",
+            "p (unsigned long)&((struct task_struct *)0)->rcu_node_entry",
         ]
     )
     raw = script_runner(combined_script, vmcore_path, vmlinux_path, False)
@@ -970,12 +1340,17 @@ def analyze_cpu_lockup_rcu(
     runq_part = ""
     rcu_part = ""
     ctrl_part = ""
+    tree_part = ""
     if marker_runq in raw:
         bt_part, rest = raw.split(marker_runq, 1)
         if marker_rcu in rest:
             runq_part, rest2 = rest.split(marker_rcu, 1)
             if marker_ctrl in rest2:
-                rcu_part, ctrl_part = rest2.split(marker_ctrl, 1)
+                rcu_part, rest3 = rest2.split(marker_ctrl, 1)
+                if marker_tree in rest3:
+                    ctrl_part, tree_part = rest3.split(marker_tree, 1)
+                else:
+                    ctrl_part = rest3
             else:
                 rcu_part = rest2
         else:
@@ -987,9 +1362,23 @@ def analyze_cpu_lockup_rcu(
     runq_info = parse_runq_summary(runq_part)
     rcu_fields = parse_rcu_state(rcu_part)
     rcu_controls = _parse_rcu_stall_controls(rcu_part, ctrl_part, rcu_fields)
+    tree_meta = _parse_tagged_scalar_blocks(tree_part) if tree_part else {}
+    rcu_tree_summary = _inspect_rcu_tree(
+        tree_meta,
+        rcu_fields.get("gp_kthread"),
+        opts.rcu_pids,
+        vmcore_path,
+        vmlinux_path,
+        script_runner,
+    )
+    merged_rcu_pids: list[int] = list(opts.rcu_pids)
+    if isinstance(rcu_tree_summary, dict):
+        for discovered_pid in rcu_tree_summary.get("discovered_not_in_dmesg") or []:
+            if isinstance(discovered_pid, int) and discovered_pid not in merged_rcu_pids:
+                merged_rcu_pids.append(discovered_pid)
     rcu_blocked_tasks = (
-        _inspect_rcu_pids(opts.rcu_pids, vmcore_path, vmlinux_path, script_runner)
-        if opts.rcu_pids
+        _inspect_rcu_pids(merged_rcu_pids[:8], vmcore_path, vmlinux_path, script_runner)
+        if merged_rcu_pids
         else []
     )
 
@@ -1093,6 +1482,7 @@ def analyze_cpu_lockup_rcu(
         "active_or_suspected_cpus": suspected_lockup_cpus[:20],
         "rcu_state_summary": rcu_fields,
         "rcu_stall_controls": rcu_controls,
+        "rcu_tree_summary": rcu_tree_summary,
         "rcu_blocked_tasks": rcu_blocked_tasks,
         "recommended_next_commands": recommended,
     }

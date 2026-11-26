@@ -1502,6 +1502,36 @@ def _parse_lock_hang_json(tool_name: str, output: str) -> set[str]:
                 if rcu_sysctls.get(k) is not None:
                     facts.add(f"rcu_sysctl:{k}={rcu_sysctls[k]}")
 
+        rcu_tree = data.get("rcu_tree_summary")
+        if isinstance(rcu_tree, dict):
+            nodes_scanned = rcu_tree.get("nodes_scanned")
+            if isinstance(nodes_scanned, int) and nodes_scanned > 0:
+                facts.add(f"rcu_tree_nodes_scanned:{nodes_scanned}")
+            total_blkd = rcu_tree.get("total_blocked_readers")
+            if isinstance(total_blkd, int):
+                facts.add(f"rcu_blocked_readers_count:{total_blkd}")
+            for qnode in (rcu_tree.get("nodes_with_qsmask") or [])[:8]:
+                if isinstance(qnode, dict) and qnode.get("qsmask") is not None:
+                    facts.add(f"rcu_qsmask:{qnode['qsmask']}")
+            for bnode in (rcu_tree.get("nodes_with_blkd_tasks") or [])[:8]:
+                if not isinstance(bnode, dict):
+                    continue
+                if bnode.get("gp_tasks"):
+                    facts.add(f"rcu_node_gp_tasks:{bnode['gp_tasks']}")
+                if bnode.get("blkd_tasks_next"):
+                    facts.add(f"rcu_node_blkd_tasks:{bnode['blkd_tasks_next']}")
+                if bnode.get("qsmask") is not None:
+                    facts.add(f"rcu_qsmask:{bnode['qsmask']}")
+                if bnode.get("gp_seq") is not None:
+                    facts.add(f"rcu_gp_seq:{bnode['gp_seq']}")
+                for btask in (bnode.get("blocked_tasks") or [])[:8]:
+                    if not isinstance(btask, dict):
+                        continue
+                    if btask.get("pid") is not None:
+                        facts.add(f"lock_holder_task:pid={btask['pid']}")
+                    if btask.get("rcu_read_lock_nesting") is not None:
+                        facts.add(f"rcu_reader_nesting:{btask['rcu_read_lock_nesting']}")
+
         for item in (data.get("rcu_blocked_tasks") or [])[:8]:
             if not isinstance(item, dict):
                 continue

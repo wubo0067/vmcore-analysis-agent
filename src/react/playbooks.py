@@ -83,8 +83,13 @@ Analysis:
 ## 3.3 RCU Stall
 Pattern: rcu_preempt / rcu_sched self-detected stall on CPUs or tasks, or `Kernel panic - not syncing: RCU Stall`.
 
-Mandatory Fast Path (Step 1):
-- When `analyze_cpu_lockup_rcu` is available, you MUST invoke it FIRST before issuing manual `struct rcu_node` / `list` commands (pass `--rcu-pids <pid1,pid2>` with any blocked reader/waiter PIDs reported in dmesg). It deterministically traverses `task_struct.rcu_blocked_node` -> `rcu_node` without manual address errors, and aggregates per-CPU stacks, runq pressure, `rcu_state` (`gp_seq`/`gp_state`/`gp_start`), `jiffies`, `rcu_cpu_stall_timeout`, `sysctl_panic_on_rcu_stall`, and `rcu_node` (`qsmask`/`gp_tasks`/`exp_tasks`/`blkd_tasks`) in a single call.
+Mandatory Fast Path (Steps 1-2):
+- Step 1: When `analyze_cpu_lockup_rcu` is available, you MUST invoke it FIRST before issuing manual `struct rcu_node` / `list` commands (pass `--rcu-pids <pid1,pid2>` with any blocked reader/waiter PIDs reported in dmesg). It deterministically scans the ENTIRE `rcu_state.node[]` tree (enumerating all `blkd_tasks` across every non-empty `rcu_node`, flagging any `discovered_not_in_dmesg` blockers, and reporting `is_sole_blocker_confirmed`), checks `rcu_state.gp_kthread` health, and aggregates per-CPU stacks, runq pressure, `rcu_state` (`gp_seq`/`gp_state`/`gp_start`/`n_force_qs`), `jiffies`, `rcu_cpu_stall_timeout`, `sysctl_panic_on_rcu_stall`, and `rcu_node` (`qsmask`/`gp_tasks`/`exp_tasks`/`boost_tasks`/`blkd_tasks`) in a single call.
+- Step 2 (Single Batched `run_script` Closure): Immediately after Step 1, combine ALL remaining crash-side checks into ONE `run_script` call (do NOT skip straight to `read_source` without instruction-to-source mapping):
+  1. If a third-party module with debug symbols appears on the blocked reader/waiter stack, load its symbols (`mod -s <mod> <ko_path>`) and run `dis -l <mod_func>` to anchor vmcore instruction offsets (`+0x...`) to exact `file:line` sites (which also lets `read_source` jump straight to the exact lines without blind overlapping reads).
+  2. For any task marked `waiter_bt_truncated` in `recommended_next_commands`, include `bt -f <waiter_task_addr>` in the same batch.
+  3. Include a lightweight negative check `log -m | grep -Ei "mce|hardware error|machine check|steal|hypervisor"` so hardware/MCE/NMI and virtualized vCPU-steal causes are actually checked before being ruled out.
+- Full-tree reporting completeness: report how many `rcu_node` entries were scanned, every blocked reader found across the tree, whether `is_sole_blocker_confirmed` is true, AND cite BOTH root `rcu_node` `qsmask` (e.g., root `node[0]` `qsmask=1` as the sole non-zero `qsmask` node) AND leaf `rcu_node` (`qsmask=0`, `gp_tasks!=0`) together to prove the GP is held exclusively by that leaf's `blkd_tasks`.
 
 Standard Manual Sequence (use targeted dot-syntax; NEVER dump full `struct -o task_struct` or `struct -o rcu_state` just to compute 2-3 offsets):
 1. Identify stall flavor (`rcu_preempt` vs `rcu_sched` / `rcu_tasks`) and whether dmesg lists CPUs, blocked tasks (`Tasks blocked on level-N rcu_node`), or both. Tasks-only with no stalled CPUs indicates a task-blocked stall rather than a wedged CPU.
@@ -99,11 +104,23 @@ Standard Manual Sequence (use targeted dot-syntax; NEVER dump full `struct -o ta
 5. If a third-party module is on the stalled task's path, run `dis -rl <ret_addr>` (or `dis -l <func>`) to collect disassembly + source correlation; if you only ran `dis -s` (source-only), follow up with `dis -l` or `bt <pid>` if execution-context disassembly is still needed. To read a module `static` global (e.g., `stall_duration_ms`), if `p <var>` fails with `gdb request failed`, resolve its address via `sym -m <module> | grep -i <var>` and read it with `rd -x <addr>` instead of retrying `p`.
 6. Run a lightweight negative check (`log -m | grep -Ei "mce|hardware error|nmi|steal"`) when relevant (e.g., virtualized hosts) before closing alternative causes.
 
+Kernel Source Verification (when `source_status` reports `configured=true`):
+- Do NOT stop at third-party module source alone, and do NOT burn turns on blind overlapping `read_source` windows: use the exact `file:line` from `dis -l` / dmesg (or `start_line`/`end_line` range reads and scoped `grep_source` with a valid `prefix`) to finish source verification in 2-3 total calls:
+  1. If dmesg contains a kernel `WARNING:`/`BUG:` site (e.g., `kernel/rcu/tree_plugin.h:318`), read that file around the reported line to confirm the exact `WARN_ONCE`/`WARN_ON_ONCE` predicate (e.g., `!preempt && rcu_preempt_depth() > 0`) and `blkd_tasks`/`gp_tasks` enlistment path.
+  2. Verify the stall detection and panic escalation path in `kernel/rcu/tree_stall.h` (or `kernel/rcu/tree.c` on older kernels) around `print_other_cpu_stall` / `rcu_print_task_stall` / `sysctl_panic_on_rcu_stall` to confirm the exact `panic("RCU Stall\n")` trigger condition.
+- Citation precision: when citing source code in your diagnosis, cite the EXACT evidence line number(s) from the numbered listing (e.g., `rcu_stall/rcu_stall_mod.c:228,240,278,286`), NEVER the read-window center line.
+- If `source_status` reports `configured=false`, rely on runtime disassembly and struct evidence without blocking convergence.
+
 RCU Stall Semantics & Accuracy Rules:
 - `t=<N> jiffies` in RCU stall dmesg is GP age (`jiffies - rcu_state.gp_start`), NOT the exact duration a reader held `rcu_read_lock()`. Derive reader hold duration from dmesg timestamps and cross-check against `gp_start`/`jiffies`/`gp_seq`.
 - A preceding `WARN_ON_ONCE` in `rcu_note_context_switch` (`!preempt && rcu_preempt_depth() > 0`) is a voluntary-context-switch-in-RCU-reader warning (and the source of the `W` taint), NOT an "RCU stall warning". Elevate it as primary earliest evidence, not an afterthought.
+- Distinguish reader-blocked GP stalls from `rcu_preempt` GP-kthread starvation using `rcu_tree_summary.gp_kthread` backtrace, `gp_state` (`RCU_GP_WAIT_FQS`), and `n_force_qs`; also note `exp_tasks` (expedited GP) and `boost_tasks` (RCU priority boosting) status when observed.
 - A task calling `synchronize_rcu()` is a GP waiter/witness, NOT a necessary trigger condition for an RCU stall; any grace period is blocked by tasks on `blkd_tasks`/`gp_tasks`. Do not claim a task is blocked in `synchronize_rcu()` unless its backtrace or stack/callback evidence confirms it.
 - On `rcu_stall_mod` or similar third-party modules, explain why panic occurred at `rcu_cpu_stall_timeout` (e.g., 60s < `stall_duration_ms` with `sysctl_panic_on_rcu_stall=1`) using the read kernel variables rather than guessing loop step sizes.
+- Negative-claim discipline: NEVER claim hardware/MCE, DMA, slab corruption, or vCPU steal are ruled out unless you actually checked them (e.g., via `log -m | grep` in Step 2); on virtualized hosts (such as VMware/KVM), explicitly account for vCPU steal / hypervisor pause when checking alternative causes.
+- Fix-suggestion accuracy:
+  - When advising to release `rcu_read_lock()` before sleeping and re-acquire it afterward, ALWAYS state that any RCU-protected pointer obtained prior to `rcu_read_unlock()` may be freed during the sleep and MUST be re-fetched/re-validated after re-acquiring `rcu_read_lock()` (or pinned via a reference count before unlocking).
+  - For synthetic stall simulator modules (e.g., `rcu_stall_mod`), do NOT advise "shortening `stall_duration_ms`" as a fix (shortening below `rcu_cpu_stall_timeout` simply prevents the simulator from triggering a stall); recommend keeping the simulator off production systems.
 - Root-cause enum discipline: for sleeping or long-holding inside `rcu_read_lock()` (whether a driver bug or test module), set `root_cause_class="rcu_misuse"` and `corruption_mechanism="unknown"` — NEVER set `race_condition` or `reinit_path_bug`.
 """.strip(),
     "use_after_free": """

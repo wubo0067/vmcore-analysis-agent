@@ -127,7 +127,7 @@ def build_tool_payload(
     # DWARF info (dis -s prints the compile-time source path of .ko modules).
     # The model never controls these paths: they come from the analysis request.
     debug_symbol_paths = state.get("debug_symbol_paths")
-    if debug_symbol_paths and tool_name in ("read_source", "source_status"):
+    if debug_symbol_paths and tool_name in ("read_source", "grep_source", "source_status"):
         from .resolver import derive_module_source_roots
 
         roots = derive_module_source_roots(list(debug_symbol_paths))

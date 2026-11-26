@@ -1,0 +1,538 @@
+diff '--color=auto' -ruN a/src/mcp_tools/kernel_source/client.py b/src/mcp_tools/kernel_source/client.py
+--- a/src/mcp_tools/kernel_source/client.py	2026-11-26 11:47:00.897635424 +0000
++++ b/src/mcp_tools/kernel_source/client.py	2026-11-26 11:47:00.930635424 +0000
+@@ -127,7 +127,7 @@
+     # DWARF info (dis -s prints the compile-time source path of .ko modules).
+     # The model never controls these paths: they come from the analysis request.
+     debug_symbol_paths = state.get("debug_symbol_paths")
+-    if debug_symbol_paths and tool_name in ("read_source", "source_status"):
++    if debug_symbol_paths and tool_name in ("read_source", "grep_source", "source_status"):
+         from .resolver import derive_module_source_roots
+ 
+         roots = derive_module_source_roots(list(debug_symbol_paths))
+diff '--color=auto' -ruN a/src/mcp_tools/kernel_source/server.py b/src/mcp_tools/kernel_source/server.py
+--- a/src/mcp_tools/kernel_source/server.py	2026-11-26 11:47:00.897635424 +0000
++++ b/src/mcp_tools/kernel_source/server.py	2026-11-26 11:47:00.930635424 +0000
+@@ -63,10 +63,12 @@
+     kver: str = "",
+     line: int = 0,
+     context: int = 20,
++    start_line: int = 0,
++    end_line: int = 0,
+     source_root: str = "",
+     module_source_roots: str = "",
+ ) -> str:
+-    """Read numbered kernel source around a file:line.
++    """Read numbered kernel or module source around a file:line or explicit line range.
+ 
+     Args:
+         file: Path as printed by `dis -s`, relative to the kernel tree root
+@@ -74,13 +76,17 @@
+             debug_symbol_paths entry). A trailing ":<line>" is accepted.
+         kver: Kernel release from `sys` (`RELEASE:`; the `KERNEL:` line is the vmlinux
+             path). A tree from a different release is rejected.
+-        line: Center line. 0 reads the beginning of the file.
+-        context: Lines before and after `line` (max 80).
++        line: Center line. 0 reads the beginning of the file. Ignored when
++            `start_line` or `end_line` is set.
++        context: Lines before and after `line` (max 100; total capped at 200 lines).
++        start_line: Optional 1-based start line for sequential range reads (avoids overlap).
++        end_line: Optional 1-based end line (inclusive; capped at start_line + 199).
+         source_root: Injected by the runtime; do not set it yourself.
+         module_source_roots: Injected by the runtime; do not set it yourself.
+ 
+-    The output starts with a SOURCE_REF line; quote that SOURCE_REF when citing
+-    the code in the analysis.
++    The output starts with a SOURCE_REF range line (`file:start-end`). When citing
++    specific statements in your analysis, cite the EXACT evidence line number(s)
++    from the numbered listing (e.g. `file.c:228,240`), not the window center line.
+     """
+ 
+     # module_source_roots arrives as a comma-separated string from the payload.
+@@ -90,8 +96,14 @@
+         else None
+     )
+     return read_source_impl(
+-        file=file, kver=kver, line=line, context=context,
+-        source_root=source_root, module_source_roots=parsed_roots,
++        file=file,
++        kver=kver,
++        line=line,
++        context=context,
++        start_line=start_line,
++        end_line=end_line,
++        source_root=source_root,
++        module_source_roots=parsed_roots,
+     )
+ 
+ 
+@@ -102,20 +114,29 @@
+     max_hits: int = 25,
+     prefix: str = "",
+     source_root: str = "",
++    module_source_roots: str = "",
+ ) -> str:
+-    """Search kernel source for a regex and return file:line matches.
++    """Search kernel or third-party module source for a regex and return file:line matches.
+ 
+     Use it to locate the condition, macro, or call site named in reasoning.
+-    `prefix` narrows the search to a subtree such as drivers/net.
+-    `source_root` is injected by the runtime; do not set it yourself.
++    `prefix` narrows the search to a kernel subtree (e.g. `kernel/rcu` or `drivers/net`),
++    a specific file, or an absolute path under `module_source_roots`. An invalid `prefix`
++    returns SOURCE_ERROR instead of silently scanning the entire kernel tree.
++    `source_root` and `module_source_roots` are injected by the runtime; do not set them yourself.
+     """
+ 
++    parsed_roots = (
++        [r.strip() for r in module_source_roots.split(",") if r.strip()]
++        if module_source_roots
++        else None
++    )
+     return grep_source_impl(
+         pattern=pattern,
+         kver=kver,
+         max_hits=max_hits,
+         prefix=prefix,
+         source_root=source_root,
++        module_source_roots=parsed_roots,
+     )
+ 
+ 
+diff '--color=auto' -ruN a/src/mcp_tools/kernel_source/tools.py b/src/mcp_tools/kernel_source/tools.py
+--- a/src/mcp_tools/kernel_source/tools.py	2026-11-26 11:47:00.897635424 +0000
++++ b/src/mcp_tools/kernel_source/tools.py	2026-11-26 11:47:00.936635424 +0000
+@@ -27,7 +27,7 @@
+     resolve_tree,
+ )
+ 
+-MAX_LINES_PER_READ = 160
++MAX_LINES_PER_READ = 200
+ MAX_OUTPUT_CHARS = 14_000
+ MAX_FILE_BYTES = 2 * 1024 * 1024
+ MAX_SCANNED_FILES = 40_000
+@@ -68,6 +68,14 @@
+     if prefix:
+         candidate = (tree.root / prefix.replace("\\", "/")).resolve()
+         if candidate == tree.root or tree.root in candidate.parents:
++            if candidate.is_file():
++                if candidate.suffix in _SOURCE_SUFFIXES:
++                    try:
++                        if candidate.stat().st_size <= MAX_FILE_BYTES:
++                            yield candidate
++                    except OSError:
++                        pass
++                return
+             start = candidate if candidate.is_dir() else candidate.parent
+ 
+     scanned = 0
+@@ -370,14 +378,38 @@
+     return [resolved[name] for name in candidates if name in resolved][:8]
+ 
+ 
+-def _compute_line_window(total: int, line: int, context: int) -> tuple[int, int]:
++def _compute_line_window(
++    total: int,
++    line: int,
++    context: int,
++    start_line: int = 0,
++    end_line: int = 0,
++) -> tuple[int, int]:
+     """Return the ``(start, end)`` 1-based line window for a snippet."""
+ 
+-    span = max(0, min(int(context or 20), 80))
++    s_req = max(0, int(start_line or 0))
++    e_req = max(0, int(end_line or 0))
++    if s_req > 0 or e_req > 0:
++        start = max(1, min(total, s_req or 1))
++        end = min(total, e_req if e_req > 0 else start + MAX_LINES_PER_READ - 1)
++        if end < start:
++            end = start
++        if end - start + 1 > MAX_LINES_PER_READ:
++            end = start + MAX_LINES_PER_READ - 1
++        return start, end
++
++    span = max(0, min(int(context or 20), 100))
++    target_len = min(total, min(2 * span + 1, MAX_LINES_PER_READ))
+     if line == 0:
+-        return 1, min(total, min(2 * span + 1, MAX_LINES_PER_READ))
++        return 1, target_len
+     start = max(1, line - span)
+     end = min(total, line + span)
++    # 触及文件首尾边界时，将未用完的上下文配额补向另一侧，避免 `line=1, context=80` 只返回 81 行
++    if end - start + 1 < target_len:
++        if start == 1:
++            end = min(total, start + target_len - 1)
++        elif end == total:
++            start = max(1, end - target_len + 1)
+     if end - start + 1 > MAX_LINES_PER_READ:
+         end = start + MAX_LINES_PER_READ - 1
+     return start, end
+@@ -391,6 +423,8 @@
+     header_prefix: str = "",
+     note: str = "",
+     footer: str = "",
++    start_line: int = 0,
++    end_line: int = 0,
+ ) -> str:
+     """Render a numbered source snippet shared by kernel-tree and module reads.
+ 
+@@ -406,22 +440,25 @@
+         return f"SOURCE_ERROR empty file: {display_name}"
+ 
+     line = max(0, int(line or 0))
+-    if line > total:
++    s_req = max(0, int(start_line or 0))
++    if s_req > total:
++        return f"SOURCE_ERROR start_line {s_req} is outside {display_name} (1..{total})"
++    if s_req == 0 and line > total:
+         return (
+             f"SOURCE_ERROR line {line} is outside {display_name} (1..{total}); "
+             "dis -s may have been resolved against a different build"
+         )
+ 
+-    start, end = _compute_line_window(total, line, context)
++    start, end = _compute_line_window(total, line, context, start_line=start_line, end_line=end_line)
+ 
+-    anchor = line if line > 0 else start
++    ref_span = f"{start}-{end}" if end > start else f"{start}"
+     body = "\n".join(
+         f"{number:6d}| {lines[number - 1]}" for number in range(start, end + 1)
+     )
+     header = (
+         f"{header_prefix}"
+         f"file={display_name} lines={start}-{end}/{total}\n"
+-        f"SOURCE_REF: {display_name}:{anchor}\n"
++        f"SOURCE_REF: {display_name}:{ref_span}\n"
+         f"{note}"
+     )
+     output = f"{header}{body}{footer}"
+@@ -437,6 +474,8 @@
+     context: int = 20,
+     source_root: str = "",
+     module_source_roots: list[str] | None = None,
++    start_line: int = 0,
++    end_line: int = 0,
+ ) -> str:
+     file, line_hint = _split_file_line(file)
+     line = int(line or 0) or line_hint
+@@ -478,6 +517,8 @@
+             display,
+             header_prefix=f"[module-source] path={raw_file}\n",
+             note="note=this is third-party module source (not from the kernel tree)\n",
++            start_line=start_line,
++            end_line=end_line,
+         )
+ 
+     if _is_absolute_path(raw_file) and not roots:
+@@ -511,7 +552,13 @@
+     # Compute the window once; shared by the snippet renderer and macro
+     # resolution so the two can never disagree.
+     total = len(lines)
+-    start, end = _compute_line_window(total, max(0, int(line or 0)), context)
++    start, end = _compute_line_window(
++        total,
++        max(0, int(line or 0)),
++        context,
++        start_line=start_line,
++        end_line=end_line,
++    )
+     snippet_slice = lines[start - 1 : end]
+     macro_defs = _resolve_referenced_macros(tree, path, lines, snippet_slice)
+     macro_footer = (
+@@ -527,34 +574,163 @@
+         rel,
+         header_prefix=f"{_status_block(tree)}\n",
+         footer=macro_footer,
++        start_line=start_line,
++        end_line=end_line,
+     )
+     return snippet
+ 
+ 
++def _resolve_module_grep_target(
++    raw_prefix: str, module_roots: list[Path]
++) -> tuple[Optional[Path], Optional[Path]]:
++    """Resolve a grep `prefix` targeting a third-party module directory or file."""
++    norm = raw_prefix.strip().strip("'\"").replace("\\", "/")
++    if not norm or not module_roots:
++        return None, None
++    resolved_roots: list[Path] = []
++    for r in module_roots:
++        try:
++            resolved_roots.append(r.resolve())
++        except OSError:
++            continue
++
++    candidates: list[Path] = []
++    if _is_absolute_path(norm):
++        try:
++            candidates.append(Path(norm).resolve())
++        except OSError:
++            return None, None
++    else:
++        for root in resolved_roots:
++            # Match `<root_name>` or `<root_name>/<file>` or `<file>` directly under module root
++            if norm == root.name:
++                candidates.append(root)
++            elif norm.startswith(root.name + "/"):
++                candidates.append((root / norm[len(root.name) + 1 :]).resolve())
++            else:
++                cand = (root / norm).resolve()
++                if cand.exists():
++                    candidates.append(cand)
++
++    for cand in candidates:
++        for root in resolved_roots:
++            if (cand == root or root in cand.parents) and cand.exists():
++                return cand, root
++    return None, None
++
++
++def _iter_module_source_files(target: Path, root: Path) -> Iterator[Path]:
++    if target.is_file():
++        if target.suffix in _SOURCE_SUFFIXES:
++            try:
++                if target.stat().st_size <= MAX_FILE_BYTES:
++                    yield target
++            except OSError:
++                pass
++        return
++    scanned = 0
++    for dirpath, dirnames, filenames in os.walk(target):
++        dirnames[:] = sorted(d for d in dirnames if d not in {".git", ".tmp_versions"})
++        for filename in sorted(filenames):
++            if Path(filename).suffix not in _SOURCE_SUFFIXES:
++                continue
++            path = Path(dirpath) / filename
++            try:
++                if path.stat().st_size > MAX_FILE_BYTES:
++                    continue
++            except OSError:
++                continue
++            scanned += 1
++            if scanned > 2000:
++                return
++            yield path
++
++
+ def grep_source_impl(
+     pattern: str,
+     kver: str = "",
+     max_hits: int = 25,
+     prefix: str = "",
+     source_root: str = "",
++    module_source_roots: list[str] | None = None,
+ ) -> str:
+     pattern = str(pattern or "").strip()
+     if not pattern:
+         return "SOURCE_ERROR pattern is required"
+ 
+-    tree, error = _tree_or_error(kver, source_root)
+-    if tree is None:
+-        return f"SOURCE_ERROR {error}"
+-
+     try:
+         regex = re.compile(pattern)
+     except re.error:
+         regex = re.compile(re.escape(pattern))
+ 
+     limit = max(1, min(int(max_hits or 25), 80))
+-    hits: list[str] = []
++    raw_prefix = str(prefix or "").strip().strip("'\"").replace("\\", "/")
++    mod_roots = [Path(r) for r in (module_source_roots or []) if r]
++
++    # 1. Check whether `prefix` targets an allowed third-party module source root/file
++    if raw_prefix and mod_roots:
++        mod_target, mod_root = _resolve_module_grep_target(raw_prefix, mod_roots)
++        if mod_target is not None and mod_root is not None:
++            hits: list[str] = []
++            truncated = False
++            for path in _iter_module_source_files(mod_target, mod_root):
++                try:
++                    raw = path.read_bytes()
++                except OSError:
++                    continue
++                if not _is_probably_text(raw):
++                    continue
++                display = (
++                    f"{path.parent.name}/{path.name}" if path.parent.name else path.name
++                )
++                text = raw.decode("utf-8", errors="replace")
++                for number, line in enumerate(text.splitlines(), start=1):
++                    if regex.search(line) is None:
++                        continue
++                    hits.append(f"{display}:{number}: {_trim(line)}")
++                    if len(hits) >= limit:
++                        truncated = True
++                        break
++                if truncated:
++                    break
++            header = (
++                f"[module-source] root={mod_root}\n"
++                f"SOURCE_GREP pattern={pattern} prefix={raw_prefix} hits={len(hits)} "
++                f"truncated={str(truncated).lower()}"
++            )
++            return "\n".join([header, *hits]) if hits else f"{header}\n(no match)"
++        if _is_absolute_path(raw_prefix):
++            allowed_str = ", ".join(str(r) for r in mod_roots)
++            return (
++                f"SOURCE_ERROR prefix {raw_prefix!r} is outside allowed module_source_roots "
++                f"({allowed_str}) and cannot be searched"
++            )
++
++    if raw_prefix and _is_absolute_path(raw_prefix):
++        return (
++            f"SOURCE_ERROR absolute prefix {raw_prefix!r} is not valid for kernel tree search; "
++            "use a relative kernel path (e.g. 'kernel/rcu') or provide module debug_symbol_paths"
++        )
++
++    tree, error = _tree_or_error(kver, source_root)
++    if tree is None:
++        return f"SOURCE_ERROR {error}"
++
++    # Validate explicit kernel-tree prefix instead of silently falling back to full-tree scan
++    if raw_prefix:
++        try:
++            candidate = (tree.root / raw_prefix).resolve()
++        except OSError:
++            return f"SOURCE_ERROR invalid prefix: {raw_prefix!r}"
++        if not (candidate == tree.root or tree.root in candidate.parents) or not candidate.exists():
++            return (
++                f"SOURCE_ERROR prefix {raw_prefix!r} not found under kernel source tree {tree.root}; "
++                "pass a valid relative kernel path (e.g. 'kernel/rcu') or an absolute path under module_source_roots"
++            )
++
++    hits = []
+     truncated = False
+-    for path in _iter_source_files(tree, prefix):
++    for path in _iter_source_files(tree, raw_prefix):
+         try:
+             raw = path.read_bytes()
+         except OSError:
+diff '--color=auto' -ruN a/src/mcp_tools/lock_hang/analyzer.py b/src/mcp_tools/lock_hang/analyzer.py
+--- a/src/mcp_tools/lock_hang/analyzer.py	2026-11-26 11:47:00.896635424 +0000
++++ b/src/mcp_tools/lock_hang/analyzer.py	2026-11-26 11:47:00.929635424 +0000
+@@ -990,8 +990,14 @@
+     gp_tasks_addr: Optional[str] = None,
+     exp_tasks_addr: Optional[str] = None,
+     limit: int = 16,
++    rcu_node_entry_offset: Optional[int] = None,
+ ) -> tuple[list[dict[str, object]], bool]:
+-    """解析 `list -H <blkd_tasks> -l task_struct.rcu_node_entry -s task_struct.pid,comm,rcu_read_lock_nesting` 输出。"""
++    """解析 `list -H <blkd_tasks> -l task_struct.rcu_node_entry -s task_struct.pid,comm,rcu_read_lock_nesting` 输出。
++
++    注意：`-l task_struct.rcu_node_entry` 打印的是 `list_head` 成员地址（`rcu_node_entry_addr`，
++    与 `rnp->gp_tasks`/`rnp->blkd_tasks.next` 一致）；真实 `task_struct *` 需减去
++    `offsetof(struct task_struct, rcu_node_entry)`。
++    """
+     tasks: list[dict[str, object]] = []
+     truncated = False
+     gp_norm = _normalize_hex_addr(gp_tasks_addr)
+@@ -1014,9 +1020,18 @@
+         if not m_pid and not m_comm and not m_nest:
+             return
+         comm_val = m_comm.group("comm").split("\\000", 1)[0].rstrip("\x00") if m_comm else None
++        real_task_addr: Optional[str] = None
++        if rcu_node_entry_offset is not None and rcu_node_entry_offset >= 0:
++            try:
++                entry_int = int(current_addr, 16)
++                if entry_int >= rcu_node_entry_offset:
++                    real_task_addr = hex(entry_int - rcu_node_entry_offset)
++            except ValueError:
++                real_task_addr = None
+         tasks.append(
+             {
+-                "task_addr": current_addr,
++                "task_addr": real_task_addr,
++                "rcu_node_entry_addr": current_addr,
+                 "pid": int(m_pid.group("pid")) if m_pid else None,
+                 "comm": comm_val,
+                 "rcu_read_lock_nesting": int(m_nest.group(1)) if m_nest else None,
+@@ -1070,6 +1085,13 @@
+         except ValueError:
+             blkd_offset = None
+ 
++    rcu_node_entry_offset: Optional[int] = None
++    if "rcu_node_entry_offset" in tree_meta:
++        try:
++            rcu_node_entry_offset = int(tree_meta["rcu_node_entry_offset"], 0)
++        except ValueError:
++            rcu_node_entry_offset = None
++
+     nodes_to_scan = min(num_nodes, max_nodes)
+     scan_lines: list[str] = []
+     for idx in range(nodes_to_scan):
+@@ -1218,6 +1240,7 @@
+                     gp_tasks_addr=str(node_entry.get("gp_tasks") or ""),
+                     exp_tasks_addr=str(node_entry.get("exp_tasks") or ""),
+                     limit=min(max_tasks_per_node, remaining),
++                    rcu_node_entry_offset=rcu_node_entry_offset,
+                 )
+                 node_entry["blocked_tasks"] = tasks
+                 total_collected += len(tasks)
+@@ -1307,6 +1330,8 @@
+             "p sizeof(struct rcu_node)",
+             "!echo ===RCU_FIELD:blkd_tasks_offset===",
+             "p (unsigned long)&((struct rcu_node *)0)->blkd_tasks",
++            "!echo ===RCU_FIELD:rcu_node_entry_offset===",
++            "p (unsigned long)&((struct task_struct *)0)->rcu_node_entry",
+         ]
+     )
+     raw = script_runner(combined_script, vmcore_path, vmlinux_path, False)
+diff '--color=auto' -ruN a/src/react/evidence.py b/src/react/evidence.py
+--- a/src/react/evidence.py	2026-11-26 11:47:00.894635424 +0000
++++ b/src/react/evidence.py	2026-11-26 11:47:00.948635424 +0000
+@@ -41,7 +41,7 @@
+ _KASAN_UAF_RE = re.compile(r"\bKASAN:\s*(?:slab-)?use-after-free\b", re.IGNORECASE)
+ # kernel_source 工具在输出里标注的源码锚点："SOURCE_REF: path/to/file.c:1203"。
+ # 该事实只用于审计"源码被真正读过"，不参与门控闭合（闭合仍要求运行时事实）。
+-_SOURCE_REF_RE = re.compile(r"SOURCE_REF:\s*(?P<file>[^\s:]+):(?P<line>\d+)")
++_SOURCE_REF_RE = re.compile(r"SOURCE_REF:\s*(?P<file>[^\s:]+):(?P<line>\d+(?:-\d+)?)")
+ # kernel_source 其余头部行：它们没有 SOURCE_REF，但同样证明"这一轮真的查了源码"，
+ # 必须计入 evidence_delta，否则合法的 source_status / 0 命中检索会被判成无进展。
+ _SOURCE_STATUS_RE = re.compile(r"SOURCE_STATUS\s+configured=(?P<configured>true|false)")
+diff '--color=auto' -ruN a/src/react/playbooks.py b/src/react/playbooks.py
+--- a/src/react/playbooks.py	2026-11-26 11:47:00.894635424 +0000
++++ b/src/react/playbooks.py	2026-11-26 11:47:00.949635424 +0000
+@@ -83,9 +83,13 @@
+ ## 3.3 RCU Stall
+ Pattern: rcu_preempt / rcu_sched self-detected stall on CPUs or tasks, or `Kernel panic - not syncing: RCU Stall`.
+ 
+-Mandatory Fast Path (Step 1):
+-- When `analyze_cpu_lockup_rcu` is available, you MUST invoke it FIRST before issuing manual `struct rcu_node` / `list` commands (pass `--rcu-pids <pid1,pid2>` with any blocked reader/waiter PIDs reported in dmesg). It deterministically scans the ENTIRE `rcu_state.node[]` tree (enumerating all `blkd_tasks` across every non-empty `rcu_node`, flagging any `discovered_not_in_dmesg` blockers, and reporting `is_sole_blocker_confirmed`), checks `rcu_state.gp_kthread` health, and aggregates per-CPU stacks, runq pressure, `rcu_state` (`gp_seq`/`gp_state`/`gp_start`/`n_force_qs`), `jiffies`, `rcu_cpu_stall_timeout`, `sysctl_panic_on_rcu_stall`, and `rcu_node` (`qsmask`/`gp_tasks`/`exp_tasks`/`boost_tasks`/`blkd_tasks`) in a single call.
+-- Report the full-tree traversal outcome explicitly (how many `rcu_node` entries were scanned, every blocked reader found across the tree, and whether `is_sole_blocker_confirmed` is true).
++Mandatory Fast Path (Steps 1-2):
++- Step 1: When `analyze_cpu_lockup_rcu` is available, you MUST invoke it FIRST before issuing manual `struct rcu_node` / `list` commands (pass `--rcu-pids <pid1,pid2>` with any blocked reader/waiter PIDs reported in dmesg). It deterministically scans the ENTIRE `rcu_state.node[]` tree (enumerating all `blkd_tasks` across every non-empty `rcu_node`, flagging any `discovered_not_in_dmesg` blockers, and reporting `is_sole_blocker_confirmed`), checks `rcu_state.gp_kthread` health, and aggregates per-CPU stacks, runq pressure, `rcu_state` (`gp_seq`/`gp_state`/`gp_start`/`n_force_qs`), `jiffies`, `rcu_cpu_stall_timeout`, `sysctl_panic_on_rcu_stall`, and `rcu_node` (`qsmask`/`gp_tasks`/`exp_tasks`/`boost_tasks`/`blkd_tasks`) in a single call.
++- Step 2 (Single Batched `run_script` Closure): Immediately after Step 1, combine ALL remaining crash-side checks into ONE `run_script` call (do NOT skip straight to `read_source` without instruction-to-source mapping):
++  1. If a third-party module with debug symbols appears on the blocked reader/waiter stack, load its symbols (`mod -s <mod> <ko_path>`) and run `dis -l <mod_func>` to anchor vmcore instruction offsets (`+0x...`) to exact `file:line` sites (which also lets `read_source` jump straight to the exact lines without blind overlapping reads).
++  2. For any task marked `waiter_bt_truncated` in `recommended_next_commands`, include `bt -f <waiter_task_addr>` in the same batch.
++  3. Include a lightweight negative check `log -m | grep -Ei "mce|hardware error|nmi|steal|hypervisor"` so hardware/MCE/NMI and virtualized vCPU-steal causes are actually checked before being ruled out.
++- Full-tree reporting completeness: report how many `rcu_node` entries were scanned, every blocked reader found across the tree, whether `is_sole_blocker_confirmed` is true, AND cite BOTH root `rcu_node` `qsmask` (e.g., root `node[0]` `qsmask=1` as the sole non-zero `qsmask` node) AND leaf `rcu_node` (`qsmask=0`, `gp_tasks!=0`) together to prove the GP is held exclusively by that leaf's `blkd_tasks`.
+ 
+ Standard Manual Sequence (use targeted dot-syntax; NEVER dump full `struct -o task_struct` or `struct -o rcu_state` just to compute 2-3 offsets):
+ 1. Identify stall flavor (`rcu_preempt` vs `rcu_sched` / `rcu_tasks`) and whether dmesg lists CPUs, blocked tasks (`Tasks blocked on level-N rcu_node`), or both. Tasks-only with no stalled CPUs indicates a task-blocked stall rather than a wedged CPU.
+@@ -101,9 +105,10 @@
+ 6. Run a lightweight negative check (`log -m | grep -Ei "mce|hardware error|nmi|steal"`) when relevant (e.g., virtualized hosts) before closing alternative causes.
+ 
+ Kernel Source Verification (when `source_status` reports `configured=true`):
+-- Do NOT stop at third-party module source alone. Use 1-2 targeted `read_source` calls (avoid broad `search_source` sweeps) to anchor the in-tree kernel mechanism with `SOURCE_REF` citations:
+-  1. If dmesg contains a kernel `WARNING:`/`BUG:` site (e.g., `kernel/rcu/tree_plugin.h:318`), read that file around the reported line to confirm the exact `WARN_ON_ONCE` predicate (e.g., `!preempt && rcu_preempt_depth() > 0`) and `blkd_tasks`/`gp_tasks` enlistment path.
++- Do NOT stop at third-party module source alone, and do NOT burn turns on blind overlapping `read_source` windows: use the exact `file:line` from `dis -l` / dmesg (or `start_line`/`end_line` range reads and scoped `grep_source` with a valid `prefix`) to finish source verification in 2-3 total calls:
++  1. If dmesg contains a kernel `WARNING:`/`BUG:` site (e.g., `kernel/rcu/tree_plugin.h:318`), read that file around the reported line to confirm the exact `WARN_ONCE`/`WARN_ON_ONCE` predicate (e.g., `!preempt && rcu_preempt_depth() > 0`) and `blkd_tasks`/`gp_tasks` enlistment path.
+   2. Verify the stall detection and panic escalation path in `kernel/rcu/tree_stall.h` (or `kernel/rcu/tree.c` on older kernels) around `print_other_cpu_stall` / `rcu_print_task_stall` / `sysctl_panic_on_rcu_stall` to confirm the exact `panic("RCU Stall\n")` trigger condition.
++- Citation precision: when citing source code in your diagnosis, cite the EXACT evidence line number(s) from the numbered listing (e.g., `rcu_stall/rcu_stall_mod.c:228,240,278,286`), NEVER the read-window center line.
+ - If `source_status` reports `configured=false`, rely on runtime disassembly and struct evidence without blocking convergence.
+ 
+ RCU Stall Semantics & Accuracy Rules:
+@@ -112,6 +117,10 @@
+ - Distinguish reader-blocked GP stalls from `rcu_preempt` GP-kthread starvation using `rcu_tree_summary.gp_kthread` backtrace, `gp_state` (`RCU_GP_WAIT_FQS`), and `n_force_qs`; also note `exp_tasks` (expedited GP) and `boost_tasks` (RCU priority boosting) status when observed.
+ - A task calling `synchronize_rcu()` is a GP waiter/witness, NOT a necessary trigger condition for an RCU stall; any grace period is blocked by tasks on `blkd_tasks`/`gp_tasks`. Do not claim a task is blocked in `synchronize_rcu()` unless its backtrace or stack/callback evidence confirms it.
+ - On `rcu_stall_mod` or similar third-party modules, explain why panic occurred at `rcu_cpu_stall_timeout` (e.g., 60s < `stall_duration_ms` with `sysctl_panic_on_rcu_stall=1`) using the read kernel variables rather than guessing loop step sizes.
++- Negative-claim discipline: NEVER claim hardware/MCE, DMA, slab corruption, or vCPU steal are ruled out unless you actually checked them (e.g., via `log -m | grep` in Step 2); on virtualized hosts (such as VMware/KVM), explicitly account for vCPU steal / hypervisor pause when checking alternative causes.
++- Fix-suggestion accuracy:
++  - When advising to release `rcu_read_lock()` before sleeping and re-acquire it afterward, ALWAYS state that any RCU-protected pointer obtained prior to `rcu_read_unlock()` may be freed during the sleep and MUST be re-fetched/re-validated after re-acquiring `rcu_read_lock()` (or pinned via a reference count before unlocking).
++  - For synthetic stall simulator modules (e.g., `rcu_stall_mod`), do NOT advise "shortening `stall_duration_ms`" as a fix (shortening below `rcu_cpu_stall_timeout` simply prevents the simulator from triggering a stall); recommend keeping the simulator off production systems.
+ - Root-cause enum discipline: for sleeping or long-holding inside `rcu_read_lock()` (whether a driver bug or test module), set `root_cause_class="rcu_misuse"` and `corruption_mechanism="unknown"` — NEVER set `race_condition` or `reinit_path_bug`.
+ """.strip(),
+     "use_after_free": """
