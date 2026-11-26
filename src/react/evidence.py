@@ -1438,6 +1438,41 @@ def _parse_ps(output: str) -> set[str]:
     return facts
 
 
+def _emit_bt_facts_from_entry(
+    facts: set[str],
+    entry: Mapping[str, Any],
+    frames_key: str,
+) -> None:
+    """从 lock_hang 结构化条目提取非空执行栈事实（bt_task / bt_frame / nmi_watchdog_frame）。"""
+    raw_frames = entry.get(frames_key)
+    if not isinstance(raw_frames, list):
+        return
+    frames = [str(f).strip() for f in raw_frames[:6] if isinstance(f, str) and str(f).strip()]
+    if not frames:
+        return
+
+    pid = entry.get("pid")
+    if pid is not None:
+        parts = [f"pid={pid}"]
+        task_addr = entry.get("task_addr")
+        if isinstance(task_addr, str) and task_addr.strip():
+            parts.append(f"task={task_addr.strip()}")
+        cpu = entry.get("cpu")
+        if cpu is not None:
+            parts.append(f"cpu={cpu}")
+        comm = entry.get("comm")
+        if isinstance(comm, str) and comm.strip():
+            cleaned_comm = comm.strip().strip("[]")
+            if cleaned_comm:
+                parts.append(f"comm={cleaned_comm}")
+        facts.add("bt_task:" + ":".join(parts))
+
+    for fr in frames:
+        facts.add(f"bt_frame:{fr}")
+        if any(tok in fr.lower() for tok in _NMI_WATCHDOG_FRAME_TOKENS):
+            facts.add(f"nmi_watchdog_frame:{fr}")
+
+
 def _parse_lock_hang_json(tool_name: str, output: str) -> set[str]:
     """解析 lock_hang MCP 工具返回的真实 JSON 摘要，抽取确定性 RCU / 锁 / CPU 停滞事实。"""
     facts: set[str] = set()
@@ -1470,6 +1505,7 @@ def _parse_lock_hang_json(tool_name: str, output: str) -> set[str]:
         for item in (data.get("rcu_blocked_tasks") or [])[:8]:
             if not isinstance(item, dict):
                 continue
+            _emit_bt_facts_from_entry(facts, item, "bt_top_frames")
             pid = item.get("pid")
             if item.get("rcu_read_lock_nesting") is not None:
                 facts.add(f"rcu_reader_nesting:{item['rcu_read_lock_nesting']}")
@@ -1491,6 +1527,7 @@ def _parse_lock_hang_json(tool_name: str, output: str) -> set[str]:
         contenders = data.get("spinlock_contenders") or []
         for contender in contenders[:8]:
             if isinstance(contender, dict) and "cpu" in contender:
+                _emit_bt_facts_from_entry(facts, contender, "top_frames")
                 pid = contender.get("pid")
                 facts.add(
                     f"spinlock_contender:cpu={contender['cpu']}"
@@ -1501,19 +1538,16 @@ def _parse_lock_hang_json(tool_name: str, output: str) -> set[str]:
         irq_cpus = data.get("irq_or_softirq_cpus") or []
         for item in irq_cpus[:8]:
             if isinstance(item, dict) and "cpu" in item:
+                _emit_bt_facts_from_entry(facts, item, "top_frames")
                 facts.add(f"cpu_lockup_irq_softirq:cpu={item['cpu']}")
 
         suspected = data.get("active_or_suspected_cpus") or []
         for cpu_item in suspected[:8]:
             if isinstance(cpu_item, dict) and "cpu" in cpu_item:
+                _emit_bt_facts_from_entry(facts, cpu_item, "top_frames")
                 cat = cpu_item.get("wait_category") or "active"
                 facts.add(f"cpu_lockup_cpu:cpu={cpu_item['cpu']}={cat}")
                 facts.add(f"rcu_stall_cpu_trace:cpu={cpu_item['cpu']}={cat}")
-                for fr in (cpu_item.get("top_frames") or [])[:6]:
-                    if isinstance(fr, str) and any(
-                        tok in fr.lower() for tok in _NMI_WATCHDOG_FRAME_TOKENS
-                    ):
-                        facts.add(f"nmi_watchdog_frame:{fr}")
 
         # 若明确完成全核扫描且无自旋锁争抢，同时存在活跃/疑似卡死 CPU，记为无锁死循环线索
         if (

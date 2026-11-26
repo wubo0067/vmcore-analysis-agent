@@ -96,7 +96,7 @@ Standard Manual Sequence (use targeted dot-syntax; NEVER dump full `struct -o ta
    - `list -H <blkd_tasks_addr> -l task_struct.rcu_node_entry -s task_struct.pid,comm`
 4. Verify GP age and stall/panic thresholds directly from kernel globals:
    - `p rcu_cpu_stall_timeout`, `p sysctl_panic_on_rcu_stall`, `p jiffies`, `p rcu_state.gp_start`, `p rcu_state.gp_state`, `p rcu_state.gp_seq`
-5. If a third-party module is on the stalled task's path and `dis -rl <ret_addr>` (or `dis -s <ret_addr - 1>`) resolves source lines, continue from source: inspect the exact sleep, loop, or lock-holding call site and validate runtime module state.
+5. If a third-party module is on the stalled task's path, run `dis -rl <ret_addr>` (or `dis -l <func>`) to collect disassembly + source correlation; if you only ran `dis -s` (source-only), follow up with `dis -l` or `bt <pid>` if execution-context disassembly is still needed. To read a module `static` global (e.g., `stall_duration_ms`), if `p <var>` fails with `gdb request failed`, resolve its address via `sym -m <module> | grep -i <var>` and read it with `rd -x <addr>` instead of retrying `p`.
 6. Run a lightweight negative check (`log -m | grep -Ei "mce|hardware error|nmi|steal"`) when relevant (e.g., virtualized hosts) before closing alternative causes.
 
 RCU Stall Semantics & Accuracy Rules:

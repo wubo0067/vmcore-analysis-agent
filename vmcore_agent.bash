@@ -277,10 +277,12 @@ start_agent() {
     mkdir -p -- "${RUN_DIR}" "$(dirname "${AGENT_LOG_FILE}")"
     cd "${PROJECT_ROOT}"
 
+    # 启动脚本已把 stdout/stderr 重定向到 AGENT_LOG_FILE，禁用 Python 内部 FileHandler，
+    # 避免同一份日志再写出一份重复文件（同时防止多进程写同一文件句柄竞争）。
     if command -v uv >/dev/null 2>&1; then
-        spawn_detached "${AGENT_LOG_FILE}" uv run main.py
+        spawn_detached "${AGENT_LOG_FILE}" env VMCORE_LOG_TO_FILE=0 uv run main.py
     else
-        spawn_detached "${AGENT_LOG_FILE}" python3 main.py
+        spawn_detached "${AGENT_LOG_FILE}" env VMCORE_LOG_TO_FILE=0 python3 main.py
     fi
     pid=$!
     printf '%s\n' "${pid}" > "${AGENT_PID_FILE}"

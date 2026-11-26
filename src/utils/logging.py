@@ -33,14 +33,24 @@ class CustomLogRecord(logging.LogRecord):
         self.pathname = custom_path_filter(self.pathname)
 
 
-# Function to set up the logger
-def setup_logger(log_filename="va-agent.log", log_dir="logs", enable_file=True):
-    # Ensure the logging directory exists
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
+_LOG_FORMAT = (
+    "%(asctime)s [%(levelname)s] [%(module)s] [%(pathname)s:%(lineno)d]: %(message)s"
+)
+_DISABLE_FILE_VALUES = frozenset({"0", "false", "no", "off"})
 
-    # Define the log file path
-    log_filepath = os.path.join(log_dir, log_filename)
+
+def _is_file_logging_enabled(enable_file: bool | None) -> bool:
+    if enable_file is not None:
+        return bool(enable_file)
+    raw = os.environ.get("VMCORE_LOG_TO_FILE", "1").strip().lower()
+    return raw not in _DISABLE_FILE_VALUES
+
+
+# Function to set up the logger
+def setup_logger(
+    log_filename="vmcore-agent.log", log_dir="logs", enable_file: bool | None = None
+):
+    use_file = _is_file_logging_enabled(enable_file)
 
     # Get or create logger
     logger_instance = logging.getLogger("vmcore_analysis_agent")
@@ -48,11 +58,11 @@ def setup_logger(log_filename="va-agent.log", log_dir="logs", enable_file=True):
     # Avoid adding handlers multiple times if logger already exists
     if not logger_instance.handlers:
         logging.setLogRecordFactory(CustomLogRecord)  # Only set once globally
-        if enable_file:
+        formatter = logging.Formatter(_LOG_FORMAT)
+        if use_file:
+            os.makedirs(log_dir, exist_ok=True)
+            log_filepath = os.path.join(log_dir, log_filename)
             handler = logging.FileHandler(log_filepath)
-            formatter = logging.Formatter(
-                "%(asctime)s [%(levelname)s] [%(module)s] [%(pathname)s:%(lineno)d]: %(message)s"
-            )
             handler.setFormatter(formatter)
             handler.setLevel(logging.DEBUG)  # 显式设置文件处理器的级别
             logger_instance.addHandler(handler)
@@ -75,11 +85,7 @@ def setup_console_logger(name="crash_daemon"):
     if not logger_instance.handlers:
         logging.setLogRecordFactory(CustomLogRecord)  # Only set once globally
         handler = logging.StreamHandler()
-        handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s [%(levelname)s] [%(module)s] [%(pathname)s:%(lineno)d]: %(message)s"
-            )
-        )
+        handler.setFormatter(logging.Formatter(_LOG_FORMAT))
         handler.setLevel(logging.DEBUG)
         logger_instance.addHandler(handler)
     logger_instance.setLevel(logging.DEBUG)

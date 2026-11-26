@@ -271,6 +271,111 @@ sysctl_panic_on_rcu_stall = $2 = 1
         self.assertEqual(evaluated["lock_holder"].status, "open")
         self.assertEqual(transitions, [])
 
+    def test_analyze_cpu_lockup_rcu_with_blocked_task_frames_closes_rcu_gates(self) -> None:
+        """真实 analyze_cpu_lockup_rcu 输出已包含 pid 栈帧时，可直接闭合 lock_holder 与 rcu_stall_trace。"""
+        analyzer_json = json.dumps(
+            {
+                "total_cpus_parsed": 8,
+                "idle_cpu_count": 0,
+                "spinlock_contender_count": 0,
+                "spinlock_contenders": [],
+                "irq_or_softirq_cpus": [],
+                "active_or_suspected_cpus": [],
+                "rcu_state_summary": {
+                    "gp_seq": "7398185",
+                    "gp_state": "5",
+                    "gp_start": "4660044008",
+                    "jiffies_stall": "9223372041514879817",
+                    "n_force_qs": "2279386",
+                },
+                "rcu_stall_controls": {
+                    "rcu_cpu_stall_timeout": 60,
+                    "sysctl_panic_on_rcu_stall": 1,
+                    "jiffies": 4660104011,
+                    "gp_age_jiffies": 60003,
+                },
+                "rcu_blocked_tasks": [
+                    {
+                        "pid": 309547,
+                        "comm": "[rcu_blocked_rea]",
+                        "task_addr": "0xffff9b29cc4a3980",
+                        "role": "blocked_reader",
+                        "__state": 1,
+                        "rcu_read_lock_nesting": 1,
+                        "rcu_blocked_node": "0xffffffffac3e9800",
+                        "bt_top_frames": [
+                            "__schedule",
+                            "schedule",
+                            "schedule_timeout",
+                            "rcu_stall_thread",
+                            "kthread",
+                            "ret_from_fork",
+                        ],
+                        "bt_truncated": False,
+                        "blocked_node_info": {
+                            "level": "1",
+                            "grplo": "0",
+                            "grphi": "15",
+                            "qsmask": "0",
+                            "gp_seq": "7398185",
+                            "gp_tasks": "0xffff9b29cc4a42c0",
+                            "exp_tasks": "0x0",
+                            "blkd_tasks_next": "0xffff9b29cc4a42c0",
+                        },
+                    }
+                ],
+            }
+        )
+        facts = extract_evidence_facts(
+            "analyze_cpu_lockup_rcu", {"command": "--rcu-pids 309547"}, analyzer_json
+        )
+        self.assertIn(
+            "bt_task:pid=309547:task=0xffff9b29cc4a3980:comm=rcu_blocked_rea",
+            facts,
+        )
+        self.assertIn("bt_frame:rcu_stall_thread", facts)
+
+        gates = {
+            "lock_holder": GateEntry(required_for=["rcu_stall"], status="open"),
+            "rcu_stall_trace": GateEntry(required_for=["rcu_stall"], status="open"),
+        }
+        evaluated, _ = evaluate_gate_closures(gates, facts)
+        self.assertEqual(evaluated["lock_holder"].status, "closed")
+        self.assertEqual(evaluated["rcu_stall_trace"].status, "closed")
+
+    def test_analyze_cpu_lockup_rcu_empty_frames_does_not_emit_bt_facts(self) -> None:
+        """bt_top_frames 为空时不得伪造 bt_task/bt_frame 事实。"""
+        analyzer_json = json.dumps(
+            {
+                "rcu_state_summary": {"gp_seq": "7398185"},
+                "rcu_blocked_tasks": [
+                    {
+                        "pid": 309547,
+                        "comm": "[rcu_blocked_rea]",
+                        "task_addr": "0xffff9b29cc4a3980",
+                        "rcu_read_lock_nesting": 1,
+                        "rcu_blocked_node": "0xffffffffac3e9800",
+                        "bt_top_frames": [],
+                        "blocked_node_info": {
+                            "gp_tasks": "0xffff9b29cc4a42c0",
+                            "blkd_tasks_next": "0xffff9b29cc4a42c0",
+                            "qsmask": "0",
+                            "gp_seq": "7398185",
+                        },
+                    }
+                ],
+            }
+        )
+        facts = extract_evidence_facts("analyze_cpu_lockup_rcu", {}, analyzer_json)
+        self.assertFalse(any(f.startswith(("bt_task:", "bt_frame:")) for f in facts))
+        gates = {
+            "lock_holder": GateEntry(required_for=["rcu_stall"], status="open"),
+            "rcu_stall_trace": GateEntry(required_for=["rcu_stall"], status="open"),
+        }
+        evaluated, _ = evaluate_gate_closures(gates, facts)
+        self.assertEqual(evaluated["lock_holder"].status, "open")
+        self.assertEqual(evaluated["rcu_stall_trace"].status, "open")
+
 
 if __name__ == "__main__":
     unittest.main()

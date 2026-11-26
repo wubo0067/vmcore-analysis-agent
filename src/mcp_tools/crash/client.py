@@ -33,6 +33,7 @@ _CRASH_SERVER_ENV_KEYS = frozenset(
         "CRASH_BINARY",
         "CRASH_SKIP_DISTRO_CHECK",
         "CRASH_MCP_MAX_CONCURRENCY",
+        "VMCORE_LOG_TO_FILE",
     }
 )
 
