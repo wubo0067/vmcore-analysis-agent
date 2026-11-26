@@ -610,10 +610,11 @@ class VMCoreLLMAnalysisStep(BaseModel):
     )
     fix_suggestion: Optional[str] = Field(
         None,
-        description="Recommended fix or workaround.",
+        description="Recommended fix or workaround. MUST be populated (non-null) when is_conclusive=True.",
     )
     confidence: Optional[ConfidenceLevel] = Field(
-        None, description="Confidence level of the diagnosis."
+        None,
+        description="Confidence level of the diagnosis ('high', 'medium', or 'low'). MUST be populated when is_conclusive=True.",
     )
     additional_notes: Optional[str] = Field(
         None,
@@ -635,7 +636,15 @@ class VMCoreLLMAnalysisStep(BaseModel):
         data = _coerce_root_cause_class(data)
         data = _coerce_corruption_mechanism(data, root_cause_field="root_cause_class")
         data = _coerce_partial_dump(data)
-        return _coerce_confidence(data)
+        data = _coerce_confidence(data)
+        if (
+            isinstance(data, dict)
+            and data.get("is_conclusive") is True
+            and data.get("final_diagnosis") is not None
+            and not data.get("confidence")
+        ):
+            data["confidence"] = "medium"
+        return data
 
 
 # =============================================================================

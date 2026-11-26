@@ -144,6 +144,16 @@ _IDLE_FUNCS = (
     "acpi_idle_enter",
     "cpuidle_enter_state",
     "arch_cpu_idle",
+    "native_safe_halt",
+    "pv_native_safe_halt",
+)
+# kdump 抓取 vmcore 时向其他核广播 NMI 停机的栈帧，不应误判为业务硬中断卡死
+_KDUMP_STOP_FUNCS = (
+    "crash_nmi_callback",
+    "nmi_shootdown_cpus",
+    "stop_this_cpu",
+    "native_stop_other_cpus",
+    "smp_stop_nmi_callback",
 )
 
 # 复合常量与单一事实来源
@@ -991,8 +1001,11 @@ def analyze_cpu_lockup_rcu(
 
     for bt in cpu_bts:
         frame_funcs = [f.function for f in bt.frames]
-        is_idle = any(fn in _IDLE_FUNCS for fn in frame_funcs[:6]) and not any(
-            fn in _SPINLOCK_FUNCS or fn in _SOFTIRQ_OR_STALL_FUNCS for fn in frame_funcs[:8]
+        is_kdump_nmi_stop = any(fn in _KDUMP_STOP_FUNCS for fn in frame_funcs[:6])
+        # NMI 停机帧（crash_nmi_callback -> nmi_handle -> exc_nmi -> asm_exc_nmi）会占去前 5-6 帧，
+        # 因此需在更深帧范围（前 16 帧）内识别被 NMI 停住的 idle 核。
+        is_idle = any(fn in _IDLE_FUNCS for fn in frame_funcs[:16]) and not any(
+            fn in _SPINLOCK_FUNCS or fn in _SOFTIRQ_OR_STALL_FUNCS for fn in frame_funcs[:12]
         )
         if is_idle:
             idle_cpu_count += 1
@@ -1016,7 +1029,11 @@ def analyze_cpu_lockup_rcu(
             spinlock_contenders.append(summary)
         if any(fn in _SOFTIRQ_OR_STALL_FUNCS for fn in frame_funcs[:10]):
             irq_or_softirq_cpus.append(summary)
-        if not is_idle and any(fn in _HARDIRQ_ENTRY_FUNCS for fn in frame_funcs[:10]):
+        if (
+            not is_idle
+            and not is_kdump_nmi_stop
+            and any(fn in _HARDIRQ_ENTRY_FUNCS for fn in frame_funcs[:10])
+        ):
             hardirq_active_cpus.append(summary)
         # 仅将真正存在异常指标的 CPU 标记为 suspected lockup：
         #   - spinlock 自旋等待
