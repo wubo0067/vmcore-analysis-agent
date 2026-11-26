@@ -68,11 +68,12 @@ def analyze_cpu_lockup_rcu(
         str,
         Field(
             description=(
-                "Aggregate per-CPU backtraces, runq pressure, spinlock contention, and RCU grace-period state.\n"
-                "Syntax: [--cpus <cpu1,cpu2,...>] [--include-idle]\n"
+                "Aggregate per-CPU backtraces, runq pressure, spinlock contention, RCU grace-period/sysctl state, and optional blocked-task rcu_node linkage.\n"
+                "Syntax: [--cpus <cpu1,cpu2,...>] [--rcu-pids <pid1,pid2,...>] [--include-idle]\n"
                 "Examples:\n"
                 "  (empty string analyzes all non-idle CPUs)\n"
-                "  --cpus 0,3,7"
+                "  --cpus 0,3,7\n"
+                "  --rcu-pids 309547,309548"
             ),
             default="",
         ),

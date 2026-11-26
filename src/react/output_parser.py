@@ -1010,6 +1010,8 @@ def _audit_open_action_closure(
     logger.warning("%s%s", prefix, audit_note)
 
     analysis_step.is_conclusive = False
+    analysis_step.final_diagnosis = None
+    analysis_step.fix_suggestion = None
     if analysis_step.confidence not in {None, "low"}:
         analysis_step.confidence = "low"
     if audit_note not in analysis_step.reasoning:

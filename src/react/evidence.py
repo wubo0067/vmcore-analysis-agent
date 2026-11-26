@@ -113,19 +113,30 @@ _PS_M_TASK_LINE_RE = re.compile(
     rf"^\s*\[[^\]]+\]\s+\[(?P<state>UN|RU|IN|ZO|ST)\]\s+PID:\s+(?P<pid>\d+)\b"
 )
 
+# rcu_stall_trace 必须观测到 RCU 树/GP 级状态（不能仅靠单个 task 的 nesting 就同时闭合两个门控）
 _RCU_TRACE_STATE_PREFIXES = (
-    "rcu_reader_nesting:",
-    "rcu_blocked_node:",
     "rcu_node_gp_tasks:",
     "rcu_node_blkd_tasks:",
     "rcu_gp_seq:",
     "rcu_qsmask:",
     "rcu_stall_cpu_trace:",
 )
+_RCU_HOLDER_TASK_PREFIXES = (
+    "rcu_reader_nesting:",
+    "rcu_blocked_node:",
+    "lock_holder_task:",
+    "lock_owner_word:",
+)
+_RCU_HOLDER_TREE_PREFIXES = (
+    "rcu_node_gp_tasks:",
+    "rcu_node_blkd_tasks:",
+    "lock_holder_task:",
+)
 _RCU_HOLDER_IDENTITY_PREFIXES = (
     "rcu_reader_nesting:",
     "rcu_blocked_node:",
     "rcu_node_gp_tasks:",
+    "rcu_node_blkd_tasks:",
     "lock_holder_task:",
     "lock_owner_word:",
 )
@@ -638,10 +649,13 @@ def _gate_criteria_satisfied(
             for fact in facts
         )
         if "rcu_stall" in signature_classes:
-            has_rcu_holder = any(
-                fact.startswith(_RCU_HOLDER_IDENTITY_PREFIXES) for fact in facts
+            has_task_side = any(
+                fact.startswith(_RCU_HOLDER_TASK_PREFIXES) for fact in facts
             )
-            return has_rcu_holder and has_holder_ctx
+            has_tree_side = any(
+                fact.startswith(_RCU_HOLDER_TREE_PREFIXES) for fact in facts
+            )
+            return has_task_side and has_tree_side and has_holder_ctx
         if "soft_lockup" in signature_classes:
             has_lock_owner = any(
                 fact.startswith(_SOFT_LOCKUP_HOLDER_PREFIXES) for fact in facts
@@ -1375,17 +1389,20 @@ def _parse_struct_values(output: str) -> set[str]:
 def _parse_print_vars(command: str, output: str) -> set[str]:
     """解析 crash ``p`` 输出中的 RCU 全局参数/宽限期变量。"""
     facts: set[str] = set()
+    dollar_ints: list[int] = []
     for line in output.splitlines():
         m = _PRINT_RCU_VAR_RE.match(line)
         if m:
             facts.add(f"rcu_sysctl:{m.group('name')}={m.group('val')}")
             continue
-        if _RCU_STATE_GP_SEQ_CMD_RE.match(command.strip()):
-            dm = _GDB_DOLLAR_INT_RE.match(line)
-            if dm:
-                val = int(dm.group("val"), 10)
-                if val > 0:
-                    facts.add(f"rcu_gp_seq:{val}")
+        dm = _GDB_DOLLAR_INT_RE.match(line)
+        if dm:
+            dollar_ints.append(int(dm.group("val"), 10))
+    # 仅当输出中只有唯一一行匿名 `$N = <val>` 时才归属给 `p rcu_state.gp_seq`，
+    # 避免多条 `p` 合跑在一个 run_script 里时把 gp_start / gp_state 误提取为 rcu_gp_seq。
+    if _RCU_STATE_GP_SEQ_CMD_RE.match(command.strip()) and len(dollar_ints) == 1:
+        if dollar_ints[0] > 0:
+            facts.add(f"rcu_gp_seq:{dollar_ints[0]}")
     return facts
 
 
@@ -1443,6 +1460,33 @@ def _parse_lock_hang_json(tool_name: str, output: str) -> set[str]:
             if "gp_seq" in rcu_summary and rcu_summary["gp_seq"] is not None:
                 facts.add(f"rcu_gp_seq:{rcu_summary['gp_seq']}")
             facts.add("rcu_stall_cpu_trace:rcu_state_summary=present")
+
+        rcu_sysctls = data.get("rcu_stall_controls")
+        if isinstance(rcu_sysctls, dict):
+            for k in ("rcu_cpu_stall_timeout", "sysctl_panic_on_rcu_stall"):
+                if rcu_sysctls.get(k) is not None:
+                    facts.add(f"rcu_sysctl:{k}={rcu_sysctls[k]}")
+
+        for item in (data.get("rcu_blocked_tasks") or [])[:8]:
+            if not isinstance(item, dict):
+                continue
+            pid = item.get("pid")
+            if item.get("rcu_read_lock_nesting") is not None:
+                facts.add(f"rcu_reader_nesting:{item['rcu_read_lock_nesting']}")
+            if item.get("rcu_blocked_node"):
+                facts.add(f"rcu_blocked_node:{item['rcu_blocked_node']}")
+            node = item.get("blocked_node_info")
+            if isinstance(node, dict):
+                if node.get("gp_tasks"):
+                    facts.add(f"rcu_node_gp_tasks:{node['gp_tasks']}")
+                if node.get("blkd_tasks_next"):
+                    facts.add(f"rcu_node_blkd_tasks:{node['blkd_tasks_next']}")
+                if node.get("qsmask") is not None:
+                    facts.add(f"rcu_qsmask:{node['qsmask']}")
+                if node.get("gp_seq") is not None:
+                    facts.add(f"rcu_gp_seq:{node['gp_seq']}")
+                if pid is not None and node.get("gp_tasks") and node.get("gp_tasks") != "0x0":
+                    facts.add(f"lock_holder_task:pid={pid}")
 
         contenders = data.get("spinlock_contenders") or []
         for contender in contenders[:8]:

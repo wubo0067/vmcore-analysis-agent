@@ -159,7 +159,8 @@ def generate_markdown_report(state: AgentState) -> str:
             lines.append(f"  - `{path}`")
 
     lines.append("")
-    lines.append(f"- **分析步数**: {state.get('step_count', 0)}")
+    lines.append(f"- **LLM 推理轮数**: {state.get('step_count', 0)}")
+    lines.append(f"- **工具调用次数**: {state.get('tool_call_count', 0)}")
     lines.append(f"- **Token 使用量**: {state.get('token_usage', 0)}")
     lines.append("")
 
@@ -341,7 +342,11 @@ def generate_markdown_report(state: AgentState) -> str:
     lines.append("")
     lines.append("## 总结")
     lines.append("")
-    summary_text = f"本次分析共执行 {step_number} 个步骤，使用了 {state.get('token_usage', 0)} 个 Token"
+    summary_text = (
+        f"本次分析共完成 {state.get('step_count', 0)} 轮推理、"
+        f"{state.get('tool_call_count', 0)} 次工具调用（记录 {step_number} 条过程条目），"
+        f"使用了 {state.get('token_usage', 0)} 个 Token"
+    )
     summary_text += f"，使用的模型：{model_name}。"
     lines.append(summary_text)
 
@@ -363,11 +368,7 @@ def generate_markdown_report(state: AgentState) -> str:
                 pass
 
     if not has_diagnosis:
-        lines.append("")
-        lines.append(
-            "⚠️ **注意**: 分析未得出正式的最终结论，以下为最后一步的最佳可用分析状态："
-        )
-        # Fallback: render best-available data from the last AIMessage
+        # Fallback: 区分“已产出完整 final_diagnosis 但门控未全闭合（有界诊断）”与“真正未收敛”
         for msg in reversed(messages):
             if not isinstance(msg, AIMessage):
                 continue
@@ -378,6 +379,56 @@ def generate_markdown_report(state: AgentState) -> str:
                     else json.dumps(msg.content)
                 )
                 last_step = VMCoreAnalysisStep.model_validate_json(raw)
+                if last_step.final_diagnosis is not None:
+                    diag = last_step.final_diagnosis
+                    lines.append("")
+                    lines.append(
+                        "⚠️ **注意**: 已形成诊断结论，但部分验证门控未完全闭合（置信度受限），请结合下方验证状态复核："
+                    )
+                    lines.append("")
+                    lines.append("---")
+                    lines.append("")
+                    lines.append("## ⚠️ 有界诊断结果（部分门控未闭环）")
+                    lines.append("")
+                    lines.append(f"**崩溃类型**: {diag.crash_type}")
+                    lines.append("")
+                    lines.append(f"**Panic 信息**: {diag.panic_string}")
+                    lines.append("")
+                    lines.append(f"**故障指令**: {diag.faulting_instruction}")
+                    lines.append("")
+                    lines.append(f"**根本原因**: {diag.root_cause}")
+                    lines.append("")
+                    lines.append("**详细分析**:")
+                    lines.append("")
+                    lines.append(diag.detailed_analysis)
+                    lines.append("")
+                    lines.append("**可疑代码位置**:")
+                    lines.append(f"- 文件：{diag.suspect_code.file}")
+                    lines.append(f"- 函数：{diag.suspect_code.function}")
+                    lines.append(f"- 行号：{diag.suspect_code.line}")
+                    lines.append("")
+                    if diag.evidence:
+                        lines.append("**关键证据**:")
+                        for ev in diag.evidence:
+                            lines.append(f"- {ev}")
+                        lines.append("")
+                    if last_step.fix_suggestion:
+                        lines.append(f"**修复建议**: {last_step.fix_suggestion}")
+                        lines.append("")
+                    if last_step.confidence:
+                        lines.append(
+                            f"**可信度**: {_cls(last_step.confidence, _ZH_CONFIDENCE_LABELS)}"
+                        )
+                        lines.append("")
+                    if last_step.additional_notes:
+                        lines.append(f"**附加说明**: {last_step.additional_notes}")
+                        lines.append("")
+                    break
+
+                lines.append("")
+                lines.append(
+                    "⚠️ **注意**: 分析未得出正式的最终结论，以下为最后一步的最佳可用分析状态："
+                )
                 lines.append("")
                 lines.append("---")
                 lines.append("")
@@ -560,11 +611,25 @@ def _append_verification_summary(
         if not unverified and gate_resolution_state(
             state.get("current_signature_class"), state.get("managed_gates")
         ) == "satisfied":
-            lines.append(
-                "✅ 全部关键验证环节均已获得确定性证据支持。"
+            verified_names = (
+                "、".join(item_labels.get(name, name) for name in verification_gate_names)
                 if zh_mode
-                else "✅ All key verification checkpoints are backed by deterministic evidence."
+                else ", ".join(item_labels.get(name, name) for name in verification_gate_names)
             )
+            lines.append(
+                f"✅ 以上必需验证环节（{verified_names}）均已获得确定性证据支持；"
+                "超出上述门控范围的辅助陈述仍以正文引用的工具输出为界。"
+                if zh_mode
+                else f"✅ The required verification checkpoints above ({verified_names}) are backed by deterministic evidence; "
+                "any additional statements outside these checkpoints remain bounded by the tool outputs cited."
+            )
+            expired_unresolved = state.get("expired_unresolved") or []
+            if expired_unresolved:
+                lines.append(
+                    f"⚠️ **未闭环提示**：本次分析中仍有 {len(expired_unresolved)} 项工具查询未能获得有效结果，相关分支结论需结合审计记录复核。"
+                    if zh_mode
+                    else f"⚠️ **Unresolved queries**: {len(expired_unresolved)} tool query(ies) expired without usable output; review the audit record for those branches."
+                )
     lines.append("")
 
 

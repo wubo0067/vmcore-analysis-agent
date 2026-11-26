@@ -74,8 +74,12 @@ _RUNQ_CURR_RE = re.compile(
     r"CURRENT:\s+PID:\s+(?P<pid>\d+)\s+TASK:\s+(?P<task>[0-9a-fA-F]+)\s+COMMAND:\s+\"(?P<comm>[^\"]+)\""
 )
 _RCU_FIELD_RE = re.compile(
-    r"\b(?P<name>gp_seq|completed|gpnum|gp_state|gp_kthread|jiffies_stall|n_force_qs)\s*=\s*(?P<val>(?:0x)?-?[0-9a-fA-F]+)"
+    r"\b(?P<name>gp_seq|completed|gpnum|gp_state|gp_start|gp_kthread|jiffies_stall|n_force_qs)\s*=\s*(?P<val>(?:0x)?-?[0-9a-fA-F]+)"
 )
+_GDB_NAMED_SCALAR_RE = re.compile(
+    r"(?P<name>rcu_cpu_stall_timeout|sysctl_panic_on_rcu_stall|jiffies)\s*=\s*\$\d+\s*=\s*(?P<val>-?(?:0x)?[0-9a-fA-F]+)"
+)
+_GDB_SCALAR_LINE_RE = re.compile(r"^\s*\$\d+\s*=\s*(?P<val>-?(?:0x)?[0-9a-fA-F]+)\s*$")
 _HEX_RE = re.compile(r"^(?:0x)?[0-9a-fA-F]+$")
 
 # 等待原语分类关键字
@@ -212,6 +216,7 @@ class LockWaitGraphOptions:
 @dataclass
 class CpuLockupOptions:
     cpus: list[int] = field(default_factory=list)
+    rcu_pids: list[int] = field(default_factory=list)
     include_idle: bool = False
 
 
@@ -261,6 +266,10 @@ def parse_cpu_lockup_command(command: str) -> CpuLockupOptions:
             idx += 1
             raw = _require_arg(tokens, idx, tok)
             opts.cpus = [int(c.strip()) for c in raw.split(",") if c.strip()]
+        elif tok == "--rcu-pids":
+            idx += 1
+            raw = _require_arg(tokens, idx, tok)
+            opts.rcu_pids = [int(p.strip()) for p in raw.split(",") if p.strip()]
         elif tok == "--include-idle":
             opts.include_idle = True
         else:
@@ -697,12 +706,207 @@ def parse_runq_summary(runq_output: str) -> dict[int, RunqCpuInfo]:
     return per_cpu
 
 
+def _parse_tagged_scalar_blocks(text: str, tag_prefix: str = "===RCU_FIELD:") -> dict[str, str]:
+    """按显式 `!echo ===RCU_FIELD:<name>===` 分隔符逐块解析标量值。
+
+    每块独立提取首个 gdb 标量值（`$N = <val>` 或 `<name> = $N = <val>`），
+    若某条 `p` 失败（如 `gdb request failed` / `No symbol`）则该键缺失，绝不发生跨项错位。
+    """
+    parsed: dict[str, str] = {}
+    if tag_prefix not in text:
+        return parsed
+    for sec in text.split(tag_prefix)[1:]:
+        name, sep, body = sec.partition("===")
+        if not sep:
+            continue
+        key = name.strip()
+        if not key:
+            continue
+        for ln in body.splitlines():
+            s = ln.strip()
+            if not s or "gdb request failed" in s.lower() or "no symbol" in s.lower():
+                continue
+            m_named = _GDB_NAMED_SCALAR_RE.search(s)
+            if m_named:
+                parsed[key] = m_named.group("val")
+                break
+            m_scalar = _GDB_SCALAR_LINE_RE.match(s)
+            if m_scalar:
+                parsed[key] = m_scalar.group("val")
+                break
+    return parsed
+
+
 def parse_rcu_state(rcu_output: str) -> dict[str, str]:
-    """解析 `p rcu_state` 输出中的关键宽限期（grace period）字段。"""
+    """解析 `p rcu_state` 或带显式分隔符的单项 `p rcu_state.<field>` 输出。"""
     fields: dict[str, str] = {}
+    tagged = _parse_tagged_scalar_blocks(rcu_output)
+    if tagged:
+        for k in ("gp_seq", "gp_state", "gp_start", "jiffies_stall", "n_force_qs"):
+            if k in tagged:
+                fields[k] = tagged[k]
+        return fields
     for m in _RCU_FIELD_RE.finditer(rcu_output):
         fields[m.group("name")] = m.group("val")
     return fields
+
+
+def _parse_rcu_stall_controls(
+    rcu_part: str, ctrl_part: str, rcu_fields: dict[str, str]
+) -> dict[str, Optional[int]]:
+    """解析 RCU stall 超时/panic 开关及 jiffies，并计算 GP 年龄（jiffies - gp_start）。"""
+    controls: dict[str, Optional[int]] = {
+        "rcu_cpu_stall_timeout": None,
+        "sysctl_panic_on_rcu_stall": None,
+        "jiffies": None,
+        "gp_age_jiffies": None,
+    }
+    tagged = _parse_tagged_scalar_blocks(ctrl_part)
+    if tagged:
+        for k in ("rcu_cpu_stall_timeout", "sysctl_panic_on_rcu_stall", "jiffies"):
+            if k in tagged:
+                try:
+                    controls[k] = int(tagged[k], 0)
+                except ValueError:
+                    pass
+    else:
+        for m in _GDB_NAMED_SCALAR_RE.finditer(ctrl_part):
+            try:
+                controls[m.group("name")] = int(m.group("val"), 0)
+            except ValueError:
+                pass
+    gp_start_raw = rcu_fields.get("gp_start")
+    if controls["jiffies"] is not None and gp_start_raw is not None:
+        try:
+            controls["gp_age_jiffies"] = controls["jiffies"] - int(gp_start_raw, 0)
+        except ValueError:
+            pass
+    return controls
+
+
+def _inspect_rcu_pids(
+    pids: list[int],
+    vmcore_path: str,
+    vmlinux_path: str,
+    script_runner: Callable[[str, str, str, bool], str],
+) -> list[dict[str, object]]:
+    """批量检查指定 RCU 相关 PID 的 task_struct RCU 字段及所属 rcu_node 状态。"""
+    if not pids:
+        return []
+    ps_script = "\n".join(f"ps {pid}" for pid in pids[:8])
+    ps_out = script_runner(ps_script, vmcore_path, vmlinux_path, False)
+    tasks = {t.pid: t for t in parse_ps_tasks(ps_out)}
+    if not tasks:
+        return []
+
+    _waiter_gp_funcs = {
+        "synchronize_rcu",
+        "__wait_rcu_gp",
+        "wait_rcu_gp",
+        "wait_for_completion",
+        "wait_for_common",
+    }
+    _sched_trunc_funcs = {"schedule_timeout", "schedule", "__schedule"}
+
+    task_lines: list[str] = []
+    for pid, t in tasks.items():
+        task_lines.append(f"!echo ===RCU_PID:{pid}:{t.task_addr:x}===")
+        task_lines.append(
+            f"struct task_struct.__state,rcu_read_lock_nesting,rcu_blocked_node,rcu_node_entry {t.task_addr:x}"
+        )
+        task_lines.append(f"!echo ===RCU_BT:{pid}===")
+        task_lines.append(f"bt {pid}")
+    task_out = script_runner("\n".join(task_lines), vmcore_path, vmlinux_path, False)
+
+    records: list[dict[str, object]] = []
+    node_addrs: list[str] = []
+    for sec in task_out.split("===RCU_PID:")[1:]:
+        header, _, rest = sec.partition("===")
+        parts = header.strip().split(":")
+        if len(parts) != 2:
+            continue
+        pid = int(parts[0])
+        task_addr = f"0x{parts[1]}"
+        bt_marker = f"===RCU_BT:{pid}==="
+        if bt_marker in rest:
+            body, bt_body = rest.split(bt_marker, 1)
+        else:
+            body, bt_body = rest, ""
+
+        m_state = _STRUCT_STATE_RE.search(body)
+        m_nest = re.search(r"rcu_read_lock_nesting\s*=\s*(-?\d+)", body)
+        m_node = re.search(r"rcu_blocked_node\s*=\s*(0x[0-9a-fA-F]+)", body)
+        nesting = int(m_nest.group(1)) if m_nest else None
+        node_addr = m_node.group(1) if m_node else None
+        if node_addr and node_addr != "0x0" and node_addr not in node_addrs:
+            node_addrs.append(node_addr)
+
+        bt_frames = [
+            m.group("func")
+            for ln in bt_body.splitlines()
+            if (m := _BT_FRAME_RE.match(ln))
+        ]
+        bt_top_frames = bt_frames[:8]
+
+        if (nesting is not None and nesting > 0) or (node_addr and node_addr != "0x0"):
+            role = "blocked_reader"
+            bt_truncated = False
+        elif any(fn in _waiter_gp_funcs for fn in bt_top_frames):
+            role = "waiter_confirmed"
+            bt_truncated = False
+        elif bt_top_frames and bt_top_frames[-1] in _sched_trunc_funcs:
+            role = "waiter_bt_truncated"
+            bt_truncated = True
+        else:
+            role = "other"
+            bt_truncated = False
+
+        records.append(
+            {
+                "pid": pid,
+                "comm": tasks[pid].comm,
+                "task_addr": task_addr,
+                "role": role,
+                "__state": int(m_state.group("state")) if m_state else None,
+                "rcu_read_lock_nesting": nesting,
+                "rcu_blocked_node": node_addr,
+                "bt_top_frames": bt_top_frames,
+                "bt_truncated": bt_truncated,
+                "blocked_node_info": None,
+            }
+        )
+
+    if node_addrs:
+        node_lines: list[str] = []
+        for naddr in node_addrs[:4]:
+            bare = naddr[2:] if naddr.startswith("0x") else naddr
+            node_lines.append(f"!echo ===RCU_NODE:{naddr}===")
+            node_lines.append(
+                f"struct rcu_node.level,grplo,grphi,qsmask,gp_seq,gp_tasks,exp_tasks,blkd_tasks {bare}"
+            )
+        node_out = script_runner("\n".join(node_lines), vmcore_path, vmlinux_path, False)
+        node_map: dict[str, dict[str, object]] = {}
+        for sec in node_out.split("===RCU_NODE:")[1:]:
+            naddr, _, body = sec.partition("===")
+            naddr = naddr.strip()
+            info: dict[str, object] = {}
+            for key in ("level", "grplo", "grphi", "qsmask", "gp_seq"):
+                m = re.search(rf"\b{key}\s*=\s*(-?(?:0x)?[0-9a-fA-F]+)", body)
+                if m:
+                    info[key] = m.group(1)
+            for key in ("gp_tasks", "exp_tasks"):
+                m = re.search(rf"\b{key}\s*=\s*(0x[0-9a-fA-F]+)", body)
+                if m:
+                    info[key] = m.group(1)
+            m_blkd = re.search(r"blkd_tasks\s*=\s*\{[^}}]*?next\s*=\s*(0x[0-9a-fA-F]+)", body, re.DOTALL)
+            if m_blkd:
+                info["blkd_tasks_next"] = m_blkd.group(1)
+            node_map[naddr] = info
+        for rec in records:
+            naddr = rec.get("rcu_blocked_node")
+            if isinstance(naddr, str) and naddr in node_map:
+                rec["blocked_node_info"] = node_map[naddr]
+    return records
 
 
 def analyze_cpu_lockup_rcu(
@@ -724,13 +928,30 @@ def analyze_cpu_lockup_rcu(
     )
     marker_runq = "===LOCK_HANG_RUNQ==="
     marker_rcu = "===LOCK_HANG_RCU==="
+    marker_ctrl = "===LOCK_HANG_RCU_CTRL==="
     combined_script = "\n".join(
         [
             bt_cmd,
             f"!echo {marker_runq}",
             "runq",
             f"!echo {marker_rcu}",
-            "p rcu_state",
+            "!echo ===RCU_FIELD:gp_seq===",
+            "p rcu_state.gp_seq",
+            "!echo ===RCU_FIELD:gp_state===",
+            "p rcu_state.gp_state",
+            "!echo ===RCU_FIELD:gp_start===",
+            "p rcu_state.gp_start",
+            "!echo ===RCU_FIELD:jiffies_stall===",
+            "p rcu_state.jiffies_stall",
+            "!echo ===RCU_FIELD:n_force_qs===",
+            "p rcu_state.n_force_qs",
+            f"!echo {marker_ctrl}",
+            "!echo ===RCU_FIELD:rcu_cpu_stall_timeout===",
+            "p rcu_cpu_stall_timeout",
+            "!echo ===RCU_FIELD:sysctl_panic_on_rcu_stall===",
+            "p sysctl_panic_on_rcu_stall",
+            "!echo ===RCU_FIELD:jiffies===",
+            "p jiffies",
         ]
     )
     raw = script_runner(combined_script, vmcore_path, vmlinux_path, False)
@@ -738,10 +959,15 @@ def analyze_cpu_lockup_rcu(
     bt_part = raw
     runq_part = ""
     rcu_part = ""
+    ctrl_part = ""
     if marker_runq in raw:
         bt_part, rest = raw.split(marker_runq, 1)
         if marker_rcu in rest:
-            runq_part, rcu_part = rest.split(marker_rcu, 1)
+            runq_part, rest2 = rest.split(marker_rcu, 1)
+            if marker_ctrl in rest2:
+                rcu_part, ctrl_part = rest2.split(marker_ctrl, 1)
+            else:
+                rcu_part = rest2
         else:
             runq_part = rest
     elif marker_rcu in raw:
@@ -750,6 +976,12 @@ def analyze_cpu_lockup_rcu(
     cpu_bts = parse_multi_bt(bt_part)
     runq_info = parse_runq_summary(runq_part)
     rcu_fields = parse_rcu_state(rcu_part)
+    rcu_controls = _parse_rcu_stall_controls(rcu_part, ctrl_part, rcu_fields)
+    rcu_blocked_tasks = (
+        _inspect_rcu_pids(opts.rcu_pids, vmcore_path, vmlinux_path, script_runner)
+        if opts.rcu_pids
+        else []
+    )
 
     suspected_lockup_cpus: list[dict[str, object]] = []
     spinlock_contenders: list[dict[str, object]] = []
@@ -826,6 +1058,15 @@ def analyze_cpu_lockup_rcu(
         if isinstance(top_frames, list) and top_frames:
             recommended.append(f"dis -rl {top_frames[0]}")
 
+    for rec in rcu_blocked_tasks:
+        if rec.get("role") == "waiter_bt_truncated":
+            taddr = str(rec.get("task_addr") or "")
+            bare = taddr[2:] if taddr.startswith("0x") else taddr
+            if bare:
+                cmd = f"bt -f {bare}"
+                if cmd not in recommended:
+                    recommended.append(cmd)
+
     result = {
         "total_cpus_parsed": len(cpu_bts),
         "idle_cpu_count": idle_cpu_count,
@@ -834,6 +1075,8 @@ def analyze_cpu_lockup_rcu(
         "irq_or_softirq_cpus": irq_or_softirq_cpus[:16],
         "active_or_suspected_cpus": suspected_lockup_cpus[:20],
         "rcu_state_summary": rcu_fields,
+        "rcu_stall_controls": rcu_controls,
+        "rcu_blocked_tasks": rcu_blocked_tasks,
         "recommended_next_commands": recommended,
     }
     return json.dumps(result, indent=2, ensure_ascii=False)

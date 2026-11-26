@@ -94,7 +94,10 @@ def should_continue(state: AgentState) -> str:
                     # Sometimes json_repair fixes a truncated model output and sets is_conclusive=False
                     # by default, even though final_diagnosis is populated. Check if we actually have
                     # a final_diagnosis, and if so, consider it conclusive to prevent an infinite loop.
-                    if step_obj.final_diagnosis is not None:
+                    audit_blocked = "Executor audit: conclusion blocked" in (
+                        (step_obj.reasoning or "") + " " + (step_obj.additional_notes or "")
+                    )
+                    if step_obj.final_diagnosis is not None and not audit_blocked:
                         logger.info(
                             "LLM returned is_conclusive=False but final_diagnosis is populated. "
                             "Treating as conclusive to prevent infinite loop. Routing to __end__."

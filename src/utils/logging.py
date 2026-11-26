@@ -34,7 +34,7 @@ class CustomLogRecord(logging.LogRecord):
 
 
 # Function to set up the logger
-def setup_logger(log_filename="va-agent.log", log_dir="logs"):
+def setup_logger(log_filename="va-agent.log", log_dir="logs", enable_file=True):
     # Ensure the logging directory exists
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
@@ -47,15 +47,15 @@ def setup_logger(log_filename="va-agent.log", log_dir="logs"):
 
     # Avoid adding handlers multiple times if logger already exists
     if not logger_instance.handlers:
-        # Define the logging configuration
         logging.setLogRecordFactory(CustomLogRecord)  # Only set once globally
-        handler = logging.FileHandler(log_filepath)
-        formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] [%(module)s] [%(pathname)s:%(lineno)d]: %(message)s"
-        )
-        handler.setFormatter(formatter)
-        handler.setLevel(logging.DEBUG)  # 显式设置文件处理器的级别
-        logger_instance.addHandler(handler)
+        if enable_file:
+            handler = logging.FileHandler(log_filepath)
+            formatter = logging.Formatter(
+                "%(asctime)s [%(levelname)s] [%(module)s] [%(pathname)s:%(lineno)d]: %(message)s"
+            )
+            handler.setFormatter(formatter)
+            handler.setLevel(logging.DEBUG)  # 显式设置文件处理器的级别
+            logger_instance.addHandler(handler)
 
         # Also add console handler for debugging
         console_handler = logging.StreamHandler()
@@ -66,6 +66,23 @@ def setup_logger(log_filename="va-agent.log", log_dir="logs"):
     # 确保无论是否已存在 Handler（例如由于多次调用或环境预初始化），Logger 的级别都设置为 DEBUG
     logger_instance.setLevel(logging.DEBUG)
 
+    return logger_instance
+
+
+def setup_console_logger(name="crash_daemon"):
+    """仅输出到 stdout/stderr 的 logger，供 crash-daemon 等由外部脚本重定向日志的进程使用。"""
+    logger_instance = logging.getLogger(name)
+    if not logger_instance.handlers:
+        logging.setLogRecordFactory(CustomLogRecord)  # Only set once globally
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] [%(module)s] [%(pathname)s:%(lineno)d]: %(message)s"
+            )
+        )
+        handler.setLevel(logging.DEBUG)
+        logger_instance.addHandler(handler)
+    logger_instance.setLevel(logging.DEBUG)
     return logger_instance
 
 

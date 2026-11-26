@@ -495,6 +495,13 @@ def _select_playbook(state: AgentState, recent_text: str) -> str:
     """
     signature_class = state.get("current_signature_class")
     if not signature_class or signature_class == "unknown":
+        lowered = (recent_text or "").lower()
+        if (
+            "rcu stall" in lowered
+            or "detected stalls on cpus/tasks" in lowered
+            or "self-detected stall on cpu" in lowered
+        ):
+            return PLAYBOOKS.get("rcu_stall", "")
         return ""
 
     if _is_stack_protector_case(signature_class, recent_text):

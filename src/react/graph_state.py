@@ -60,9 +60,10 @@ class AgentState(MessagesState):
     # 为 "zh" 时在系统提示词中注入中文输出规则，使报告正文为简体中文。
     report_language: str
 
-    # 当前图执行的累计分析步数。
-    # 该字段通过 operator.add 聚合，适合在多个节点返回增量值后自动累加。
+    # 当前图执行的累计 LLM 推理轮数（仅在 llm_analysis_node 递增，与提示词阶段阈值对齐）。
     step_count: Annotated[int, add]
+    # 当前图执行的累计工具调用次数（仅在 call_crash_tool 递增）。
+    tool_call_count: Annotated[int, add]
 
     # LLM 调用过程中累计消耗的 token 数量。
     # 同样通过 operator.add 聚合，便于统计一次完整分析流程的成本。

@@ -88,9 +88,10 @@ def is_pty_available() -> bool:
 
 def _get_logger():
     try:
-        from src.utils.logging import logger
+        from src.utils.logging import setup_console_logger
 
-        return logger
+        # daemon 日志由启动脚本重定向到 crash-daemon.log，避免共享 agent 的 va-agent.log 文件句柄
+        return setup_console_logger("crash_daemon")
     except Exception:
         import logging
 

@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import re
+from pathlib import Path
 from contextlib import AsyncExitStack
 from typing import Any, List, Mapping, Optional, Tuple, cast
 
@@ -687,7 +688,7 @@ async def collect_crash_init_data(state: AgentState) -> dict:
         error_msg = f"Critical error in {collect_crash_init_data_node}: {exc}"
         logger.error(error_msg, exc_info=True)
         return {
-            "step_count": 1,
+            "step_count": 0,
             "error": {
                 "message": str(exc),
                 "node": collect_crash_init_data_node,
@@ -716,15 +717,56 @@ async def collect_crash_init_data(state: AgentState) -> dict:
                 # 逐行扫描，找到匹配行后提取上下文窗口
                 for i, line in enumerate(dmesg_lines):
                     if pattern.search(line):
-                        # 向前取 50 行（崩溃前的上下文），不提取 dmesg 中的 Call Trace 部分
-                        # Call Trace 以 bt 为准，因为发生 Kernel stack is corrupted，还是以 bt 的为准
+                        # 默认向前取 50 行；若起点落在 Call Trace / 寄存器块中间，
+                        # 继续向上回溯至对应的 WARNING/BUG/cut here 头部行（上限 150 行），
+                        # 避免截断前置告警头行与模块启动日志。
                         start = max(0, i - 50)
-                        end = min(len(dmesg_lines), i)
-                        return (
-                            f"$ vmcore-dmesg (extracted around CPU:{t_cpu} PID:{t_pid} Comm:{t_comm})\n"
-                            + "".join(dmesg_lines[start:end])
-                            + "\n\n"
+                        min_start = max(0, i - 150)
+                        _block_header_re = re.compile(
+                            r"(?:---+\[\s*cut here\s*\]---+|WARNING:|BUG:|Oops:|kernel BUG at)"
                         )
+                        _mid_trace_re = re.compile(
+                            r"(?:Call Trace:|<TASK>|</TASK>|\bRIP:|\bRSP:|\bFS:|\bCS:|\bCR2:|\s+\?\s+|\+0x[0-9a-f]+/0x[0-9a-f]+)"
+                        )
+                        if start > min_start and _mid_trace_re.search(dmesg_lines[start]):
+                            probe = start - 1
+                            while probe >= min_start:
+                                if _block_header_re.search(dmesg_lines[probe]):
+                                    start = max(min_start, probe - 2)
+                                    break
+                                probe -= 1
+
+                        end = min(len(dmesg_lines), i)
+                        parts = [
+                            f"$ vmcore-dmesg (extracted around CPU:{t_cpu} PID:{t_pid} Comm:{t_comm})\n",
+                            "".join(dmesg_lines[start:end]),
+                        ]
+
+                        # 补充提取末尾 2000 行中的关键时间线信号（WARNING/BUG/RCU/第三方模块日志），
+                        # 避免窗口外的前置关键日志（如模块参数、起始时间戳、WARNING 头行）丢失。
+                        extra_mod_names = [
+                            Path(p).stem.split(".")[0]
+                            for p in (state.get("debug_symbol_paths") or [])
+                            if p
+                        ]
+                        sig_tokens = [r"WARNING:", r"BUG:", r"rcu:", r"RCU Stall"]
+                        sig_tokens.extend(re.escape(m) for m in extra_mod_names if m)
+                        sig_re = re.compile("|".join(sig_tokens))
+                        scan_from = max(0, start - 2000)
+                        highlights: list[str] = []
+                        for idx_line in range(scan_from, start):
+                            ln = dmesg_lines[idx_line]
+                            if sig_re.search(ln):
+                                highlights.append(ln)
+                                if len(highlights) >= 30:
+                                    break
+                        if highlights:
+                            parts.append(
+                                "\n$ vmcore-dmesg (earlier key signals before window)\n"
+                                + "".join(highlights)
+                            )
+
+                        return "".join(parts) + "\n\n"
                 # 未找到匹配行，返回空字符串
                 return ""
             except Exception as e:
@@ -769,7 +811,8 @@ async def collect_crash_init_data(state: AgentState) -> dict:
     return {
         "messages": [HumanMessage(content=prompt)],
         "error": None,
-        "step_count": 1,
+        "step_count": 0,
+        "tool_call_count": 0,
         "loaded_modules": loaded_modules,
     }
 
@@ -1178,7 +1221,8 @@ async def call_crash_tool(state: AgentState) -> dict:
         logger.error(f"Critical error in call_crash_tool: {exc}", exc_info=True)
         # 即使发生严重错误，也尽量返回一个空的或错误的消息以避免流程卡死
         return {
-            "step_count": 1,
+            "step_count": 0,
+            "tool_call_count": 1,
             "error": {"message": str(exc), "node": crash_tool_node, "is_error": True},
         }
 
@@ -1252,7 +1296,8 @@ async def call_crash_tool(state: AgentState) -> dict:
         step_index,
     )
     return {
-        "step_count": 1,
+        "step_count": 0,
+        "tool_call_count": 1,
         "messages": tool_messages,
         "executed_fingerprints": new_fingerprints,
         "replayed_fingerprints": new_replayed_fingerprints,

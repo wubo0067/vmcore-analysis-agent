@@ -81,17 +81,30 @@ Analysis:
     "hard_lockup": _LOCKUP_PLAYBOOK,
     "rcu_stall": """
 ## 3.3 RCU Stall
-Pattern: rcu_sched self-detected stall or related RCU stall report.
+Pattern: rcu_preempt / rcu_sched self-detected stall on CPUs or tasks, or `Kernel panic - not syncing: RCU Stall`.
 
-Analysis:
-1. Identify stall type first: rcu_sched, rcu_bh, or rcu_tasks.
-2. Inspect stalled-task backtrace for long-held rcu_read_lock sections.
-3. Check whether offline or online CPU operations delayed the grace period.
-4. If CONFIG_RCU_NOCB_CPU is present, consider callback backlog accumulation.
-5. If a third-party module is on the stalled task's path and `dis -l` or `dis -s` resolves source lines, continue from source instead of stopping at the stall symptom: inspect the exact sleep, loop, or lock-holding path in that function.
-6. For source-mapped third-party module code, identify the concrete source-side mistake: sleeping while atomic, holding `rcu_read_lock()` across a blocking call, missing unlock on an error path, wrong loop exit condition, or a state flag that never changes.
-7. Validate the source-side predicate with runtime values. Prefer reading the task state and the exact fields implied by the source line, such as `task -R preempt_count`, `task -R rcu_read_lock_nesting`, module-private state fields via `struct`, or the arguments/locals visible in adjacent disassembly.
-8. If a WARN/BUG precedes the final stall, treat the WARN/BUG trigger condition as a candidate primary cause and use source-level analysis to explain how it leads to the later RCU stall, rather than treating the stall as the only root cause signal.
+Mandatory Fast Path (Step 1):
+- When `analyze_cpu_lockup_rcu` is available, you MUST invoke it FIRST before issuing manual `struct rcu_node` / `list` commands (pass `--rcu-pids <pid1,pid2>` with any blocked reader/waiter PIDs reported in dmesg). It deterministically traverses `task_struct.rcu_blocked_node` -> `rcu_node` without manual address errors, and aggregates per-CPU stacks, runq pressure, `rcu_state` (`gp_seq`/`gp_state`/`gp_start`), `jiffies`, `rcu_cpu_stall_timeout`, `sysctl_panic_on_rcu_stall`, and `rcu_node` (`qsmask`/`gp_tasks`/`exp_tasks`/`blkd_tasks`) in a single call.
+
+Standard Manual Sequence (use targeted dot-syntax; NEVER dump full `struct -o task_struct` or `struct -o rcu_state` just to compute 2-3 offsets):
+1. Identify stall flavor (`rcu_preempt` vs `rcu_sched` / `rcu_tasks`) and whether dmesg lists CPUs, blocked tasks (`Tasks blocked on level-N rcu_node`), or both. Tasks-only with no stalled CPUs indicates a task-blocked stall rather than a wedged CPU.
+2. For each blocked task PID from dmesg, inspect its backtrace and RCU fields directly:
+   - `bt <pid>` (if truncated and you need raw stack frames, use `bt -f <hex_task_addr>`, never a numeric PID)
+   - `struct task_struct.__state,rcu_read_lock_nesting,rcu_blocked_node,rcu_node_entry <task_addr>` (on 5.14+ kernels the field is `__state`, not `state`)
+3. Using the task's `rcu_blocked_node` address (do NOT assume `rcu_state.node0`; 5.14 uses `rcu_state.node[]` and dmesg names the exact level), inspect the blocking `rcu_node` and list all blocked tasks:
+   - `struct rcu_node.level,grplo,grphi,qsmask,gp_seq,gp_tasks,exp_tasks,blkd_tasks <blocked_node_addr>`
+   - `list -H <blkd_tasks_addr> -l task_struct.rcu_node_entry -s task_struct.pid,comm`
+4. Verify GP age and stall/panic thresholds directly from kernel globals:
+   - `p rcu_cpu_stall_timeout`, `p sysctl_panic_on_rcu_stall`, `p jiffies`, `p rcu_state.gp_start`, `p rcu_state.gp_state`, `p rcu_state.gp_seq`
+5. If a third-party module is on the stalled task's path and `dis -rl <ret_addr>` (or `dis -s <ret_addr - 1>`) resolves source lines, continue from source: inspect the exact sleep, loop, or lock-holding call site and validate runtime module state.
+6. Run a lightweight negative check (`log -m | grep -Ei "mce|hardware error|nmi|steal"`) when relevant (e.g., virtualized hosts) before closing alternative causes.
+
+RCU Stall Semantics & Accuracy Rules:
+- `t=<N> jiffies` in RCU stall dmesg is GP age (`jiffies - rcu_state.gp_start`), NOT the exact duration a reader held `rcu_read_lock()`. Derive reader hold duration from dmesg timestamps and cross-check against `gp_start`/`jiffies`/`gp_seq`.
+- A preceding `WARN_ON_ONCE` in `rcu_note_context_switch` (`!preempt && rcu_preempt_depth() > 0`) is a voluntary-context-switch-in-RCU-reader warning (and the source of the `W` taint), NOT an "RCU stall warning". Elevate it as primary earliest evidence, not an afterthought.
+- A task calling `synchronize_rcu()` is a GP waiter/witness, NOT a necessary trigger condition for an RCU stall; any grace period is blocked by tasks on `blkd_tasks`/`gp_tasks`. Do not claim a task is blocked in `synchronize_rcu()` unless its backtrace or stack/callback evidence confirms it.
+- On `rcu_stall_mod` or similar third-party modules, explain why panic occurred at `rcu_cpu_stall_timeout` (e.g., 60s < `stall_duration_ms` with `sysctl_panic_on_rcu_stall=1`) using the read kernel variables rather than guessing loop step sizes.
+- Root-cause enum discipline: for sleeping or long-holding inside `rcu_read_lock()` (whether a driver bug or test module), set `root_cause_class="rcu_misuse"` and `corruption_mechanism="unknown"` — NEVER set `race_condition` or `reinit_path_bug`.
 """.strip(),
     "use_after_free": """
 ## 3.4 Use-After-Free / Memory Corruption

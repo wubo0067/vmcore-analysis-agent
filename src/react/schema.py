@@ -414,15 +414,19 @@ class ToolCall(BaseModel):
         `cls` 表示当前模型类，而不是某个具体实例。
         """
         if isinstance(data, dict):
-            if "command_name" in data and "arguments" not in data:
+            if data.get("arguments") is None:
+                data["arguments"] = []
+            elif isinstance(data.get("arguments"), str):
+                stripped = data["arguments"].strip()
+                data["arguments"] = [stripped] if stripped else []
+
+            if "command_name" in data and not data["arguments"]:
                 for key, value in list(data.items()):
-                    if isinstance(value, list):
+                    if key != "arguments" and isinstance(value, list):
                         data["arguments"] = value
                         if key != "command_name":
                             del data[key]
                         break
-                if "arguments" not in data:
-                    data["arguments"] = []
             if isinstance(data.get("arguments"), list):
                 cleaned_args: list[str] = []
                 for raw_item in data["arguments"]:
