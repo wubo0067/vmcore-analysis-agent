@@ -70,6 +70,8 @@ When a synchronous CPU exception (page fault, GPF, SMAP/SMEP violation) is captu
   anchor; do not use a broad or generic pattern.
 - Forbidden: bt -a except when signature_class is hard_lockup (e.g. NMI watchdog hard LOCKUP)
 	Correct alternative: bt <pid>, bt -c <cpu>, foreach UN bt
+	For hung-task / deadlock / lockup / RCU-stall triage, call the deterministic analyzers in 3.7a FIRST
+	when they are available; use these manual commands only for targeted follow-up.
 - Forbidden: ps or ps -m standalone
 	Correct alternative: ps | grep <pat>, ps <pid>
 - Forbidden: log, log -m, log -t, or log -a standalone
@@ -406,7 +408,7 @@ In crash backtraces, frames prefixed with ? are scan-derived candidates and must
 - runq, runq -t
 - set <pid> (switch to task context by PID)
 - set -c <cpu> (switch to CPU context; do NOT use bare `set <N>` to switch CPUs -- that sets PID N)
-- foreach UN bt
+- foreach UN bt (manual fallback; prefer analyze_lock_wait_graph from 3.7a when available)
 - search -s <start> -e <end> <value>
 - kmem -p <phys_addr>
 - ptov <phys_addr>
@@ -424,6 +426,29 @@ In crash backtraces, frames prefixed with ? are scan-derived candidates and must
 - Use kmem -v or help -m for actual kernel virtual address ranges.
 - Recognize common poison values such as 0xdead..., 0x5a5a..., and 0x6b6b....
 
+## 3.7a Deterministic Lock / Hang Analyzers (lock_hang tools)
+
+These are MCP tools, not crash built-ins or mpykdump extensions. When they are available,
+they take precedence over every manual or extension command in 3.5 and 3.8 for the scenarios
+below: their structured output is parsed by the executor and can close hang-related gates directly.
+
+- **analyze_lock_wait_graph**: FIRST action for hung_task watchdog panics, "blocked for more than
+  N seconds", AB-BA deadlocks, or many UN (D-state) tasks. Decodes mutex / rw_semaphore owner
+  words (masking the low flag bits), builds the wait-for graph, and reports deadlock cycles and
+  root blockers.
+  - Syntax: [--pids <pid1,pid2,...>] [--top <int>] [--max-depth <int>] [--lock-addr <hex>] [--lock-type <mutex|rwsem>]
+  - Prefer over: foreach UN bt, hanginfo, and manual struct mutex / rw_semaphore owner decoding.
+- **analyze_cpu_lockup_rcu**: FIRST action for soft lockup, hard lockup (NMI watchdog), spinlock
+  storms, or RCU stalls. Aggregates per-CPU wait category, spinlock contenders, softirq/watchdog
+  stalls, runq pressure, and rcu_state in a single call.
+  - Syntax: [--cpus <cpu1,cpu2,...>] [--rcu-pids <pid1,pid2,...>] [--include-idle]
+  - Prefer over: bt -a across all CPUs and manual struct rcu_node / list walking.
+- After the analyzer returns, follow up only on what it identified: bt -f <task_addr> for cycle
+  members or root blockers, bt -c <cpu> for suspected CPUs, struct for one specific lock, and
+  dis -rl <function> for the stuck frame.
+- Fallback: if the analyzer is unavailable, errors, or reports no_uninterruptible_tasks / an empty
+  result, fall back to hanginfo / rqlist (3.8) and the manual commands in 3.5.
+
 ## 3.8 Extended Commands (mpykdump / crash-extensions)
 
 The following commands are provided by mpykdump and crash-extensions.
@@ -431,7 +456,8 @@ Prefer these over manual built-in equivalents when the scenario matches.
 
 ### Hang / Uninterruptible Sleep
 
-- **hanginfo**: Use as the FIRST command when diagnosing D-state
+- **hanginfo**: Use as the FIRST extension command (after analyze_lock_wait_graph
+  from 3.7a when that tool is available) when diagnosing D-state
   (TASK_UNINTERRUPTIBLE) hangs, mutex/semaphore deadlocks, or hung_task
   watchdog panics. Automatically categorizes all UN threads by wait reason.
   - Trigger: panic string contains "hung_task", "INFO: task ... blocked",

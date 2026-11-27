@@ -767,4 +767,12 @@ is a critical analysis error that misleads the customer.
 ### 5.8 DMA Corruption Forensics
 - Refer to the DMA workflow for full device-side attribution rules.
 """.strip(),
+    "lock_hang_fast_path": """
+[SOP: LOCK / HANG / RCU STALL FAST PATH]
+Injected because lock, hang, lockup, or RCU-stall signals appear in the crash context before the crash signature is classified.
+1. Hung tasks, "blocked for more than N seconds", AB-BA deadlocks, or multiple UN-state tasks: when `analyze_lock_wait_graph` is available, call it FIRST (e.g. arguments `--top 12`, or `--pids <pid1,pid2>`). It decodes mutex/rwsem owner words, builds the wait-for graph, and reports deadlock cycles and root blockers without flooding context.
+2. Soft lockup, hard lockup, spinlock storm, or RCU stall: when `analyze_cpu_lockup_rcu` is available, call it FIRST instead of dumping `bt -a` across all CPUs (add `--rcu-pids <pid1,pid2>` for blocked RCU readers/waiters reported in dmesg).
+3. Only after receiving the structured graph / CPU summary, run targeted `bt -f <task_addr>`, `bt -c <cpu>`, `struct`, or `dis -rl` on the identified cycle members, root blockers, or suspected CPUs.
+4. If the analyzer is unavailable or reports no blocked task / suspected CPU, continue with the active playbook and manual commands.
+""".strip(),
 }

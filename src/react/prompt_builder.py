@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from typing import Iterable, Optional, Sequence, cast
 
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from .action_guard import canonicalize_command_line, extract_command_lines
 from .consistency import (
@@ -510,6 +510,39 @@ def _select_playbook(state: AgentState, recent_text: str) -> str:
     return PLAYBOOKS.get(signature_class, "")
 
 
+# 锁/挂死强信号（均为小写字面量，与 lower() 后的文本比较）。
+# 刻意不含 __mutex_lock / rwsem_down_ 等弱信号，避免在指针破坏类栈中误注入。
+_LOCK_HANG_SIGNAL_TOKENS = (
+    "blocked for more than",
+    "hung_task: blocked tasks",
+    "soft lockup",
+    "hard lockup",
+    "detected stalls on cpus",
+    "self-detected stall",
+    "rcu stall",
+)
+
+
+def _initial_context_text(state: AgentState) -> str:
+    """返回第一条 HumanMessage（初始崩溃上下文）的完整文本，不截断。
+
+    `_recent_text_blob` 对每条消息只取前 800 字符；初始消息中 vmcore-dmesg 位于
+    sys / sys -t / bt 之后，`blocked for more than`、`soft lockup` 等关键行会被截掉。
+    本函数仅用于锁/挂死信号的关键词检测，结果不会注入 prompt。
+    """
+    for message in state.get("messages") or []:
+        if isinstance(message, HumanMessage):
+            content = getattr(message, "content", "")
+            return content if isinstance(content, str) else ""
+    return ""
+
+
+def _has_lock_hang_signal(state: AgentState, lowered_recent_text: str) -> bool:
+    """在近期文本与完整初始上下文中检测锁/挂死强信号。"""
+    haystack = lowered_recent_text + "\n" + _initial_context_text(state).lower()
+    return any(token in haystack for token in _LOCK_HANG_SIGNAL_TOKENS)
+
+
 def _select_sop_fragments(state: AgentState, recent_text: str) -> list[str]:
     """
     根据当前调查状态选择应注入的 SOP 片段。
@@ -601,6 +634,14 @@ def _select_sop_fragments(state: AgentState, recent_text: str) -> list[str]:
 
     if "kasan" in lowered_recent_text or "ubsan" in lowered_recent_text:
         fragments.append(SOP_FRAGMENTS["kasan_ubsan"])
+
+    # 锁/挂死兜底 SOP：仅在签名尚未分类（None / 空 / unknown，即第 1 轮初筛）且上下文出现强信号时注入，
+    # 让第 1 轮也能优先调用 lock_hang 分析器。签名一旦落定即退场：四类锁/挂死签名由各自 playbook 的
+    # Mandatory Fast Path 负责；非锁类签名不再被初始 dmesg 中残留的历史锁/挂死日志反复注入。
+    if (not signature_class or signature_class == "unknown") and _has_lock_hang_signal(
+        state, lowered_recent_text
+    ):
+        fragments.append(SOP_FRAGMENTS["lock_hang_fast_path"])
 
     # 在后期收敛阶段，为高风险签名注入高级分析技巧。
     if step_count >= 18 and signature_class in {

@@ -11,10 +11,15 @@ _LOCKUP_PLAYBOOK = """
 ## 3.2 Soft Lockup / Hard Lockup
 Pattern: soft lockup or NMI watchdog hard lockup.
 
+Mandatory Fast Path (Step 1):
+- When `analyze_cpu_lockup_rcu` is available, you MUST invoke it FIRST, before `bt -a`, per-CPU `bt -c` sweeps, or manual qspinlock decoding (pass `--cpus <cpu1,cpu2>` with the CPUs named in the watchdog message when known).
+- Then run the targeted steps below only on the CPUs it reports in `spinlock_contenders`, `irq_or_softirq_cpus`, or `active_or_suspected_cpus`. For hard lockup, still confirm the NMI/watchdog context with `bt -c <cpu>` on the reported CPU.
+- If the tool is unavailable, errors, or reports no suspected CPU, continue with the manual analysis below.
+
 Analysis:
 1. Use dis -l <stuck_function> 100 to identify loops or pause-based spin paths.
 2. Check for missing cond_resched() or long IRQ-disabled sections.
-3. For hard lockup, use bt -a to inspect all CPUs for lock contention or non-progress.
+3. For hard lockup, use bt -a to inspect all CPUs for lock contention or non-progress only when `analyze_cpu_lockup_rcu` is unavailable; otherwise use bt -c <cpu> on the CPUs it reported.
 4. For soft lockup or spinlock/rwlock contention (e.g., native_queued_spin_lock_slowpath), decode the lock address from registers/stack, inspect `qspinlock` `val` (locked/pending/tail CPU & idx), and use `bt -c <cpu>` on the active/running peer CPUs plus `runq` to locate the lock holder.
 5. Use runq to inspect per-CPU queue backlog and scheduler imbalance.
 """.strip()
@@ -209,9 +214,14 @@ Analysis:
 ## 3.5 Deadlock / Hung Task
 Pattern: task blocked for more than 120 seconds.
 
+Mandatory Fast Path (Step 1):
+- When `analyze_lock_wait_graph` is available, you MUST invoke it FIRST (e.g. `--top 12`, or `--pids <pid1,pid2>` with the blocked PIDs reported in dmesg), before `foreach UN bt`, `hanginfo`, or manual `struct mutex` / `rw_semaphore` owner decoding. It decodes owner words, builds the wait-for graph, and reports `deadlock_cycles` and `root_blockers`.
+- Then run targeted `bt -f <task_addr>` / `struct` / `dis -rl` only on the reported cycle members and root blockers. Use `--lock-addr <hex> --lock-type <mutex|rwsem>` to confirm a single lock's owner chain (omitting `--lock-type` means mutex).
+- If the tool is unavailable, errors, or reports `no_uninterruptible_tasks`, fall back to the manual analysis below (start with `hanginfo` / `rqlist` to separate lock waits from I/O hangs).
+
 Analysis:
 1. Distinguish true deadlock, lock starvation, and I/O hang first (when custom crash extensions are available, use `hanginfo`, `rqlist`, or `scsishow` as appropriate).
-2. Use foreach UN bt to inspect all D-state tasks.
+2. Use foreach UN bt to inspect all D-state tasks (manual fallback when the fast path is unavailable).
 3. Inspect lock ownership with struct mutex / rw_semaphore and wait-chain backtraces: for `struct mutex`, mask the lower flag bits of `owner` (`owner & ~0x7`) to extract the holder `task_struct *`, then run `bt <holder_task_addr>` or `bt -c <cpu>` if the holder is running on a CPU.
 4. If lockdep output exists in dmesg, prioritize it.
 """.strip(),

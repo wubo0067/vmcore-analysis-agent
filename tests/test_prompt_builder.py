@@ -541,5 +541,171 @@ class ReplanProbeMenuTests(unittest.TestCase):
                 self.assertIn("Pivot requirement", rendered)
 
 
+
+LOCK_HANG_DMESG_LINE = (
+    "INFO: task kworker/3:1:4321 blocked for more than 120 seconds.\n"
+)
+
+
+def _long_initial_message(signal_line: str) -> str:
+    # 模拟真实初始消息：dmesg 位于 sys / sys -t / bt 之后，远超 800 字符截断窗口。
+    return ("# Initial Context\n" + "sys / bt output line\n" * 120) + signal_line
+
+
+class LockHangFastPathTests(unittest.TestCase):
+    def test_layer0_lists_analyzers_before_extension_commands(self) -> None:
+        from src.react.layer0_system import LAYER0_SYSTEM_PROMPT_TEMPLATE as L0
+
+        new_section = L0.index("## 3.7a Deterministic Lock / Hang Analyzers")
+        self.assertLess(new_section, L0.index("## 3.8 Extended Commands"))
+        self.assertLess(new_section, L0.index("**hanginfo**"))
+        self.assertIn("analyze_lock_wait_graph", L0)
+        self.assertIn("analyze_cpu_lockup_rcu", L0)
+        self.assertIn("--rcu-pids", L0)
+        # hanginfo 不再与 lock_hang 争抢唯一 FIRST
+        self.assertNotIn("**hanginfo**: Use as the FIRST command", L0)
+        self.assertNotIn("bt -f <pid>", L0)
+        # 模板仍可被 str.format 正常渲染（新增文本不得引入花括号）
+        L0.format(VMCoreAnalysisStep_Schema="{}")
+
+    def test_playbooks_put_analyzer_before_manual_commands(self) -> None:
+        from src.react.playbooks import PLAYBOOKS
+
+        hung = PLAYBOOKS["hung_task"]
+        self.assertIn("Mandatory Fast Path", hung)
+        self.assertLess(hung.index("analyze_lock_wait_graph"), hung.index("foreach UN bt"))
+        for sig in ("soft_lockup", "hard_lockup"):
+            with self.subTest(signature=sig):
+                book = PLAYBOOKS[sig]
+                self.assertIn("Mandatory Fast Path", book)
+                self.assertLess(book.index("analyze_cpu_lockup_rcu"), book.index("bt -a"))
+        for sig in ("hung_task", "soft_lockup", "hard_lockup"):
+            self.assertNotIn("bt -f <pid>", PLAYBOOKS[sig])
+
+    def test_sop_injected_on_first_turn_despite_recent_text_truncation(self) -> None:
+        from langchain_core.messages import HumanMessage
+        from src.react.prompt_builder import _recent_text_blob, _select_sop_fragments
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        messages = [HumanMessage(content=_long_initial_message(LOCK_HANG_DMESG_LINE))]
+        recent = _recent_text_blob(messages)
+        # 前置条件：关键行确实被 800 字符截断窗口裁掉
+        self.assertNotIn("blocked for more than", recent.lower())
+        state = {
+            "current_signature_class": None,
+            "current_root_cause_class": None,
+            "step_count": 0,
+            "messages": messages,
+        }
+        self.assertIn(SOP_FRAGMENTS["lock_hang_fast_path"], _select_sop_fragments(state, recent))
+
+    def test_sop_detects_each_strong_signal(self) -> None:
+        from langchain_core.messages import HumanMessage
+        from src.react.prompt_builder import _recent_text_blob, _select_sop_fragments
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        lines = (
+            "watchdog: BUG: soft lockup - CPU#3 stuck for 22s! [insmod:1234]\n",
+            "NMI watchdog: Watchdog detected hard LOCKUP on cpu 5\n",
+            "rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:\n",
+            "rcu: INFO: rcu_sched self-detected stall on CPU\n",
+            "Kernel panic - not syncing: hung_task: blocked tasks\n",
+        )
+        for line in lines:
+            with self.subTest(line=line):
+                messages = [HumanMessage(content=_long_initial_message(line))]
+                state = {
+                    "current_signature_class": None,
+                    "step_count": 0,
+                    "messages": messages,
+                }
+                self.assertIn(
+                    SOP_FRAGMENTS["lock_hang_fast_path"],
+                    _select_sop_fragments(state, _recent_text_blob(messages)),
+                )
+
+    def test_sop_not_duplicated_when_lock_hang_playbook_active(self) -> None:
+        from langchain_core.messages import HumanMessage
+        from src.react.prompt_builder import _recent_text_blob, _select_sop_fragments
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        messages = [HumanMessage(content=_long_initial_message(LOCK_HANG_DMESG_LINE))]
+        for sig in ("hung_task", "soft_lockup", "hard_lockup", "rcu_stall"):
+            with self.subTest(signature=sig):
+                state = {
+                    "current_signature_class": sig,
+                    "step_count": 4,
+                    "messages": messages,
+                }
+                self.assertNotIn(
+                    SOP_FRAGMENTS["lock_hang_fast_path"],
+                    _select_sop_fragments(state, _recent_text_blob(messages)),
+                )
+
+    def test_sop_retires_once_non_lock_signature_is_classified(self) -> None:
+        # 评审回归：初始 dmesg 残留历史锁/挂死日志时，非锁类签名落定后兜底 SOP 必须退场
+        from langchain_core.messages import HumanMessage
+        from src.react.prompt_builder import _recent_text_blob, _select_sop_fragments
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        messages = [HumanMessage(content=_long_initial_message(LOCK_HANG_DMESG_LINE))]
+        for sig in ("pointer_corruption", "null_deref", "stack_corruption", "bug_on"):
+            with self.subTest(signature=sig):
+                state = {
+                    "current_signature_class": sig,
+                    "step_count": 6,
+                    "messages": messages,
+                }
+                self.assertNotIn(
+                    SOP_FRAGMENTS["lock_hang_fast_path"],
+                    _select_sop_fragments(state, _recent_text_blob(messages)),
+                )
+
+    def test_sop_injected_for_unknown_or_empty_signature(self) -> None:
+        from langchain_core.messages import HumanMessage
+        from src.react.prompt_builder import _recent_text_blob, _select_sop_fragments
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        messages = [HumanMessage(content=_long_initial_message(LOCK_HANG_DMESG_LINE))]
+        for sig in ("unknown", ""):
+            with self.subTest(signature=sig):
+                state = {
+                    "current_signature_class": sig,
+                    "step_count": 2,
+                    "messages": messages,
+                }
+                self.assertIn(
+                    SOP_FRAGMENTS["lock_hang_fast_path"],
+                    _select_sop_fragments(state, _recent_text_blob(messages)),
+                )
+
+    def test_sop_not_injected_without_strong_signal(self) -> None:
+        from langchain_core.messages import HumanMessage
+        from src.react.prompt_builder import _recent_text_blob, _select_sop_fragments
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        # 弱信号（__mutex_lock 出现在栈中）不应触发兜底 SOP
+        messages = [
+            HumanMessage(content=_long_initial_message(" #3 [ffffb] __mutex_lock at ffffffff81a0\n"))
+        ]
+        state = {
+            "current_signature_class": "pointer_corruption",
+            "step_count": 4,
+            "messages": messages,
+        }
+        self.assertNotIn(
+            SOP_FRAGMENTS["lock_hang_fast_path"],
+            _select_sop_fragments(state, _recent_text_blob(messages)),
+        )
+
+    def test_sop_fragment_syntax_matches_tool_contract(self) -> None:
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        sop = SOP_FRAGMENTS["lock_hang_fast_path"]
+        self.assertIn("--rcu-pids", sop)
+        self.assertIn("bt -f <task_addr>", sop)
+        self.assertNotIn("bt -f <pid>", sop)
+
+
 if __name__ == "__main__":
     unittest.main()
