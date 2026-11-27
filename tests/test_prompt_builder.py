@@ -749,5 +749,194 @@ class SelectPlaybookInitialContextTests(unittest.TestCase):
         )
 
 
+
+class TerminateExemptionTests(unittest.TestCase):
+    """收尾豁免：只对 tool_error 和"源码可读但 0 SOURCE_REF"生效，且各自只触发一次。"""
+
+    def _ready(self, **overrides):
+        state = dict(
+            current_signature_class="null_deref",
+            current_root_cause_class="use_after_free",
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="executed",
+            duplicate_streak=0,
+            no_progress_streak=1,
+            replan_required=True,
+            evidence_facts=ALL_DIMENSION_FACTS,
+        )
+        state.update(overrides)
+        return state
+
+    def _assert_no_terminate_channel(self, rendered: str) -> None:
+        # 三处收尾通道都必须让位：菜单、状态段、门控目标行
+        self.assertNotIn("TERMINATE ON THIS TURN", rendered)
+        self.assertNotIn("terminate on this turn by emitting the final JSON conclusion", rendered)
+        self.assertNotIn("the only remaining objective is to emit the final conclusion", rendered)
+
+    def test_tool_error_gets_one_retry(self) -> None:
+        rendered = _render(**self._ready(last_action_status="tool_error"))
+        self.assertIn("RETRY AFTER TOOL ERROR", rendered)
+        self.assertIn("retry the failed tool call ONCE", rendered)
+        self._assert_no_terminate_channel(rendered)
+
+    def test_tool_error_retry_is_one_shot(self) -> None:
+        rendered = _render(
+            **self._ready(last_action_status="tool_error", tool_error_retry_used=True)
+        )
+        self.assertIn("TERMINATE ON THIS TURN", rendered)
+
+    def test_guard_rejections_do_not_suspend_termination(self) -> None:
+        # dedup / convergence-guard 的 rejected 是防空转护栏，不能被豁免 A 解除
+        rendered = _render(**self._ready(last_action_status="rejected"))
+        self.assertIn("TERMINATE ON THIS TURN", rendered)
+        self.assertNotIn("RETRY AFTER TOOL ERROR", rendered)
+
+    def test_streak_bound_disables_exemptions(self) -> None:
+        rendered = _render(**self._ready(last_action_status="tool_error", no_progress_streak=3))
+        self.assertNotIn("RETRY AFTER TOOL ERROR", rendered)
+
+    def test_missing_source_ref_gets_one_citation_check(self) -> None:
+        rendered = _render(**self._ready(kernel_source_root="/root/kernel-sources/x"))
+        self.assertIn("SOURCE CITATION CHECK", rendered)
+        self.assertIn("cite ONE SOURCE_REF", rendered)
+        self._assert_no_terminate_channel(rendered)
+
+    def test_citation_check_is_one_shot_even_if_model_ignored_it(self) -> None:
+        # 发出过一次后，即使模型下一步执行的是 rd 而非 read_source，也不再触发
+        rendered = _render(
+            **self._ready(
+                kernel_source_root="/root/kernel-sources/x",
+                source_citation_retry_used=True,
+            )
+        )
+        self.assertIn("TERMINATE ON THIS TURN", rendered)
+        self.assertNotIn("SOURCE CITATION CHECK", rendered)
+
+    def test_cited_or_unconfigured_source_terminates(self) -> None:
+        cited = _render(
+            **self._ready(
+                kernel_source_root="/root/kernel-sources/x",
+                evidence_facts=ALL_DIMENSION_FACTS + ["source_ref:kernel/rcu/tree_plugin.h:318"],
+            )
+        )
+        self.assertIn("TERMINATE ON THIS TURN", cited)
+        self.assertIn("TERMINATE ON THIS TURN", _render(**self._ready()))
+
+    def test_issued_exemption_matches_rendering_condition(self) -> None:
+        from src.react.prompt_builder import issued_terminate_exemption
+
+        state = dict(BASE_STATE, **self._ready(last_action_status="tool_error"))
+        self.assertEqual(issued_terminate_exemption(state), "tool_error_retry")
+        state["replan_required"] = False
+        self.assertIsNone(issued_terminate_exemption(state))
+
+    def test_non_payload_signature_terminate_text(self) -> None:
+        from src.react.schema import required_gates_for
+
+        gates = {
+            name: GateEntry(
+                status="closed",
+                evidence="executor facts",
+                required_for=["rcu_stall"],
+                closure_basis="executor_evidence",
+            )
+            for name in (required_gates_for("rcu_stall") or [])
+        }
+        rendered = _render(
+            **self._ready(
+                current_signature_class="rcu_stall",
+                current_root_cause_class="rcu_misuse",
+                managed_gates=gates,
+            )
+        )
+        self.assertIn("TERMINATE ON THIS TURN", rendered)
+        self.assertIn("Layer0 2.4", rendered)
+        self.assertNotIn("overwritten scalar", rendered)
+        line = next(l for l in rendered.splitlines() if "TERMINATE ON THIS TURN" in l)
+        self.assertNotIn('confidence="low"', line)
+
+
+class SourceCitationStatusTests(unittest.TestCase):
+    def test_module_dir_counts_only_when_it_contains_sources(self) -> None:
+        import tempfile
+
+        from src.react.graph_state import source_citation_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ko = Path(tmp) / "rcu_stall_mod.ko"
+            ko.write_bytes(b"")
+            state = {"debug_symbol_paths": [str(ko)]}
+            self.assertEqual(source_citation_status(state), ("not_configured", 0))
+            (Path(tmp) / "rcu_stall_mod.c").write_text("int x;\n", encoding="utf-8")
+            self.assertEqual(source_citation_status(state), ("missing", 0))
+
+    def test_refs_are_counted_once(self) -> None:
+        from src.react.graph_state import source_citation_status
+
+        facts = ["source_ref:a.c:1", "source_ref:a.c:1", "source_ref:b.c:2"]
+        self.assertEqual(source_citation_status({"evidence_facts": facts}), ("cited", 2))
+
+
+
+class ReportEvidenceDisciplineRuleTests(unittest.TestCase):
+    """2026-11-27 21:37 报告评审的三处措辞问题对应的提示词约束。"""
+
+    def test_layer0_contains_three_new_rules(self) -> None:
+        from src.react.layer0_system import LAYER0_SYSTEM_PROMPT_TEMPLATE as L0
+
+        self.assertIn("Truncated-stack follow-up", L0)
+        self.assertIn("run that `bt -f` before emitting the final conclusion", L0)
+        self.assertIn("No placeholder values", L0)
+        self.assertIn("ffffffffaa42xxxx", L0)
+        self.assertIn("SOURCE_REF citation scope", L0)
+        self.assertIn("must be labeled as disassembly evidence", L0)
+        # 模板仍可被 str.format 渲染（新规则不得引入花括号）
+        L0.format(VMCoreAnalysisStep_Schema="{}")
+
+    def test_rules_live_in_the_existing_discipline_block(self) -> None:
+        from src.react.layer0_system import LAYER0_SYSTEM_PROMPT_TEMPLATE as L0
+
+        anchor = L0.index("Configured vs. actual duration discipline")
+        for marker in ("Truncated-stack follow-up", "No placeholder values", "SOURCE_REF citation scope"):
+            self.assertGreater(L0.index(marker), anchor)
+            self.assertLess(L0.index(marker), L0.index("## Log Query Budget"))
+
+    def test_rcu_stall_playbook_requires_late_bt_f(self) -> None:
+        from src.react.playbooks import PLAYBOOKS
+
+        book = PLAYBOOKS["rcu_stall"]
+        self.assertIn("as soon as a later analyzer run reports `waiter_bt_truncated`", book)
+        self.assertIn("do not describe the waiter as blocked in `synchronize_rcu()`", book)
+
+
+
+class FinalHygieneRuleTests(unittest.TestCase):
+    """2026-11-27 22:23 报告评审：偏移进制混写、--rcu-pids 漏传 waiter、误带 --top。"""
+
+    def test_layer0_offset_radix_rule(self) -> None:
+        from src.react.layer0_system import LAYER0_SYSTEM_PROMPT_TEMPLATE as L0
+
+        self.assertIn("Disassembly vs. backtrace offset radix", L0)
+        self.assertIn("never prefix a decimal `dis` offset with `0x`", L0)
+        # 与其他证据纪律规则放在一起，位于 Log Query Budget 之前
+        marker = L0.index("Disassembly vs. backtrace offset radix")
+        self.assertGreater(marker, L0.index("SOURCE_REF citation scope"))
+        self.assertLess(marker, L0.index("## Log Query Budget"))
+        L0.format(VMCoreAnalysisStep_Schema="{}")
+
+    def test_sop_asks_for_all_rcu_pids_and_forbids_top(self) -> None:
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        sop = SOP_FRAGMENTS["lock_hang_fast_path"]
+        self.assertIn("--rcu-pids <pid1,pid2,...>", sop)
+        self.assertIn("BOTH blocked RCU readers AND any `synchronize_rcu`/GP waiter PIDs", sop)
+        self.assertIn("do not pass `--top`", sop)
+        # 原来只写"add --rcu-pids"的措辞已被替换
+        self.assertNotIn("(add `--rcu-pids", sop)
+        # --top 仍是 analyze_lock_wait_graph 第 1 条里的合法示例
+        self.assertIn("arguments `--top 12`", sop)
+
+
 if __name__ == "__main__":
     unittest.main()

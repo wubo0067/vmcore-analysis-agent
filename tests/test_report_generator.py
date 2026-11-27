@@ -327,5 +327,32 @@ class GateAuditReportTests(unittest.TestCase):
         )
 
 
+
+class SourceCitationLineTests(unittest.TestCase):
+    def _report(self, **overrides):
+        return generate_markdown_report(
+            _base_state(report_language="eng", managed_gates=_gates(), **overrides)
+        )
+
+    def test_cited(self) -> None:
+        report = self._report(
+            evidence_facts=["source_ref:kernel/rcu/tree_plugin.h:318", "source_ref:mod.c:228"]
+        )
+        self.assertIn("- **Source Citations**: ✅ 2 SOURCE_REF cited", report)
+
+    def test_missing_when_source_configured(self) -> None:
+        report = self._report(kernel_source_root="/root/kernel-sources/x")
+        self.assertIn("⚠️ Missing (source readable, 0 SOURCE_REF)", report)
+
+    def test_not_configured(self) -> None:
+        self.assertIn("- **Source Citations**: ➖ Not configured", self._report())
+
+    def test_audit_lists_citation_after_metadata(self) -> None:
+        audit = generate_gate_audit_report(
+            _base_state(current_signature_class="null_deref", managed_gates=_gates())
+        )
+        self.assertIn("- **源码引用**：➖ 未配置", audit)
+        self.assertLess(audit.index("**生成时间**"), audit.index("**源码引用**"))
+
 if __name__ == "__main__":
     unittest.main()

@@ -892,5 +892,45 @@ class ModuleSourceTests(unittest.TestCase):
         self.assertEqual(path, self.mod_source.resolve())
 
 
+
+class PayloadTypeValidationTests(unittest.TestCase):
+    """build_tool_payload 在派发到 MCP 前按 server 签名校验参数类型。"""
+
+    def _build(self, tool, params):
+        from src.mcp_tools.kernel_source.client import build_tool_payload
+
+        return build_tool_payload(tool, params, {})
+
+    def test_list_file_and_line_are_rejected_with_actionable_hint(self) -> None:
+        # 回归：本次事故中模型一次传了 3 个 file 和 3 个 line
+        cases = (
+            {"file": ["a.c", "b.c"], "line": 10},
+            {"file": "a.c", "line": [217, 318, 345]},
+        )
+        for params in cases:
+            with self.subTest(params=params):
+                with self.assertRaises(ValueError) as ctx:
+                    self._build("read_source", params)
+                self.assertIn("once per file", str(ctx.exception))
+
+    def test_numeric_string_is_coerced_to_int(self) -> None:
+        payload = self._build("read_source", {"file": "a.c", "line": "217", "context": " 20 "})
+        self.assertEqual(payload["line"], 217)
+        self.assertEqual(payload["context"], 20)
+
+    def test_bool_and_non_numeric_line_are_rejected(self) -> None:
+        for bad in (True, "abc", 1.5):
+            with self.subTest(line=bad):
+                with self.assertRaises(ValueError):
+                    self._build("read_source", {"file": "a.c", "line": bad})
+
+    def test_other_source_tools_are_validated_too(self) -> None:
+        with self.assertRaises(ValueError):
+            self._build("grep_source", {"pattern": ["a", "b"]})
+        with self.assertRaises(ValueError):
+            self._build("git_history", {"file": "a.c", "start_line": [1, 2]})
+        payload = self._build("find_struct", {"type_name": "rcu_node", "max_lines": "80"})
+        self.assertEqual(payload["max_lines"], 80)
+
 if __name__ == "__main__":
     unittest.main()

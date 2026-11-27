@@ -73,6 +73,17 @@ structure_reasoning_node = "structure_reasoning_node"
 # 定义在此处（而非 edges.py）是因为 edges.py 已依赖 nodes.py，反向导入会成环。
 NO_PROGRESS_STREAK_LIMIT = 3
 
+# 工具调用失败的输出前缀。除执行器自己包装的 "[error] ..." 外，provider 会把内部异常
+# 转成普通文本返回：lock_hang/server.py 返回 "Failed to analyze ..."，
+# kernel_source/tools.py 返回 "SOURCE_ERROR ..."。这些都必须计入 tool_error，
+# 否则整轮失败会被记成 executed，收尾豁免 A 不会生效。
+TOOL_ERROR_PREFIXES = ("[error]", "Failed to analyze ", "SOURCE_ERROR")
+
+
+def _is_tool_error_output(content: str) -> bool:
+    """只按前缀判断，避免正常输出中恰好出现 "error" 字样时被误判。"""
+    return content.lstrip().startswith(TOOL_ERROR_PREFIXES)
+
 
 def _has_non_echo_output(content: str) -> bool:
     """判断工具输出是否包含真实内容（而非仅 crash 提示符 echo）。
@@ -859,6 +870,9 @@ async def call_crash_tool(state: AgentState) -> dict:
     prior_evidence_facts = set(state.get("evidence_facts", []))
     observed_evidence_facts: set[str] = set()
     observed_nonempty_output = False
+    executed_cmd_count = 0
+    tool_error_count = 0
+    source_citation_retry_used = bool(state.get("source_citation_retry_used", False))
     # 本步读到的内存快照，用于与已缓存的结构体布局做取值级一致性检查，
     # 并与历史缓存中的内存读取合并以执行跨步内存拷贝/偏移关联计算。
     observed_memory_reads: list[MemoryRead] = []
@@ -975,11 +989,12 @@ async def call_crash_tool(state: AgentState) -> dict:
                     )
                 ):
                     # 判断历史输出是否有实质证据内容：排除 echo-only 输出，并把
-                    # 缓存的 [error]/[TIMEOUT] 失败结果也视为无证据——失败命令不应
+                    # 缓存的工具报错 / [TIMEOUT] 失败结果也视为无证据——失败命令不应
                     # 被当作"有证据"回放，否则 LLM 会反复收到同一份失败输出而
                     # 得不到"换方向"的信号。
                     cached_has_evidence = bool(prior_output) and \
-                        not prior_output.startswith(("[error]", "[TIMEOUT]")) and \
+                        not _is_tool_error_output(prior_output) and \
+                        not prior_output.startswith("[TIMEOUT]") and \
                         _has_non_echo_output(prior_output)
                     # 同一指纹已经回放过一次，说明 LLM 拿到过这份输出又原样索取。
                     # 此时不再回放（否则"有证据"的重复命令可以无限次骗取同一份输出），
@@ -1162,7 +1177,24 @@ async def call_crash_tool(state: AgentState) -> dict:
                                             )
                                     else:
                                         content = f"{content.rstrip()}\n\n{mech_summary}"
-                            if not content.startswith(("[error]", "[TIMEOUT]")) and _has_non_echo_output(content):
+                            executed_cmd_count += 1
+                            # 只有会打印 SOURCE_REF 的工具才消耗"源码引用补救"机会；
+                            # 早先用过 grep_source / list_writers 不应让豁免 B 失效。
+                            if tool_name in {"read_source", "find_struct"}:
+                                source_citation_retry_used = True
+                            # 只认前缀（见 TOOL_ERROR_PREFIXES）：执行器包装的 "[error]"、
+                            # lock_hang 的 "Failed to analyze ..."、kernel_source 的 "SOURCE_ERROR ..."。
+                            # [TIMEOUT] 是执行环境问题，重试大概率仍超时，不计入 tool_error。
+                            is_tool_error = isinstance(r_output, Exception) or _is_tool_error_output(
+                                content
+                            )
+                            if is_tool_error:
+                                tool_error_count += 1
+                            if (
+                                not is_tool_error
+                                and not content.startswith("[TIMEOUT]")
+                                and _has_non_echo_output(content)
+                            ):
                                 observed_nonempty_output = True
                             if fingerprint:
                                 open_actions = _update_open_actions(
@@ -1211,6 +1243,10 @@ async def call_crash_tool(state: AgentState) -> dict:
                     if not found_result:
                         # 没在结果里找到，说明 tool 没匹配上（因为 dispatch_crash_commands 会忽略未匹配的命令）
                         msg = f"[error] No matching crash tool found for command: {original_cmd}"
+                        # 未匹配到工具同样是"本轮命令失败"，必须计入 tool_error 统计，
+                        # 否则整轮只有这一种错误时会被记成 executed。
+                        executed_cmd_count += 1
+                        tool_error_count += 1
                         tool_messages.append(
                             ToolMessage(
                                 content=msg, tool_call_id=tool_call_id, name=tool_name
@@ -1244,14 +1280,20 @@ async def call_crash_tool(state: AgentState) -> dict:
         evidence_delta: list[str] = []
     elif commands_to_run:
         duplicate_streak = 0
-        no_progress_streak = (
-            0
-            if observed_evidence_facts - prior_evidence_facts
-            or observed_nonempty_output
-            else state.get("no_progress_streak", 0) + 1
-        )
-        action_status = "executed"
-        evidence_delta = sorted(observed_evidence_facts - prior_evidence_facts)
+        all_tool_errors = executed_cmd_count > 0 and tool_error_count == executed_cmd_count
+        if all_tool_errors:
+            no_progress_streak = state.get("no_progress_streak", 0) + 1
+            action_status = "tool_error"
+            evidence_delta = []
+        else:
+            no_progress_streak = (
+                0
+                if observed_evidence_facts - prior_evidence_facts
+                or observed_nonempty_output
+                else state.get("no_progress_streak", 0) + 1
+            )
+            action_status = "executed"
+            evidence_delta = sorted(observed_evidence_facts - prior_evidence_facts)
     elif rejected_count:
         duplicate_streak = 0
         no_progress_streak = state.get("no_progress_streak", 0) + 1
@@ -1318,9 +1360,9 @@ async def call_crash_tool(state: AgentState) -> dict:
         "replan_required": all_duplicate
         or (bool(commands_to_run) and not evidence_delta)
         # C1：DEDUP-BLOCKED（无证据的重复命令）走 rejected 分支，
-        # 同样需要向 LLM 渲染"Replanning required"advisory，
-        # 提示其更换证据目标而非重复等价命令。
-        or action_status == "rejected",
+        # tool_error（参数校验/工具调用报错）同样需要触发 replan 并由豁免 A 给予纠错重试。
+        or action_status in {"rejected", "tool_error"},
+        "source_citation_retry_used": source_citation_retry_used,
         "managed_gates": managed_gates,
         "evidence_goal_status": (
             "advanced" if goal_advanced else state.get("evidence_goal_status")

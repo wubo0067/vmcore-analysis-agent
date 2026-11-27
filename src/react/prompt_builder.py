@@ -19,6 +19,7 @@ from .graph_state import (
     AgentState,
     CONVERGENCE_GUARD_STREAK_THRESHOLD,
     has_committed_root_cause,
+    source_citation_status,
 )
 from .prompt_overlays import DRIVER_OBJECT_OVERLAY, STACK_CORRUPTION_OVERLAY
 from .prompt_phrases import FORCED_CHOICE_CONVERGENCE_RULE
@@ -221,6 +222,60 @@ def _observed_evidence_categories(evidence_facts: object) -> set[str]:
     return observed
 
 
+_CORRUPTED_PAYLOAD_SIGNATURES = frozenset(
+    {
+        # null_deref 的空值同样常来自被覆盖/清零的字段，沿用 corrupted-payload 措辞
+        # （也是既有 test_known_root_cause_steers_to_termination 断言的场景）。
+        "null_deref",
+        "pointer_corruption",
+        "use_after_free",
+        "general_protection_fault",
+        "invalid_address_access",
+        "page_not_present",
+        "write_protection_violation",
+    }
+)
+
+
+def _terminate_exemption(state: AgentState) -> Optional[str]:
+    """判断是否应暂缓"立即收尾"指令。状态段、门控目标行与转向菜单三处共用。
+
+    返回值：
+      - "tool_error_retry": 上一轮整轮工具/参数报错（仅限 tool_error，不含 dedup /
+        convergence-guard 产生的 rejected），且本次运行尚未用过这次重试机会。
+      - "missing_source_ref": 源码确实可读、尚无 SOURCE_REF，且本次运行尚未用过这次补救机会。
+      - None: 不豁免，照常立即收尾。
+
+    两个豁免都由 llm_node 在"发出"的那一轮置位 *_retry_used，与模型下一步调用什么
+    工具无关，因此各自最多触发一次；no_progress_streak 上限再兜底一层。
+    """
+    if state.get("is_last_step") or state.get("force_terminal_wrapup"):
+        return None
+    if int(state.get("no_progress_streak", 0) or 0) > 2:
+        return None
+    if state.get("last_action_status") == "tool_error" and not state.get(
+        "tool_error_retry_used", False
+    ):
+        return "tool_error_retry"
+    if not state.get("source_citation_retry_used", False):
+        status, _ = source_citation_status(state)
+        if status == "missing":
+            return "missing_source_ref"
+    return None
+
+
+def issued_terminate_exemption(state: AgentState) -> Optional[str]:
+    """返回本轮提示词中实际会渲染出来的豁免（与 build_executor_state_section 的渲染条件一致）。
+
+    llm_node 据此在同一轮置位一次性标记；只有真的展示给模型的豁免才消耗机会。
+    """
+    if not state.get("last_action_status") or not state.get("replan_required"):
+        return None
+    if not (has_committed_root_cause(state) and _gates_exhausted(state)):
+        return None
+    return _terminate_exemption(state)
+
+
 def _gates_exhausted(state: AgentState) -> bool:
     """Return whether a registered policy has only executor-verified terminal gates."""
     return (
@@ -281,25 +336,51 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
             "that marks the contradiction as addressed so it no longer blocks a conclusion."
         )
 
-    # L1：root_cause_class 已确定且强制门控全部关闭时，任何后续命令都无法再加强结论，
-    # 此时若仍列出"未探索的证据维度"并强制"换假设"，就等于在同一份提示词里同时要求
-    # "立即收尾"和"继续探索"——真实运行（run D）中模型正是被后半句带走，在收尾轮继续
-    # 发起 rd 探测而被 build_tool_calls 剥掉 tool_calls，整轮作废、报告没有最终结论。
-    # 这里让收敛条件同时压制转向菜单，使提示词只剩一个可执行指令。
-    terminate_only = bool(root_cause_class) and gates_exhausted
+    # L1：root_cause_class 已确定且强制门控全部关闭时，除非命中有限豁免（工具报错重试或单次源码补救），
+    # 否则压制转向菜单、只留唯一的收尾指令。
+    exemption = _terminate_exemption(state) if (bool(root_cause_class) and gates_exhausted) else None
+    terminate_only = bool(root_cause_class) and gates_exhausted and exemption is None
 
-    if terminate_only:
+    if exemption == "tool_error_retry":
         lines.append(
-            f"- TERMINATE ON THIS TURN: root_cause_class={root_cause_class} is set and every mandatory "
-            f"gate for signature_class={signature_class} is closed. No further crash command can strengthen "
-            f"this conclusion, so do not issue another read-only probe (rd/struct/dis/log/irq/sym). "
-            f"Decoding one overwritten scalar is NOT a prerequisite for concluding: an isolated corrupted "
-            f"value is payload, not live state. If the evidence already in hand contains at least two "
-            f"aligned records with a coherent documented protocol template, evaluate that template under "
-            f"the corrupted-payload exception before finalizing; otherwise emit the final JSON now with "
-            f"confidence=\"low\" and record the residual unknown in "
-            f"final_diagnosis.detailed_analysis."
+            "- RETRY AFTER TOOL ERROR: the previous tool call failed with a parameter or execution error "
+            "(`tool_error`). Fix the argument types/syntax (for `read_source`, pass a single `file` string "
+            "and a single `line` integer, or `start_line`/`end_line`; one file per call) and retry ONCE "
+            "before finalizing; do not issue unrelated crash probes."
         )
+    elif exemption == "missing_source_ref":
+        lines.append(
+            "- SOURCE CITATION CHECK (ONE-SHOT): mandatory runtime gates are closed, but a source tree or "
+            "module source is readable and no `SOURCE_REF` has been collected yet. Issue ONE `read_source` "
+            "call (one file, one `line` or `start_line`/`end_line` range) at the most important `file:line` "
+            "printed by `dis -l` / `dis -s` (do NOT emit `rd`/`struct`/`dis` probes; `grep_source` does not "
+            "produce a SOURCE_REF), then emit the final JSON conclusion on the next turn."
+        )
+    elif terminate_only:
+        if signature_class in _CORRUPTED_PAYLOAD_SIGNATURES:
+            lines.append(
+                f"- TERMINATE ON THIS TURN: root_cause_class={root_cause_class} is set and every mandatory "
+                f"gate for signature_class={signature_class} is closed. No further crash command can strengthen "
+                f"this conclusion, so do not issue another read-only probe (rd/struct/dis/log/irq/sym). "
+                f"Decoding one overwritten scalar is NOT a prerequisite for concluding: an isolated corrupted "
+                f"value is payload, not live state. If the evidence already in hand contains at least two "
+                f"aligned records with a coherent documented protocol template, evaluate that template under "
+                f"the corrupted-payload exception before finalizing; otherwise emit the final JSON now, "
+                f"set confidence using the Layer0 2.4 criteria (`high` requires >=2 independent evidence "
+                f"sources, a complete causal chain, and strongest alternative addressed; use `medium`/`low` "
+                f"when material uncertainty or an isolated corrupted payload remains), and record residual "
+                f"unknowns in final_diagnosis.detailed_analysis."
+            )
+        else:
+            lines.append(
+                f"- TERMINATE ON THIS TURN: root_cause_class={root_cause_class} is set and every mandatory "
+                f"gate for signature_class={signature_class} is closed. No further crash command can strengthen "
+                f"this conclusion, so do not issue another read-only probe (rd/struct/dis/log/irq/sym). "
+                f"Emit the final JSON now, set confidence using the Layer0 2.4 criteria (`high` requires >=2 "
+                f"independent evidence sources, a complete causal chain, and strongest alternative addressed; "
+                f"use `medium` or `low` when material gaps remain), and record any residual caveats in "
+                f"final_diagnosis.detailed_analysis."
+            )
     elif root_cause_class:
         lines.append(
             f"- root_cause_class={root_cause_class} is already set: "
@@ -334,7 +415,7 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
             f"{state.get('no_progress_streak', 0)} actions: " + FORCED_CHOICE_CONVERGENCE_RULE
         )
 
-    if not terminate_only:
+    if not terminate_only and exemption is None:
         missing = [
             name
             for name in _GATE_EVIDENCE_CATEGORIES
@@ -408,7 +489,20 @@ def build_executor_state_section(state: AgentState) -> str:
     # 对"该收尾还是该继续挖"给出相反指令。
     conclusion_ready = has_committed_root_cause(state) and _gates_exhausted(state)
     if replan_required and next_gate_objective == "no outstanding gate":
-        if conclusion_ready:
+        objective_exemption = _terminate_exemption(state) if conclusion_ready else None
+        if objective_exemption == "tool_error_retry":
+            next_gate_objective = (
+                f"all mandatory gates are closed and root_cause_class="
+                f"{state.get('current_root_cause_class')} is established; before concluding, retry the "
+                f"failed tool call ONCE with corrected arguments"
+            )
+        elif objective_exemption == "missing_source_ref":
+            next_gate_objective = (
+                f"all mandatory runtime gates are closed and root_cause_class="
+                f"{state.get('current_root_cause_class')} is established; before concluding, cite ONE "
+                f"SOURCE_REF with a single read_source call"
+            )
+        elif conclusion_ready:
             next_gate_objective = (
                 f"all mandatory gates are closed and root_cause_class="
                 f"{state.get('current_root_cause_class')} is established; the only remaining objective "
@@ -456,7 +550,20 @@ def build_executor_state_section(state: AgentState) -> str:
             f"no-progress streak={state.get('no_progress_streak', 0)})"
         )
         if replan_required:
-            if conclusion_ready:
+            exemption = _terminate_exemption(state) if conclusion_ready else None
+            if conclusion_ready and exemption == "tool_error_retry":
+                lines.append(
+                    "- Replanning required: the previous tool call failed (`tool_error`). "
+                    "Fix the argument types/syntax (one file and one integer line per `read_source` call) "
+                    "and retry ONCE before emitting the final JSON conclusion."
+                )
+            elif conclusion_ready and exemption == "missing_source_ref":
+                lines.append(
+                    "- Replanning required: mandatory runtime gates are closed, but configured source has not "
+                    "been cited yet (`0 SOURCE_REF`). Issue ONE targeted `read_source` call, "
+                    "then emit the final JSON conclusion."
+                )
+            elif conclusion_ready:
                 lines.append(
                     "- Replanning required: the root cause class is already established and every mandatory "
                     "gate is closed, so terminate on this turn by emitting the final JSON conclusion "

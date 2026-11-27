@@ -59,7 +59,7 @@ def analyze_lock_wait_graph(
     try:
         return _analyze_lock_wait_graph_impl(vmcore_path, vmlinux_path, command)
     except Exception as exc:
-        return f"Failed to analyze lock wait graph: {exc}"
+        return f"[error] Failed to analyze lock wait graph: {exc}"
 
 
 @lock_hang_server.tool()
@@ -89,7 +89,7 @@ def analyze_cpu_lockup_rcu(
     try:
         return _analyze_cpu_lockup_rcu_impl(vmcore_path, vmlinux_path, command)
     except Exception as exc:
-        return f"Failed to analyze CPU lockup / RCU state: {exc}"
+        return f"[error] Failed to analyze CPU lockup / RCU state: {exc}"
 
 
 if __name__ == "__main__":

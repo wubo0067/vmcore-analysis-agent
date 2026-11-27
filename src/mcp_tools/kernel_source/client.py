@@ -75,6 +75,59 @@ def _map_positional_command(tool_name: str, command: Any) -> dict[str, object]:
     return map_positional(tool_name, split_command(command))
 
 
+_KS_STR_FIELDS: dict[str, frozenset[str]] = {
+    "read_source": frozenset({"file", "kver"}),
+    "grep_source": frozenset({"pattern", "kver", "prefix"}),
+    "list_writers": frozenset({"field", "kver", "prefix"}),
+    "git_history": frozenset({"file", "kver"}),
+    "find_struct": frozenset({"type_name", "kver", "prefix", "field_filter"}),
+}
+_KS_INT_FIELDS: dict[str, frozenset[str]] = {
+    "read_source": frozenset({"line", "context", "start_line", "end_line"}),
+    "grep_source": frozenset({"max_hits"}),
+    "list_writers": frozenset({"max_hits"}),
+    "git_history": frozenset({"start_line", "end_line", "max_commits"}),
+    "find_struct": frozenset({"max_lines"}),
+}
+
+
+def _validate_and_coerce_payload(tool_name: str, payload: dict[str, object]) -> None:
+    """Pre-validate parameter types before MCP dispatch and coerce numeric strings to int."""
+    str_fields = _KS_STR_FIELDS.get(tool_name, frozenset())
+    int_fields = _KS_INT_FIELDS.get(tool_name, frozenset())
+    range_hint = (
+        " Call read_source once per file (or use start_line/end_line for a line range)."
+        if tool_name == "read_source"
+        else f" Call {tool_name} once per target with scalar arguments."
+    )
+
+    for key in list(payload.keys()):
+        val = payload[key]
+        if key in str_fields:
+            if isinstance(val, (list, tuple, dict, set)):
+                raise ValueError(
+                    f"{tool_name} parameter '{key}' must be a single string, not {type(val).__name__}.{range_hint}"
+                )
+            if not isinstance(val, str):
+                payload[key] = str(val)
+        elif key in int_fields:
+            if isinstance(val, bool) or isinstance(val, (list, tuple, dict, set)):
+                raise ValueError(
+                    f"{tool_name} parameter '{key}' must be a single integer, not {type(val).__name__}.{range_hint}"
+                )
+            if isinstance(val, str):
+                stripped = val.strip()
+                if stripped.lstrip("+-").isdigit():
+                    payload[key] = int(stripped)
+                else:
+                    raise ValueError(
+                        f"{tool_name} parameter '{key}' must be an integer, got {val!r}.{range_hint}"
+                    )
+            elif not isinstance(val, int):
+                raise ValueError(
+                    f"{tool_name} parameter '{key}' must be an integer, got {type(val).__name__}.{range_hint}"
+                )
+
 def build_tool_payload(
     tool_name: str, raw_args: Any, state: dict[str, object]
 ) -> dict[str, object]:
@@ -117,6 +170,8 @@ def build_tool_payload(
         mapped = _map_positional_command(tool_name, payload.pop("command"))
         for key, value in mapped.items():
             payload.setdefault(key, value)
+
+    _validate_and_coerce_payload(tool_name, payload)
 
     source_root = str(state.get("kernel_source_root") or "").strip()
     if source_root:

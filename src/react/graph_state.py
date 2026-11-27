@@ -115,6 +115,10 @@ class AgentState(MessagesState):
     # 每条 value_conflict 已累计处理的次数，用于超限后降噪并保留 residual caveat。
     value_conflict_audit_counts: dict[str, int]
     replan_required: bool
+    # 源码引用补救（豁免 B）单次触发标记：防止在源码树已配置但无 SOURCE_REF 时反复跳过收尾。
+    source_citation_retry_used: bool
+    # 工具报错重试（豁免 A）单次触发标记：保证 "retry ONCE" 与实际行为一致。
+    tool_error_retry_used: bool
     current_evidence_goal: Optional[dict[str, object]]
     evidence_goal_version: int
     evidence_goal_status: Optional[str]
@@ -171,3 +175,53 @@ def has_committed_root_cause(state: AgentState) -> bool:
     """
     root_cause_class = cast(Optional[str], state.get("current_root_cause_class", None))
     return root_cause_class not in UNCOMMITTED_ROOT_CAUSE_CLASSES
+
+
+# 只有这两个工具会在输出里打印 `SOURCE_REF:`（见 kernel_source/tools.py）；
+# grep_source / list_writers 输出的是 SOURCE_GREP / SOURCE_WRITERS。
+SOURCE_REF_TOOLS = ("read_source", "find_struct")
+
+
+def _module_source_available(debug_symbol_paths: object) -> bool:
+    """`.ko` 所在目录里确实有 C 源文件时才算模块源码可读。
+
+    只传了 `.ko`（例如来自驱动 RPM、没有源码）时目录存在但没有 `*.c` / `*.h`，
+    此时不应判为"源码已配置"，否则会多跑一轮注定失败的 read_source，
+    报告也会误标为 Missing。只检查 `.ko` 的直接父目录，与
+    kernel_source.resolver.derive_module_source_roots 的信任范围一致。
+    """
+    from pathlib import Path
+
+    if not isinstance(debug_symbol_paths, (list, tuple)):
+        return False
+    for raw in debug_symbol_paths:
+        try:
+            parent = Path(str(raw)).expanduser().parent
+            if not parent.is_dir():
+                continue
+            if any(parent.glob("*.c")) or any(parent.glob("*.h")):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def source_citation_status(state: "AgentState") -> tuple[str, int]:
+    """源码引用完整性的唯一判定口径，供提示词豁免与报告渲染共用。
+
+    返回 (status, ref_count)：
+      - ("cited", N)：已采集到 N 条 source_ref 事实；
+      - ("missing", 0)：源码可读（内核树已配置 / source_status 报告 configured=true /
+        模块目录中确有源文件），但本次运行没有任何 SOURCE_REF；
+      - ("not_configured", 0)：没有可读源码。
+    """
+    facts = [f for f in (state.get("evidence_facts") or []) if isinstance(f, str)]
+    refs = {f for f in facts if f.startswith("source_ref:")}
+    if refs:
+        return "cited", len(refs)
+    configured = (
+        bool(str(state.get("kernel_source_root") or "").strip())
+        or "source_status:configured=true" in facts
+        or _module_source_available(state.get("debug_symbol_paths"))
+    )
+    return ("missing", 0) if configured else ("not_configured", 0)

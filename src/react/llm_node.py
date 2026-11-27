@@ -29,7 +29,11 @@ from .llm_runtime import (
     calibrate_chars_per_token,
     prepare_messages_for_llm,
 )
-from .prompt_builder import build_analysis_system_prompt, build_executor_state_section
+from .prompt_builder import (
+    build_analysis_system_prompt,
+    build_executor_state_section,
+    issued_terminate_exemption,
+)
 from .prompts import (
     build_structure_reasoning_force_conclusion,
     crash_init_data_prompt,
@@ -170,6 +174,16 @@ def _reasoning_signals_convergence(reasoning: str) -> bool:
     )
 
 
+def _exemption_flag_updates(state: AgentState, issued: str | None) -> dict:
+    """把本轮发出的一次性豁免写回状态（已置位的标记保持为 True）。"""
+    return {
+        "tool_error_retry_used": bool(state.get("tool_error_retry_used"))
+        or issued == "tool_error_retry",
+        "source_citation_retry_used": bool(state.get("source_citation_retry_used"))
+        or issued == "missing_source_ref",
+    }
+
+
 def _serialize_step_for_message(step: VMCoreAnalysisStep) -> str:
     """将分析步骤序列化为 AIMessage.content，仅保留精简版 gate 状态（不携带 evidence 与 completion_criteria）。"""
     if not step.gates:
@@ -231,6 +245,9 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
         state,
         is_last_step=effective_last_step,
     )
+    # 豁免（工具报错重试 / 源码引用补救）在"发出"的这一轮就消耗掉，与模型下一步
+    # 调用什么工具无关，保证各自最多触发一次。
+    issued_exemption = None if effective_last_step else issued_terminate_exemption(state)
 
     # 压缩消息历史后按真实预算规划输出；thinking 预算不足时 plan 会关闭 thinking，
     # 而不是静默回落到 4,096。
@@ -628,6 +645,7 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
         # 置位后 after_crash_tool / should_continue 不再给予额外轮次，
         # 保证强制收口最多发生一次。
         "force_terminal_wrapup": wrapup_triggered,
+        **_exemption_flag_updates(state, issued_exemption),
         "error": None,
     }
 
@@ -678,6 +696,7 @@ async def structure_reasoning_content(state: AgentState, llm) -> dict:
         force_conclusion=force_conclusion,
     )
     system_prompt += "\n\n" + build_executor_state_section(state)
+    issued_exemption = None if effective_last_step else issued_terminate_exemption(state)
     if str(state.get("report_language", "eng")).lower() == "zh":
         from .prompt_builder import CHINESE_REPORT_RULE
 
@@ -849,5 +868,6 @@ async def structure_reasoning_content(state: AgentState, llm) -> dict:
         "value_conflict_audit_counts": audit_counts,
         # 强制收口标志：保证 should_continue 不再重试，直接 __end__。
         "force_terminal_wrapup": wrapup_triggered,
+        **_exemption_flag_updates(state, issued_exemption),
         "error": None,
     }

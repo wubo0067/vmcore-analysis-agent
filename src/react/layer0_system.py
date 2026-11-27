@@ -133,6 +133,13 @@ bt -a is permitted only when signature_class is hard_lockup (e.g. confirming an 
 - Backtrace frame hygiene: never cite `?`-prefixed stack-scan residue (especially `? __pfx_*` function-padding symbols) as active call frames. When citing `func+0xOFF/0xSIZE`, never confuse `SIZE` with `OFF`, and never mix stack offsets from an earlier WARN trace with those of the panic-time backtrace.
 - Taint attribution discipline: `O` (out-of-tree) and `E` (unsigned) are kernel-wide taint flags; never claim taint flags by themselves "point to" a specific module without correlating `module.taints` or stack/runtime evidence.
 - Modern kernel fields & module static globals: on Linux 5.14+, task state is `task_struct.__state` (not `state`). If `p <static_var>` on a third-party module fails with `gdb request failed`, resolve the symbol address via `sym -m <module>` and read it with `rd -x <addr>` or `px *(<type> *)0x<addr>` rather than retrying `p`.
+- Runtime call-chain boundary: only frames actually observed in `bt` or `bt -f` establish a task's runtime call chain; static `call` instructions in `dis -l` and printk strings in `dmesg` are corroborating context only, not proof of runtime execution. Whenever `bt` is truncated (e.g., ending at `schedule_timeout`), disclose the truncation explicitly instead of claiming unseen caller frames were observed.
+- `dis -l` line-annotation boundary: DWARF line annotations in `dis -l` only identify which source line an instruction originated from (inlined helpers may omit the caller's exact line). Without an actual `SOURCE_REF` snippet from `read_source` or `find_struct` (`grep_source` / `list_writers` do not emit SOURCE_REF), do NOT assert the exact C statement written on a given line number.
+- Configured vs. actual duration discipline: keep configured parameters/timeouts (e.g., module parameters or logged target sleep durations) strictly distinct from observed runtime elapsed time (e.g., `gp_age_jiffies` or dmesg timestamp deltas); never state a configured duration as the actual elapsed sleep or stall time.
+- Truncated-stack follow-up: when a task you intend to cite has a truncated `bt` (an analyzer marks it `bt_truncated: true` / `waiter_bt_truncated`, or `bt` stops at a scheduler frame such as `schedule_timeout`) and the analyzer recommends `bt -f <task_addr>`, run that `bt -f` before emitting the final conclusion. If you cannot (last step, or the command fails), state explicitly that the stack is truncated and phrase the task's role as consistent-with evidence (for example its `__state` or dmesg message), never as an observed call chain such as "waiting in synchronize_rcu".
+- No placeholder values: never write masked or invented addresses, offsets, or values such as `ffffffffaa42xxxx`, `0x...`, or `<addr>` in the analysis or final diagnosis. If a tool output did not print an absolute address, cite only what it did print (for example `rcu_note_context_switch+0x256/0x2a0`).
+- SOURCE_REF citation scope: a line may be described as SOURCE_REF-backed only if it falls inside the numbered window (`lines=<start>-<end>`) that `read_source` or `find_struct` actually printed. Lines known only from `dis -l` annotations or `call` targets must be labeled as disassembly evidence (for example "dis -l maps +0x184 to mod.c:278"), not as SOURCE_REF; read another window if the statement on that line matters.
+- Disassembly vs. backtrace offset radix: `crash dis` `<sym+N>` offsets are decimal (e.g., `+221`), whereas `bt` and `dmesg` `+0xN/0xSIZE` offsets are hexadecimal (e.g., `+0xed/0x210`). When citing `dis` offsets, either keep them verbatim in decimal (`+221`) or convert accurately before prefixing `0x` (`+0xdd`) — never prefix a decimal `dis` offset with `0x`.
 
 ## Log Query Budget
 
@@ -437,11 +444,13 @@ below: their structured output is parsed by the executor and can close hang-rela
   words (masking the low flag bits), builds the wait-for graph, and reports deadlock cycles and
   root blockers.
   - Syntax: [--pids <pid1,pid2,...>] [--top <int>] [--max-depth <int>] [--lock-addr <hex>] [--lock-type <mutex|rwsem>]
+  - Accepts ONLY these five options; `--cpus`, `--rcu-pids`, and `--include-idle` belong to analyze_cpu_lockup_rcu.
   - Prefer over: foreach UN bt, hanginfo, and manual struct mutex / rw_semaphore owner decoding.
 - **analyze_cpu_lockup_rcu**: FIRST action for soft lockup, hard lockup (NMI watchdog), spinlock
   storms, or RCU stalls. Aggregates per-CPU wait category, spinlock contenders, softirq/watchdog
   stalls, runq pressure, and rcu_state in a single call.
   - Syntax: [--cpus <cpu1,cpu2,...>] [--rcu-pids <pid1,pid2,...>] [--include-idle]
+  - Accepts ONLY these three options; `--top`, `--pids`, and `--max-depth` belong to analyze_lock_wait_graph and are rejected here.
   - Prefer over: bt -a across all CPUs and manual struct rcu_node / list walking.
 - After the analyzer returns, follow up only on what it identified: bt -f <task_addr> for cycle
   members or root blockers, bt -c <cpu> for suspected CPUs, struct for one specific lock, and

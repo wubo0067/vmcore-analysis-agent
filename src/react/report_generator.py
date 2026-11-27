@@ -12,7 +12,7 @@ import json
 from datetime import datetime
 from typing import Any, List, Optional
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
-from .graph_state import AgentState
+from .graph_state import AgentState, source_citation_status
 from .evidence import has_executor_closure_rule
 from .output_parser import render_action_arguments
 from .schema import (
@@ -546,6 +546,7 @@ def _append_verification_summary(
         label = item_labels.get(gate_name, gate_name)
         mark = status_labels.get(status, status)
         lines.append(f"- **{label}**：{mark}" if zh_mode else f"- **{label}**: {mark}")
+    lines.append(_format_source_citation_line(state, zh_mode=zh_mode))
     lines.append("")
 
     if "object_lifetime" in gates:
@@ -633,6 +634,32 @@ def _append_verification_summary(
     lines.append("")
 
 
+def _format_source_citation_line(state: AgentState, *, zh_mode: bool) -> str:
+    """确定性渲染"源码引用"行，与模型自评的可信度解耦。
+
+    判定口径与提示词豁免共用 graph_state.source_citation_status。
+    "N 处 SOURCE_REF" 只说明取得了多少条源码锚点，不代表每条源码陈述都有引用。
+    """
+    status, count = source_citation_status(state)
+    if status == "cited":
+        return (
+            f"- **源码引用**：✅ 已引用 {count} 处 SOURCE_REF"
+            if zh_mode
+            else f"- **Source Citations**: ✅ {count} SOURCE_REF cited"
+        )
+    if status == "missing":
+        return (
+            "- **源码引用**：⚠️ 缺失（源码可读，但未取得 SOURCE_REF）"
+            if zh_mode
+            else "- **Source Citations**: ⚠️ Missing (source readable, 0 SOURCE_REF)"
+        )
+    return (
+        "- **源码引用**：➖ 未配置"
+        if zh_mode
+        else "- **Source Citations**: ➖ Not configured"
+    )
+
+
 def generate_gate_audit_report(state: AgentState) -> str:
     """
     生成独立的 Gate 审计文档（与面向读者的分析报告分开，由 API 返回）。
@@ -660,6 +687,8 @@ def generate_gate_audit_report(state: AgentState) -> str:
         "本文件记录执行器判定的证据 gate 状态、完成条件与状态转换历史，"
         "并作为独立审计报告交付给 API 调用方；面向读者的分析报告只包含对应的验证状态摘要。"
     )
+    lines.append("")
+    lines.append(_format_source_citation_line(state, zh_mode=True))
     lines.append("")
 
     if gates:

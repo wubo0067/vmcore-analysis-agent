@@ -89,6 +89,39 @@ validate_tool_call_request      # action_guard：命令合法性、参数校验�
 都算未提交（`unknown` 是 `RootCauseClass` 的合法成员且为真值，直接真值判断会把"尚未定论"
 当成"结论已成立"，让 `TERMINATE ON THIS TURN` 等通道在错误前提上运行）。
 
+#### 工具报错与 `last_action_status`
+
+`call_crash_tool` 每轮把动作记为下面五种状态之一，`replan_required` 与 prompt 的 "Last action status" 都以它为准：
+
+| 状态 | 含义 | `no_progress_streak` | 触发 replan |
+|---|---|---|---|
+| `executed` | 至少有一条命令正常返回 | 有新事实或非空输出时清零，否则 +1 | 无新增证据时 |
+| `duplicate` | 全部是缓存回放（首次 `[DEDUP]`） | +1 | 是 |
+| `rejected` | action_guard / dedup 硬拒 / convergence-guard 拦截 | +1 | 是 |
+| `tool_error` | 本轮**所有**命令都失败 | +1，`evidence_delta` 置空 | 是 |
+| `no_progress` | 没有可执行内容 | +1 | 是 |
+
+`tool_error` 的判定规则（`nodes.TOOL_ERROR_PREFIXES` + `_is_tool_error_output`）：
+
+- 只按输出**开头**判断，不做子串匹配，正常输出中间出现 `SOURCE_ERROR` 字样不算失败；
+- 认三种前缀：执行器包装的 `[error]`（包括 `[error] Execution failed: ...` 与 payload 预检失败）、`Failed to analyze `、`SOURCE_ERROR`。后两种是 provider 把内部异常转成普通文本返回的老写法，保留作为兜底；`lock_hang/server.py` 现在返回的是 `[error] Failed to analyze ...`；
+- "找不到匹配工具"（`[error] No matching crash tool found ...`）同样计入；
+- `[TIMEOUT]` **不算** `tool_error`：超时是执行环境问题，重试大概率仍超时；
+- 只要有一条命令成功，整轮仍记 `executed`。
+
+失败输出同样不会被当作证据：dedup 判断"缓存输出是否有实质证据"时排除工具报错文本，"非空输出"计数也排除它，所以一条报错不会清零 `no_progress_streak`。
+
+这个状态之所以要单独区分，是因为它是下面"收尾豁免 A"的触发条件：整轮失败不应被当成"没有更多可查的了"而立即逼停。
+
+#### Provider 侧参数预检
+
+模型传错参数时，应在**派发前**拦下并给出可照做的报错，而不是让 MCP 端返回一段普通文本。预检在各 provider 的 `build_tool_payload` 里完成；抛出的 `ValueError` 被 `dispatch_mcp_requests` 包装成 `[error] Execution failed: ...`，进而记为 `tool_error`。
+
+| provider | 预检内容 |
+|---|---|
+| `kernel_source` | `_validate_and_coerce_payload`：按 server 签名校验类型（见下方 `kernel_source/` 一节） |
+| `lock_hang` | 结构化参数的键名映射 + 最终命令串用 analyzer 自己的解析器预检（见 `lock_hang/` 的输入 / 输出契约） |
+
 ## 一次分析的完整生命周期：从现象到根因
 
 前面三个子系统是"静态结构"；这一节按**时间轴**讲一次 `/analyze` 请求里 agent 如何一步步从
@@ -225,6 +258,24 @@ sequenceDiagram
 | 收口轮违规 | 收口轮仍请求工具 | 追加 terminal-only 硬性指令，重试且仅重试一次 |
 | 兜底合成 | 收口轮无结论，但根因类已定 + 强制门控全关 | `apply_fallback_conclusion_synthesis` 把已闭合证据确定性地渲染成 confidence=low 的有界结论 |
 
+**收尾豁免（`prompt_builder._terminate_exemption`）**：根因已提交且强制门控全关时，原本会注入 `TERMINATE ON THIS TURN`。下面两种情况会暂缓这条指令，改为给一次明确的补救机会：
+
+| 豁免 | 条件 | 提示 | 次数 |
+|---|---|---|---|
+| A `tool_error_retry` | `last_action_status == "tool_error"` | 纠正参数类型 / 语法后重试一次，再下结论 | 一次（`tool_error_retry_used`） |
+| B `missing_source_ref` | 源码可读但本次运行 0 条 `source_ref:` 事实 | 发一次 `read_source`（一个文件、一个 `line` 或 `start_line`/`end_line`），再下结论 | 一次（`source_citation_retry_used`） |
+
+共同约束：`is_last_step` 或 `force_terminal_wrapup` 时不豁免；`no_progress_streak > 2` 时不豁免。`rejected`（dedup / convergence-guard 的拒绝）**不**触发豁免 A，因为它们本身就是防空转护栏。
+
+要点：
+
+- **三处"立即收尾"通道必须同时让位**：转向菜单的 `terminate_only`、状态段的 `conclusion_ready`、`Current gate objective` 行（原先写 "the only remaining objective is to emit the final conclusion"）。三处都调用同一个 `_terminate_exemption`，否则同一份提示词会同时出现"先重试"和"立即收尾"两条相反指令。
+- **一次性标记在"发出"时置位**：`llm_node` 用 `issued_terminate_exemption` 判断本轮提示词里实际渲染了哪个豁免，并通过 `_exemption_flag_updates` 写回状态，与模型下一步调用什么工具无关。若改成"工具执行后才置位"，模型忽略提示改发 `rd` 时标记不会置位，豁免会反复触发。
+- **"源码可读"的口径**（`graph_state.source_citation_status`，提示词与报告共用）：已有 `source_ref:` 事实 → `cited`；否则 `kernel_source_root` 有值、或观测到 `source_status:configured=true`、或某个 `.ko` 的直接父目录里确有 `*.c` / `*.h` → `missing`；其余 → `not_configured`。只有 `.ko`、没有源码时不算"可读"。
+- **只有 `SOURCE_REF_TOOLS = ("read_source", "find_struct")` 会消耗补救机会**：`grep_source` / `list_writers` 输出的是 `SOURCE_GREP` / `SOURCE_WRITERS`，不含 `SOURCE_REF`。
+- **收尾提示不再写死 `confidence="low"`**：改为让模型按 layer0 2.4 的标准自评（`high` 需要 ≥2 个独立证据源、完整因果链、已处理最强替代假设）。"isolated corrupted payload / overwritten scalar" 那段措辞只对 `_CORRUPTED_PAYLOAD_SIGNATURES`（`null_deref`、`pointer_corruption`、`use_after_free`、`general_protection_fault`、`invalid_address_access`、`page_not_present`、`write_protection_violation`）附带。执行器自动合成的兜底结论（`apply_fallback_conclusion_synthesis`）仍是 `confidence=low`。
+- 重试时模型只被允许发 `read_source`，不会被放开去做 `rd` / `struct` / `dis` 这类只读探测。
+
 输出：`final_diagnosis` → `generate_markdown_report`（逐步过程回放、验证摘要，其中包含
 "ALLOCATED 只是快照状态"的解读提醒）+ `generate_gate_audit_report`（门控变迁独立审计）。
 
@@ -300,6 +351,22 @@ client.py        未配置 CRASH_MCP_URL 保持 stdio；配置后切换 streamab
 
 `tests/test_crash_session_pool.py` 分为三组：`CrashSessionCrossPlatformUnitTests`（Windows 与 Linux CI 必跑，覆盖 `_clean_output`、`_mod_load_failed`、`_prepare_lines`、多槽位严格 LRU、TCP Daemon 及跨 loop 信号量）、`TestExecutionModeConfig`（验证默认 `daemon`、旧 `pool` 值告警回退、不可达快速失败及环境变量白名单清理）和 `CrashPersistentPtyIntegrationTests`（仅 POSIX 运行，使用真实 `pty.openpty()` 驱动 mock `crash` REPL，覆盖常驻复用、伪提示符、`SIGINT` 3s 恢复、`SIGKILL` 重建、多 `vmcore` 真并行与 UDS `0600` 权限校验）。
 
+### `kernel_source/` —— 参数预检与 SOURCE_REF
+
+`kernel_source/client.py` 的 `_validate_and_coerce_payload` 在派发前按 `server.py` 的函数签名校验参数类型：
+
+| 工具 | 字符串参数 | 整数参数 |
+|---|---|---|
+| `read_source` | `file`、`kver` | `line`、`context`、`start_line`、`end_line` |
+| `grep_source` | `pattern`、`kver`、`prefix` | `max_hits` |
+| `list_writers` | `field`、`kver`、`prefix` | `max_hits` |
+| `git_history` | `file`、`kver` | `start_line`、`end_line`、`max_commits` |
+| `find_struct` | `type_name`、`kver`、`prefix`、`field_filter` | `max_lines` |
+
+规则：列表 / 元组 / 字典 / 集合一律拒绝，报错写明"每个文件调用一次，或用 `start_line`/`end_line`"；整数参数收到布尔、浮点或非数字字符串也拒绝；`"217"` 这样的数字字符串转成 `int`，不浪费一轮。这源自一次真实事故：模型一次传了 3 个 `file` 和 3 个 `line`，MCP 返回 `[217, 318, 345] is not of type 'integer'`，当时被记成 `executed`。
+
+**`SOURCE_REF` 是什么、谁会产生**：`read_source` 与 `find_struct` 在输出头部打印 `SOURCE_REF: <file>:<anchor>`，`evidence.extract_evidence_facts` 把它转成 `source_ref:<file>:<line>` 事实。锚点是读取窗口的中心行或起始行，**不是**被引用的那条语句；引用具体语句时应写窗口内实际的行号。`grep_source` 输出 `SOURCE_GREP`、`list_writers` 输出 `SOURCE_WRITERS`，都不含 `SOURCE_REF`。`source_ref:` 只证明源码被读过，不参与门控闭合（闭合仍要求运行时事实）。
+
 ### `lock_hang/` —— 锁 / 挂死确定性分析
 
 `lock_hang` 与其余 provider 一样遵守 registry 契约（`MCP_CLIENT` / `MCP_SERVER_NAME` / `initialize_tools` / `build_tool_payload`），但它的价值全在 `analyzer.py` 这颗**纯函数式内核**上：除 `run_crash_command` / `run_crash_script` 外不依赖任何框架 API，且这两个 runner 都以关键字参数注入，因此单元测试可以用假 runner 驱动完整分析流程而不需要真实 vmcore。
@@ -370,6 +437,19 @@ is_idle = (
 
 `build_tool_payload` 是 LLM 参数与工具入参之间的适配层：把 dict / list / `None` / 标量四种形态统一压平成 `command` 字符串，并强制从 state 注入 `vmcore_path` / `vmlinux_path`；缺任一路径直接 `ValueError`，由 `src/react/nodes.py` 的 `call_crash_tool` 捕获成任务结果。
 
+dict 入参（即模型使用 `parameters` 的写法）按工具分别映射到 CLI 选项（`_TOOL_PARAM_SPECS`）：
+
+| 工具 | 键 → 选项 |
+|---|---|
+| `analyze_lock_wait_graph` | `pids`→`--pids`、`top`→`--top`、`max_depth`→`--max-depth`、`lock_addr`→`--lock-addr`、`lock_type`→`--lock-type` |
+| `analyze_cpu_lockup_rcu` | `cpus`→`--cpus`、`rcu_pids`→`--rcu-pids`、`include_idle`→`--include-idle`（布尔真值才加 flag） |
+
+- 键名大小写不敏感，`-` 与 `_` 等价；`command` 字符串先写入，映射出的选项追加其后。
+- 列表型取值（`pids` / `cpus` / `rcu_pids`）规范成不带空格的逗号串，`"309547, 309548"` 与 `[309547, 309548]` 等价，否则 `shlex` 会把第二个 PID 拆成多余参数。
+- **未知键、拿错工具的键、单值参数收到列表，一律抛 `ValueError`**，报错列出该工具允许的键。不能静默丢弃：一次真实事故里 `rcu_pids` 被丢掉，分析器跑了默认范围，模型却以为过滤已生效。
+- **最终命令串再预检一次**（`_validate_command`）：用 `parse_lock_wait_graph_command` / `parse_cpu_lockup_command` 解析，失败就抛 `ValueError` 并列出可用选项。这一步覆盖模型写 `arguments` 或直接给 `command` 字符串的情况（结构化键名校验管不到这两种写法；一次真实事故里 `--top 12` 就是这样一路传到了 analyzer）。
+- `server.py` 内部异常转文本时返回 `[error] Failed to analyze ...`，与执行器的错误前缀约定一致。
+
 #### 提示词侧状态
 
 锁/挂死快速通道已启用，分三层引导，每层各管一件事，避免同一指令在提示词里多处重复：
@@ -398,6 +478,7 @@ is_idle = (
 - `generate_markdown_report`：面向读者的最终报告（含验证状态摘要、`ALLOCATED` 语义说明）
 - `generate_gate_audit_report`：门控关闭/拒绝审计
 - gate 中英标签映射在文件头部字典
+- **源码引用行**：`Verification Status` 末尾由 `_format_source_citation_line` 确定性渲染一行 `Source Citations`，取值 `✅ N SOURCE_REF cited` / `⚠️ Missing (source readable, 0 SOURCE_REF)` / `➖ Not configured`，同一行也写进 `.audit.md`（排在元数据之后）。它来自 `evidence_facts` 与 `graph_state.source_citation_status`，与模型自评的 `可信度` 完全独立：引用完整性和诊断把握是两个维度。"N 处 SOURCE_REF" 只说明取得了多少条源码锚点，不代表每条源码陈述都有引用。
 
 ## "想改 X 动哪里" 速查
 
@@ -409,6 +490,12 @@ is_idle = (
 | 改命令合法性/去重 | `action_guard.py` |
 | 改收敛/路由（何时结束、何时重试） | `edges.py`、`llm_node.py`（收口逻辑）、`nodes._convergence_guard_error` |
 | 改报告呈现 | `report_generator.py` |
+| 改"哪些输出算工具失败" | `nodes.TOOL_ERROR_PREFIXES` / `_is_tool_error_output`；provider 侧统一返回 `[error] ...` |
+| 改收尾豁免（工具报错重试 / 源码引用补救） | `prompt_builder._terminate_exemption`（条件）、`issued_terminate_exemption` + `llm_node._exemption_flag_updates`（一次性标记）；三处收尾通道都要同步 |
+| 改"源码是否可读 / 引用是否完整"的判定 | `graph_state.source_citation_status`（提示词与报告共用，只改这一处） |
+| 改 `kernel_source` 的参数类型校验 | `kernel_source/client.py` 的 `_KS_STR_FIELDS` / `_KS_INT_FIELDS`，要和 `server.py` 签名保持一致 |
+| 改 `lock_hang` 的结构化参数映射 | `lock_hang/client.py` 的 `_TOOL_PARAM_SPECS` / `_LIST_VALUED_KEYS`；新增 analyzer 选项时 `analyzer.py` 的解析器也要同步，`_validate_command` 会按它预检 |
+| 改证据纪律规则（调用链边界、截断栈补 `bt -f`、占位值、SOURCE_REF 范围、偏移进制、时长） | `layer0_system.py` 中 "Runtime call-chain boundary" 起的一组规则 |
 | 加新崩溃类型剧本 | `playbooks.py` 加条目 + `prompt_builder._select_playbook` 选择信号 |
 | 改等待原语分类（增删 mutex/rwsem/spinlock/io_wait/软中断函数） | `lock_hang/analyzer.py` 对应的 `_*_FUNCS` 集合；优先级在 `_CLASSIFY_PRIORITY` |
 | 改 idle 判定阈值（栈顶帧数、是否需要无锁/无软中断） | `lock_hang/analyzer.py` 的 `analyze_cpu_lockup_rcu` 内 `is_idle` 表达式 |
@@ -448,3 +535,8 @@ $mods = Get-ChildItem tests -Filter 'test_*.py' | ForEach-Object { 'tests.' + $_
 - ~~`soft_lockup` / `hard_lockup` / `rcu_stall` / `hung_task` 的签名门控（`lock_holder`、`wait_chain` 等）在 `evidence._GATE_COMPLETION_CRITERIA` 里没有对应条款~~（已解决）：四类签名的必需门控（`lock_holder`、`rcu_stall_trace`、`blocked_task_context`、`wait_chain`、`stack_integrity`、`nmi_watchdog_evidence`、`cpu_progress_state`）已注册确定性执行器闭合规则，可由 `bt` / `dis` / `ps` / `ps -m` / `runq` / `struct` / lock_hang JSON 事实闭合。注意 `lock_holder` 仅对 `{"rcu_stall", "soft_lockup"}` 注册确定性规则，`hung_task` 及无签名场景下仍为 telemetry-only。仍无闭合规则的必需门控仅有 `warn_on` 的 `warning_site` / `warning_timeline`。
 - `crash/daemon.py` 的 `http://` 端点无内置鉴权，仅限可信单租户主机；多用户主机必须使用 `unix://`（已自动收紧为 `0600` 权限），避免本地其他用户借 `crash` 的 `!` shell 逃逸执行任意命令。
 - `daemon` 模式下，所有 MCP Server 共享守护进程侧的 `CRASH_POOL_MAX_SESSIONS × CRASH_POOL_SLOTS_PER_VMCORE` 槽位；若各 MCP Server 的 `CRASH_MCP_MAX_CONCURRENCY` 之和远大于池容量，超出请求会在 `CRASH_POOL_ACQUIRE_TIMEOUT_SEC` 处排队超时，生产部署应按池容量同步调优。
+- **证据纪律规则只是提示词约束，执行器不强制**：layer0 里的"调用链只以 `bt` / `bt -f` 实际栈帧为准""栈被截断时先补 `bt -f` 或写明截断""禁止占位地址""SOURCE_REF 只能引用实际读到的行窗口""`dis` 偏移是十进制、`bt` 偏移是十六进制""配置时长与实际时长分开写"都靠模型自觉。一次真实运行里 waiter 栈被截断而模型没有补 `bt -f`；若要强制，需要在执行器侧加检查（例如分析器输出里还有未执行的 `bt -f` 建议时拒绝第一次收尾）。
+- **`parameters` 与 `arguments` 同时给出时 `arguments` 被忽略**（`output_parser.build_tool_calls`），不报错也不提示；模型两处都写时，后者里的选项会静默丢失。
+- **部分证据事实不带 PID**：`rcu_reader_nesting`、`rcu_blocked_node` 等事实没有标注属于哪个任务，门控规则原理上可能匹配到别的任务（如 waiter）的值。目前门控关闭用到的证据是对的，但审计时需要自己对照 PID。
+- **收尾豁免 B 只要求至少一条 `SOURCE_REF`**：补到一处就收尾，不保证模块源码和内核源码两处都引用到。
+- **`_classify_tool_output` 把非空输出默认归为 `ok`**，仅命中 `_HARD_FAILURE_MARKERS` 才算 `failed`。该关键词表是否覆盖 provider 的报错文本尚未核对；`tool_error` 的判定走的是 `TOOL_ERROR_PREFIXES`，与它相互独立。
