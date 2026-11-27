@@ -1,65 +1,85 @@
 # Makefile for Soft Lockup Simulation Module
 
-# Kernel build directory - adjust as needed for your system
+# Kernel build directory; override for cross builds, e.g.
+#   make KERNEL_DIR=/usr/src/kernels/5.14.0-362.24.1.el9_3.x86_64
 KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
-# Module name
-obj-m := soft_lockup_module.o
+MODULE := soft_lockup_module
+obj-m := $(MODULE).o
 
-# Build options
+# Always keep debug info (-g) so crash can map addresses to file:line.
+# Do NOT use -O0: the kernel only supports -O2/-Os. Stack readability comes from
+# -g plus noinline on the functions that must appear in backtraces.
 DEBUG ?= 1
-EXTRA_CFLAGS :=
-
+ccflags-y := -g
 ifeq ($(DEBUG),1)
-	EXTRA_CFLAGS += -g -O0 -DDEBUG \
-		-fno-inline -fno-inline-functions \
-		-fno-inline-small-functions -fno-optimize-sibling-calls
-else
-EXTRA_CFLAGS += -O2
+ccflags-y += -DDEBUG
 endif
 
-# Default target
+CPU ?= 2
+# spinlock mode: CPU for the contending thread
+CPU2 ?= 1
+
 all:
-	make -C $(KERNEL_DIR) M=$(PWD) EXTRA_CFLAGS="$(EXTRA_CFLAGS)" modules
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
 
-# Clean build artifacts
 clean:
-	make -C $(KERNEL_DIR) M=$(PWD) clean
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean
 
-# Install the module to the system
 install:
-	sudo make -C $(KERNEL_DIR) M=$(PWD) EXTRA_CFLAGS="$(EXTRA_CFLAGS)" modules_install
+	sudo $(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules_install
 	sudo depmod -a
 
-# Load the module with default parameters
+# Load and start the lockup immediately on any CPU
 load:
-	sudo insmod soft_lockup_module.ko enable_soft_lockup=1
+	sudo insmod $(MODULE).ko enable_soft_lockup=1
 
-# Load the module with specific CPU
+# Load and start the lockup on a specific CPU: make load_cpu CPU=2
 load_cpu:
-	sudo insmod soft_lockup_module.ko enable_soft_lockup=1 cpu_number=$(CPU)
+	sudo insmod $(MODULE).ko enable_soft_lockup=1 cpu_number=$(CPU)
 
-# Unload the module
+# spinlock mode: holder on $(CPU), contender on $(CPU2)
+load_spinlock:
+	sudo insmod $(MODULE).ko mode=spinlock enable_soft_lockup=1 cpu_number=$(CPU) contender_cpu=$(CPU2)
+
+# softirq mode: busy-wait inside a timer softirq callback on $(CPU)
+load_softirq:
+	sudo insmod $(MODULE).ko mode=softirq enable_soft_lockup=1 cpu_number=$(CPU)
+
+# irqoff mode (DANGEROUS): hard lockup via NMI watchdog; may hang the whole system
+load_irqoff:
+	sudo insmod $(MODULE).ko mode=irqoff allow_irqoff=1 enable_soft_lockup=1 cpu_number=$(CPU)
+
+# Load without triggering; use "make start" later
+load_idle:
+	sudo insmod $(MODULE).ko cpu_number=$(CPU)
+
+# Runtime switch via sysfs
+start:
+	echo 1 | sudo tee /sys/module/$(MODULE)/parameters/enable_soft_lockup
+
+stop:
+	echo 0 | sudo tee /sys/module/$(MODULE)/parameters/enable_soft_lockup
+
 unload:
-	sudo rmmod soft_lockup_module
+	sudo rmmod $(MODULE)
 
-# Reload the module (unload then load)
 reload: unload load
 
-# Show module info
 info:
-	modinfo soft_lockup_module.ko
+	modinfo $(MODULE).ko
 
-# Check kernel version
+# vermagic must match the target kernel, e.g. 5.14.0-362.24.1.el9_3.x86_64
+vermagic:
+	@modinfo -F vermagic $(MODULE).ko
+
 kernel_version:
 	@echo "Current kernel version: $(shell uname -r)"
 
-# Show module status
 status:
-	@lsmod | grep soft_lockup || echo "Module not loaded"
+	@lsmod | grep $(MODULE) || echo "Module not loaded"
 
-# Compile and install in one command
 compile_and_install: all install
 
-.PHONY: all clean install load unload reload info kernel_version status compile_and_install load_cpu
+.PHONY: all clean install load load_cpu load_spinlock load_softirq load_irqoff load_idle start stop unload reload info vermagic kernel_version status compile_and_install

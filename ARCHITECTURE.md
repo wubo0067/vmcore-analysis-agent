@@ -372,9 +372,24 @@ is_idle = (
 
 #### 提示词侧状态
 
-截至当前版本，本仓库**未**在 `src/react/sop_fragments.py` 或 `prompt_builder._select_sop_fragments` 中挂载 `lock_hang_fast_path`：分析器只作为工具暴露，模型是否调用由通用工具描述决定。若要启用强制优先调用，按 `INTEGRATION.md` 追加 SOP 片段与签名/关键词触发条件即可，无需改 `registry.py`。
+锁/挂死快速通道已启用，分三层引导，每层各管一件事，避免同一指令在提示词里多处重复：
+
+| 层 | 位置 | 生效时机 | 内容 |
+|---|---|---|---|
+| layer0 | `layer0_system.py` 的 `3.7a Deterministic Lock / Hang Analyzers` | 每轮注入，是第 1 轮唯一可靠的引导 | 两个分析器的语法；优先于 3.5 手工命令与 3.8 的 `hanginfo` 等扩展命令；不可用或结果为空时回退 |
+| playbook | `playbooks.py` 的 `hung_task`、`_LOCKUP_PLAYBOOK` 顶部 `Mandatory Fast Path`；`rcu_stall` 原有 Step 1 | 签名确定后 | 分别指向 `analyze_lock_wait_graph` / `analyze_cpu_lockup_rcu`，写明参数、定向跟进命令与回退路径 |
+| SOP 兜底 | `sop_fragments.py` 的 `lock_hang_fast_path`；`prompt_builder._select_sop_fragments` | 仅签名未分类（`None` / 空 / `unknown`）且出现强信号时 | 让第 1 轮初筛也能优先调用分析器；签名落定后退场，非锁类签名不会被初始 dmesg 中残留的历史锁/挂死日志反复注入 |
+
+两点实现细节：
+
+- **关键词检测读完整初始上下文**：`_recent_text_blob` 对每条消息只取前 800 字符，而初始 HumanMessage 中 vmcore-dmesg 位于 `sys` / `sys -t` / `bt` 之后，会被截掉。因此 `_has_lock_hang_signal` 额外读取 `_initial_context_text()`（第一条 HumanMessage 全文）。
+- **只用强信号**：`_LOCK_HANG_SIGNAL_TOKENS` 为小写字面量（`blocked for more than`、`hung_task: blocked tasks`、`soft lockup`、`hard lockup`、`detected stalls on cpus`、`self-detected stall`、`rcu stall`），刻意不含 `__mutex_lock` / `rwsem_down_` 等会出现在普通栈中的弱信号。
+
+无需改 `registry.py`。
 
 #### 测试
+
+`tests/test_prompt_builder.py` 的 `LockHangFastPathTests` 覆盖提示词侧：layer0 中 3.7a 位于 3.8 之前、playbook 中分析器先于手工命令、首轮长消息截断回归、各强信号触发、四类锁/挂死签名与非锁类签名下不注入、`unknown` / 空签名下注入、弱信号不注入。
 
 `tests/test_lock_hang_analyzer.py` 通过注入假 runner 覆盖端到端流程（AB-BA 环、CPU 聚合、idle+硬件中断、硬中断兜底建议等），不依赖真实 vmcore；`tests/test_lock_hang_client.py` 覆盖 `build_tool_payload` 与 **FastMCP server 的工具注册**，前者使 analyzer 测试不必导入 `langchain_mcp_adapters`，后者守住"参数先后顺序导致 server 一个工具都注册不上"这类只在建 pydantic 模型时暴露的问题。
 
@@ -403,7 +418,7 @@ is_idle = (
 | 改 `crash` 执行模式路由（`daemon`/`oneshot`） | `crash/executor.py`（`get_crash_execution_mode` / `_execute_via_daemon`） |
 | 改 `crash` MCP 并发上限或 HTTP 传输模式 | `crash/server.py`（`_get_concurrency_semaphore`）与 `crash/client.py`（`_build_mcp_server_config`） |
 | 改 `lock_hang` 工具参数或描述 | `lock_hang/server.py` 的 `@tool` 签名与 `Annotated[..., Field(description=...)]` |
-| 让模型优先调用锁/挂死分析器 | `react/sop_fragments.py` 加 `lock_hang_fast_path` + `prompt_builder._select_sop_fragments` 触发条件（见 `INTEGRATION.md`） |
+| 改锁/挂死分析器的优先调用引导 | `layer0_system.py` 3.7a（每轮）、`playbooks.py` 的 `hung_task` / `_LOCKUP_PLAYBOOK` / `rcu_stall`（签名后）、`sop_fragments.py` 的 `lock_hang_fast_path` + `prompt_builder._LOCK_HANG_SIGNAL_TOKENS` / `_select_sop_fragments`（首轮兜底）；见 `INTEGRATION.md` |
 
 注意：prompt 文本改动要检查 `tests/test_prompt_builder.py`、`test_convergence.py` 是否断言了相关字符串；门控改动跑 `tests/test_evidence.py`；`lock_hang` 改动跑 `tests/test_lock_hang_analyzer.py` 与 `tests/test_lock_hang_client.py`。
 

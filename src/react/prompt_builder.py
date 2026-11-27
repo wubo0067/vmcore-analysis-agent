@@ -495,7 +495,10 @@ def _select_playbook(state: AgentState, recent_text: str) -> str:
     """
     signature_class = state.get("current_signature_class")
     if not signature_class or signature_class == "unknown":
-        lowered = (recent_text or "").lower()
+        # 未分类时靠关键词兜底挂载剧本。recent_text 每条消息只取前 800 字符，而初始
+        # HumanMessage 开头是数千字符的提示模板，sys / bt / vmcore-dmesg 都在模板之后，
+        # 第 1 轮的 RCU stall 关键行必然被截掉，因此额外检查完整初始上下文。
+        lowered = ((recent_text or "") + "\n" + _initial_context_text(state)).lower()
         if (
             "rcu stall" in lowered
             or "detected stalls on cpus/tasks" in lowered

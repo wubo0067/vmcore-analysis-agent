@@ -707,5 +707,47 @@ class LockHangFastPathTests(unittest.TestCase):
         self.assertNotIn("bt -f <pid>", sop)
 
 
+
+class SelectPlaybookInitialContextTests(unittest.TestCase):
+    RCU_LINE = "rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:\n"
+
+    def _state(self, signature, content):
+        from langchain_core.messages import HumanMessage
+
+        return {
+            "current_signature_class": signature,
+            "step_count": 0,
+            "messages": [HumanMessage(content=content)],
+        }
+
+    def test_rcu_playbook_mounted_on_first_turn_despite_truncation(self) -> None:
+        from src.react.playbooks import PLAYBOOKS
+        from src.react.prompt_builder import _recent_text_blob, _select_playbook
+
+        for sig in (None, "", "unknown"):
+            with self.subTest(signature=sig):
+                state = self._state(sig, _long_initial_message(self.RCU_LINE))
+                recent = _recent_text_blob(state["messages"])
+                # 前置条件：关键行确实被 800 字符截断窗口裁掉
+                self.assertNotIn("detected stalls on cpus/tasks", recent.lower())
+                self.assertEqual(_select_playbook(state, recent), PLAYBOOKS["rcu_stall"])
+
+    def test_no_playbook_without_rcu_signal_when_unclassified(self) -> None:
+        from src.react.prompt_builder import _recent_text_blob, _select_playbook
+
+        state = self._state(None, _long_initial_message("ordinary dmesg line\n"))
+        self.assertEqual(_select_playbook(state, _recent_text_blob(state["messages"])), "")
+
+    def test_classified_signature_ignores_residual_rcu_line(self) -> None:
+        from src.react.playbooks import PLAYBOOKS
+        from src.react.prompt_builder import _recent_text_blob, _select_playbook
+
+        state = self._state("pointer_corruption", _long_initial_message(self.RCU_LINE))
+        self.assertEqual(
+            _select_playbook(state, _recent_text_blob(state["messages"])),
+            PLAYBOOKS["pointer_corruption"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

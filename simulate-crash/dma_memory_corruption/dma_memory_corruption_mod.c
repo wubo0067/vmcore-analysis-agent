@@ -65,7 +65,11 @@ static struct task_struct *corrupt_task;
 
 /* ================= DMA 写 ================= */
 
-static void simulate_dma_write(dma_addr_t dma_handle, size_t len)
+/*
+ * noinline：保留独立栈帧，使 bt / dis -l 能直接定位到"越界写"发生的函数，
+ * 不随 -O2 被内联进 dma_corruption_thread。
+ */
+static noinline void simulate_dma_write(dma_addr_t dma_handle, size_t len)
 {
     // 在没有 IOMMU 的系统中，这个地址通常直接对应物理内存地址。
     // CPU 在模拟硬件设备执行 DMA 写操作时，通常会使用 dma_handle 这个 DMA 地址来访问内存，但 CPU 不能直接使用物理地址或总线

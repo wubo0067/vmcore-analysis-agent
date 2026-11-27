@@ -4,7 +4,7 @@
 
 ![VMCore Analysis Agent](./doc/vmcore-analysis-agent-logo.svg)
 
-基于 LangGraph、MCP 和 Linux `crash` 工具的 vmcore 分析服务。项目入口位于 [`vmcore-analysis-agent/`](./vmcore-analysis-agent/)；本 README 介绍该组件的工作流程、部署方式和输出。
+基于 LangGraph、MCP 和 Linux `crash` 工具的 vmcore 分析服务。本 README 介绍它的工作流程、部署方式和输出。
 
 ## 项目能做什么
 
@@ -38,14 +38,14 @@
 
 | 路径 | 职责 |
 |---|---|
-| [`main.py`](./vmcore-analysis-agent/main.py) | FastAPI 服务、分析 API 与生命周期初始化 |
-| [`client/`](./vmcore-analysis-agent/client/) | HTTP/SSE 客户端及命令行入口 |
-| [`src/react/`](./vmcore-analysis-agent/src/react/) | LangGraph 节点、路由、状态、Prompt、证据评估和报告生成 |
-| [`src/llm/`](./vmcore-analysis-agent/src/llm/) | LLM 客户端创建 |
-| [`src/mcp_tools/`](./vmcore-analysis-agent/src/mcp_tools/) | MCP 工具注册及 crash、源码补丁、栈保护、锁/挂死等工具 |
-| [`tests/`](./vmcore-analysis-agent/tests/) | 单元和集成测试（含 `test_lock_hang_analyzer.py`、`test_lock_hang_client.py`、`test_crash_session_pool.py`） |
-| [`doc/`](./vmcore-analysis-agent/doc/) | 架构流程图等项目文档 |
-| [`reports/`](./vmcore-analysis-agent/reports/) | 本地生成的报告目录 |
+| [`main.py`](./main.py) | FastAPI 服务、分析 API 与生命周期初始化 |
+| [`client/`](./client/) | HTTP/SSE 客户端及命令行入口 |
+| [`src/react/`](./src/react/) | LangGraph 节点、路由、状态、Prompt、证据评估和报告生成 |
+| [`src/llm/`](./src/llm/) | LLM 客户端创建 |
+| [`src/mcp_tools/`](./src/mcp_tools/) | MCP 工具注册及 crash、源码补丁、栈保护、锁/挂死等工具 |
+| [`tests/`](./tests/) | 单元和集成测试（含 `test_lock_hang_analyzer.py`、`test_lock_hang_client.py`、`test_crash_session_pool.py`） |
+| [`doc/`](./doc/) | 架构流程图等项目文档 |
+| [`reports/`](./reports/) | 本地生成的报告目录 |
 
 ## 部署前准备
 
@@ -68,11 +68,10 @@
 在仓库根目录执行：
 
 ```bash
-cd vmcore-analysis-agent
 uv sync
 ```
 
-如果需要安装仓库提供的 mpykdump 扩展，在 `vmcore-analysis-agent` 目录执行（脚本会向系统 crash 扩展目录写文件，可能需要 `sudo`）：
+如果需要安装仓库提供的 mpykdump 扩展，在仓库根目录执行（脚本会向系统 crash 扩展目录写文件，可能需要 `sudo`）：
 
 ```bash
 bash tools/install_mpykdump.sh
@@ -86,7 +85,7 @@ bash tools/install_mpykdump.sh
 cp .env.example .env
 ```
 
-编辑 `vmcore-analysis-agent/.env`，填入模型服务的有效凭据和地址：
+编辑 `.env`，填入模型服务的有效凭据和地址：
 
 ```dotenv
 REASONING_API_KEY=替换为你的API密钥
@@ -159,7 +158,7 @@ CRASH_MCP_MAX_CONCURRENCY=8
 
 ### 3. 启动服务
 
-在 `vmcore-analysis-agent` 目录使用 `vmcore_agent.bash` 统一启停和控制服务（在默认 `CRASH_EXECUTION_MODE=daemon` 下会自动先拉起并健康检查 `crash-daemon`，再启动监听 `0.0.0.0:8000` 的 agent）：
+在仓库根目录使用 `vmcore_agent.bash` 统一启停和控制服务（在默认 `CRASH_EXECUTION_MODE=daemon` 下会自动先拉起并健康检查 `crash-daemon`，再启动监听 `0.0.0.0:8000` 的 agent）：
 
 ```bash
 # 后台启动（推荐）：按模式联动启动 crash-daemon 与 agent
@@ -306,7 +305,7 @@ Gate 是分析状态机中的验证检查点。Gate 是否关闭由执行器根�
 - `object_lifetime`：评估转储中对象/内存槽位的当前状态。比如 `kmem -S` 显示 `[ALLOCATED]` 只能说明转储时槽位已分配，不能据此排除对象曾释放后被复用。
 - `local_corruption_exclusion`：结合反汇编和内存观测，检查本地代码是否可能写入异常值。
 
-具体必需 Gate 和完成条件由 [`schema.py`](./vmcore-analysis-agent/src/react/schema.py) 与 [`evidence.py`](./vmcore-analysis-agent/src/react/evidence.py) 定义。
+具体必需 Gate 和完成条件由 [`schema.py`](./src/react/schema.py) 与 [`evidence.py`](./src/react/evidence.py) 定义。
 
 ### 长时分析与证据膨胀控制
 
@@ -319,7 +318,7 @@ Gate 是分析状态机中的验证检查点。Gate 是否关闭由执行器根�
 
 ## 锁 / 挂死确定性分析（`lock_hang` 工具包）
 
-`src/mcp_tools/lock_hang/` 是一个独立的 MCP provider，按 [`registry.py`](./vmcore-analysis-agent/src/mcp_tools/registry.py) 的目录约定自动发现，无需改动注册表。它把"遍历所有 CPU 的 `bt -a` / `ps -m` / `runq` 原文"这一步收敛成结构化 JSON，减少上下文占用并消除模型对栈帧的手工解读。
+`src/mcp_tools/lock_hang/` 是一个独立的 MCP provider，按 [`registry.py`](./src/mcp_tools/registry.py) 的目录约定自动发现，无需改动注册表。它把"遍历所有 CPU 的 `bt -a` / `ps -m` / `runq` 原文"这一步收敛成结构化 JSON，减少上下文占用并消除模型对栈帧的手工解读。
 
 ### 两个工具
 
@@ -358,15 +357,21 @@ Gate 是分析状态机中的验证检查点。Gate 是否关闭由执行器根�
 
 ### 建议的使用顺序
 
-本仓库当前**未**在 `src/react/sop_fragments.py` 中启用锁/挂死快速通道，分析器只作为工具暴露给模型。若要让模型在 `soft_lockup` / `hard_lockup` / `hung_task` / `rcu_stall` 签名下优先调用它、而不是先倾倒 `bt -a`，需要按 [`INTEGRATION.md`](./INTEGRATION.md) 追加 `lock_hang_fast_path` SOP 片段。顺序建议：
+锁/挂死快速通道**已启用**，提示词分三层引导模型优先调用分析器，而不是先倾倒 `bt -a` / `foreach UN bt`（实现细节见 [`INTEGRATION.md`](./INTEGRATION.md)）：
+
+- **layer0（每轮注入）**：`3.7a Deterministic Lock / Hang Analyzers` 小节列出两个分析器及语法，规定其优先于 3.5 手工命令和 3.8 的 `hanginfo` 等扩展命令，分析器不可用或结果为空时再回退。
+- **playbook（签名确定后）**：`hung_task` 剧本要求先调 `analyze_lock_wait_graph`；`soft_lockup` / `hard_lockup` 共用剧本要求先调 `analyze_cpu_lockup_rcu`；`rcu_stall` 剧本原本就要求先调 `analyze_cpu_lockup_rcu`。
+- **SOP 兜底（仅第 1 轮初筛）**：签名尚未分类（`None` / 空 / `unknown`）且完整初始上下文中出现 `blocked for more than`、`soft lockup`、`hard lockup`、`detected stalls on cpus`、`self-detected stall` 等强信号时，注入 `lock_hang_fast_path`；签名落定后自动退场。
+
+顺序建议：
 
 1. 先 `analyze_lock_wait_graph`（等待关系）或 `analyze_cpu_lockup_rcu`（CPU 侧），拿到结构化图/摘要；
-2. 再对死锁环成员或根阻塞 CPU 定向执行 `bt -f <pid>`、`struct`、`dis -rl`；
+2. 再对死锁环成员或根阻塞 CPU 定向执行 `bt -f <task_addr>`、`bt -c <cpu>`、`struct`、`dis -rl`；
 3. 命中的锁地址若要单独确认，用 `--lock-addr <hex>` 走单锁 owner 追踪分支（`--lock-type` 省略时按 `mutex` 处理，确认是读写信号量时需显式传 `rwsem`）。
 
 ## 常驻 Crash 会话池与共享守护进程
 
-[`src/mcp_tools/crash/`](./vmcore-analysis-agent/src/mcp_tools/crash/) 提供常驻 PTY 会话池（`session_pool.py`）与可选的跨进程守护进程（`daemon.py`），`run_crash_command` / `run_crash_script` 签名保持不变，因此 `crash`、`stack_canary`、`lock_hang`、`scsishow` 全部自动受益。
+[`src/mcp_tools/crash/`](./src/mcp_tools/crash/) 提供常驻 PTY 会话池（`session_pool.py`）与可选的跨进程守护进程（`daemon.py`），`run_crash_command` / `run_crash_script` 签名保持不变，因此 `crash`、`stack_canary`、`lock_hang`、`scsishow` 全部自动受益。
 
 ### 两种执行模式
 
@@ -431,36 +436,55 @@ CRASH_MCP_TRANSPORT=streamable-http CRASH_MCP_HOST=127.0.0.1 CRASH_MCP_PORT=8766
 - **两级超时自愈**：超时后先在统一 3 秒预算内向进程组发送 `SIGINT` 挽救会话并保留已加载符号；恢复失败或进程意外退出时才杀进程组自动重建并报告 `exit_code`。
 - **多并发与防 OOM**：不同 `vmcore` 真并行；`server.py` 通过 `asyncio.to_thread` 与按事件循环隔离的 `WeakKeyDictionary` 信号量解除事件循环阻塞；按 `last_used_at` 严格全局 LRU 淘汰与后台空闲 TTL 回收控制宿主机内存。
 
+## 崩溃复现场景（`simulate-crash/`）
+
+`simulate-crash/` 下是几个用来**人为制造崩溃现场**的内核模块，用于生成可复现的 vmcore，测试和演示 agent 的各类分析剧本。只能在测试机或虚拟机上使用。每个目录都有自己的 README，说明构建、触发和分析步骤。
+
+| 目录 | 模块 | 模拟的场景 | 主要参数 | agent 应判定的 `signature_class` |
+|---|---|---|---|---|
+| [`soft_lockup/`](./simulate-crash/soft_lockup/) | `soft_lockup_module.ko` | 用 `mode` 选择 4 种 CPU 锁死：`busy`（关抢占忙等）、`spinlock`（持锁不放 + 另一 CPU 争抢）、`softirq`（在定时器软中断里忙等）、`irqoff`（关中断忙等，需 `allow_irqoff=1`） | `mode`、`cpu_number`、`contender_cpu`、`enable_soft_lockup`（运行时可切换） | `soft_lockup`；`irqoff` 为 `hard_lockup` |
+| [`rcu_stall/`](./simulate-crash/rcu_stall/) | `rcu_stall_mod.ko` | 读者线程在 `rcu_read_lock()` 内长时间睡眠，配合宽限期等待者，制造 RCU stall | `stall_duration_ms` | `rcu_stall` |
+| [`dma_memory_corruption/`](./simulate-crash/dma_memory_corruption/) | `dma_memory_corruption_mod.ko` | 模拟 DMA 越界写，覆盖相邻页里对象的函数指针；可选再破坏该页的 `struct page`，在释放路径上崩溃 | `enable_dma_corruption`、`corrupt_page_struct`、`corruption_len`、`start_delay_ms` | 函数指针模式为指针破坏类；`struct page` 模式通常在页释放路径上崩溃 |
+
+几点约定：
+
+- **编译选项**：三个模块的 Makefile 都使用 `ccflags-y := -g`，按内核默认的 `-O2` 编译，**不再使用 `-O0` / `-Og`**（内核只支持 `-O2` / `-Os`）。需要在栈里单独出现的函数在源码中标了 `noinline`。`.ko` 不要 strip，分析时用 `--debug-symbols` 传入。
+- **版本一致**：编译后用 `make vermagic` 确认 `.ko` 对应的内核版本和测试机一致（示例环境为 `5.14.0-362.24.1.el9_3.x86_64`）。
+- **基线变化**：改为 `-O2` 后，指令偏移、寄存器分配都和旧版本不同。`reports/` 里用旧 `.ko` 生成的报告不能直接与新版本对比，需要重新生成 vmcore。
+- **触发 panic**：soft lockup 需要 `kernel.softlockup_panic=1`，hard lockup 需要 `kernel.nmi_watchdog=1` 和 `kernel.hardlockup_panic=1`，RCU stall 需要 `kernel.panic_on_rcu_stall=1`，并且 kdump 正常工作。详见各目录 README。
+
 ## 项目结构
 
 ```text
-ai-app-hub/                       # 仓库根目录（包含多个项目）
+vmcore-analysis-agent/            # 仓库根目录
 ├── README.md
 ├── README.zh-CN.md
-└── vmcore-analysis-agent/         # 本文档介绍的组件
-    ├── main.py                   # FastAPI 入口
-    ├── vmcore_agent.bash         # 统一启停与运维控制脚本（联动 agent 与 crash-daemon）
-    ├── client/                   # CLI 与 HTTP/SSE 客户端
-    ├── src/
-    │   ├── llm/                  # 模型初始化
-    │   ├── react/                # Agent 图、Prompt、状态、证据和报告
-    │   ├── mcp_tools/            # MCP 工具
-    │   └── utils/                # 设置与日志
-    ├── tests/                    # 测试
-    ├── tools/                    # 运维和调试辅助脚本
-    ├── doc/                      # 流程图等文档
-    ├── simulate-crash/           # 崩溃复现场景
-    ├── reports/                  # 报告输出目录
-    ├── ARCHITECTURE.md           # 架构与核心逻辑（维护者读码地图）
-    ├── INTEGRATION.md            # lock_hang 工具集成指南
-    ├── pyproject.toml
-    ├── uv.lock
-    └── .env.example
+├── main.py                   # FastAPI 入口
+├── vmcore_agent.bash         # 统一启停与运维控制脚本（联动 agent 与 crash-daemon）
+├── client/                   # CLI 与 HTTP/SSE 客户端
+├── src/
+│   ├── llm/                  # 模型初始化
+│   ├── react/                # Agent 图、Prompt、状态、证据和报告
+│   ├── mcp_tools/            # MCP 工具
+│   └── utils/                # 设置与日志
+├── tests/                    # 测试
+├── tools/                    # 运维和调试辅助脚本
+├── doc/                      # 流程图等文档
+├── simulate-crash/           # 崩溃复现场景（见“崩溃复现场景”一节）
+│   ├── soft_lockup/          # soft/hard lockup：busy / spinlock / softirq / irqoff
+│   ├── rcu_stall/            # RCU stall
+│   └── dma_memory_corruption/  # DMA 越界写 / struct page 破坏
+├── reports/                  # 报告输出目录
+├── ARCHITECTURE.md           # 架构与核心逻辑（维护者读码地图）
+├── INTEGRATION.md            # lock_hang 工具集成指南
+├── pyproject.toml
+├── uv.lock
+└── .env.example
 ```
 
 ## 常见问题
 
-- **服务启动提示缺少配置**：检查 `vmcore-analysis-agent/.env` 或进程环境中是否设置了 `REASONING_API_KEY`、`REASONING_BASE_URL`、`REASONING_MODEL`。
+- **服务启动提示缺少配置**：检查 `.env` 或进程环境中是否设置了 `REASONING_API_KEY`、`REASONING_BASE_URL`、`REASONING_MODEL`。
 - **模型网关报错 `400 unsupported_parameter: 'thinking'`**：部分严格校验 `/v1/chat/completions` 的网关不接受 DeepSeek 私有的 `thinking` 字段，请在 `.env` 中设置 `REASONING_PARAM_PROFILE=openai`，并将 `REASONING_EFFORT` 设为网关支持的值。
 - **执行 crash 脚本提示 `shell control flow is not executable by crash` 或语法被拦截**：`run_script` 的每个参数仅执行单条 crash 原生命令，不支持 `for`/`while`/`if` 循环、分号、`&&`、重定向（如 `2>/dev/null`）或 shell 变量。应将循环展开为逐行独立的 crash 命令（支持在同一次 `run_script` 中批量传入多行以减少交互步数）。
 - **执行 crash 脚本提示 `gdb request failed` 或结构体无法识别**：若引用的结构体属于第三方或内核模块私有类型，由于每次 `run_script` 都是独立的 crash 进程会话，脚本中需在读取该类型前显式执行 `mod -s <module>` 加载模块符号。
@@ -517,8 +541,8 @@ objdump -S -d drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko > mlx5_debug.
 
 # 3. 使用工具脚本验证符号解析
 # 从仓库根目录执行
-cd /path/to/ai-app-hub
-bash vmcore-analysis-agent/tools/show_first_global_func.sh /usr/src/ofa_kernel-5.8/source/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko
+cd /path/to/vmcore-analysis-agent
+bash tools/show_first_global_func.sh /usr/src/ofa_kernel-5.8/source/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko
 ```
 
 ## 贡献与许可

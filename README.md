@@ -4,7 +4,7 @@
 
 ![VMCore Analysis Agent](./doc/vmcore-analysis-agent-logo.svg)
 
-A vmcore analysis service built with LangGraph, MCP, and the Linux `crash` utility. The application lives in [`vmcore-analysis-agent/`](./vmcore-analysis-agent/); this README explains its workflow, deployment, and outputs.
+A vmcore analysis service built with LangGraph, MCP, and the Linux `crash` utility. This README explains its workflow, deployment, and outputs.
 
 ## What it does
 
@@ -38,14 +38,14 @@ An analysis follows these steps:
 
 | Path | Responsibility |
 |---|---|
-| [`main.py`](./vmcore-analysis-agent/main.py) | FastAPI service, analysis APIs, and lifecycle initialization |
-| [`client/`](./vmcore-analysis-agent/client/) | HTTP/SSE client and CLI entry point |
-| [`src/react/`](./vmcore-analysis-agent/src/react/) | LangGraph nodes, routing, state, prompts, evidence evaluation, and report generation |
-| [`src/llm/`](./vmcore-analysis-agent/src/llm/) | LLM client creation |
-| [`src/mcp_tools/`](./vmcore-analysis-agent/src/mcp_tools/) | MCP tool registration plus crash, source-patch, stack-canary, and lock/hang tools |
-| [`tests/`](./vmcore-analysis-agent/tests/) | Unit and integration tests (including `test_lock_hang_analyzer.py`, `test_lock_hang_client.py`, and `test_crash_session_pool.py`) |
-| [`doc/`](./vmcore-analysis-agent/doc/) | Architecture flow diagrams and project documentation |
-| [`reports/`](./vmcore-analysis-agent/reports/) | Local report output directory |
+| [`main.py`](./main.py) | FastAPI service, analysis APIs, and lifecycle initialization |
+| [`client/`](./client/) | HTTP/SSE client and CLI entry point |
+| [`src/react/`](./src/react/) | LangGraph nodes, routing, state, prompts, evidence evaluation, and report generation |
+| [`src/llm/`](./src/llm/) | LLM client creation |
+| [`src/mcp_tools/`](./src/mcp_tools/) | MCP tool registration plus crash, source-patch, stack-canary, and lock/hang tools |
+| [`tests/`](./tests/) | Unit and integration tests (including `test_lock_hang_analyzer.py`, `test_lock_hang_client.py`, and `test_crash_session_pool.py`) |
+| [`doc/`](./doc/) | Architecture flow diagrams and project documentation |
+| [`reports/`](./reports/) | Local report output directory |
 
 ## Prerequisites
 
@@ -68,11 +68,10 @@ Commands below use a Linux shell.
 From the repository root:
 
 ```bash
-cd vmcore-analysis-agent
 uv sync
 ```
 
-To install the bundled mpykdump extension, run this from the `vmcore-analysis-agent` directory. The script writes to the system crash extension directory and may require `sudo`:
+To install the bundled mpykdump extension, run this from the repository root. The script writes to the system crash extension directory and may require `sudo`:
 
 ```bash
 bash tools/install_mpykdump.sh
@@ -86,7 +85,7 @@ Copy the template:
 cp .env.example .env
 ```
 
-Edit `vmcore-analysis-agent/.env` with valid model credentials and endpoint details:
+Edit `.env` with valid model credentials and endpoint details:
 
 ```dotenv
 REASONING_API_KEY=replace-with-your-api-key
@@ -159,7 +158,7 @@ Process environment variables take precedence over `.env`. The service fails dur
 
 ### 3. Start the service
 
-From the `vmcore-analysis-agent` directory, use `vmcore_agent.bash` to start and manage the service (under the default `CRASH_EXECUTION_MODE=daemon`, it automatically starts and health-checks `crash-daemon` before launching the agent on `0.0.0.0:8000`):
+From the repository root, use `vmcore_agent.bash` to start and manage the service (under the default `CRASH_EXECUTION_MODE=daemon`, it automatically starts and health-checks `crash-daemon` before launching the agent on `0.0.0.0:8000`):
 
 ```bash
 # Background mode (recommended): starts crash-daemon (if daemon mode) + agent
@@ -306,7 +305,7 @@ Examples:
 - `object_lifetime`: assess the current state of an object or memory slot in the dump. For example, `[ALLOCATED]` from `kmem -S` only describes the slot at dump time; it does not rule out an earlier free and reuse.
 - `local_corruption_exclusion`: use disassembly and memory observations to check whether local code could have written the unexpected value.
 
-The required gates and completion criteria are defined in [`schema.py`](./vmcore-analysis-agent/src/react/schema.py) and [`evidence.py`](./vmcore-analysis-agent/src/react/evidence.py).
+The required gates and completion criteria are defined in [`schema.py`](./src/react/schema.py) and [`evidence.py`](./src/react/evidence.py).
 
 ### Long-run analysis and evidence bounding
 
@@ -319,7 +318,7 @@ In long-running and complex vmcore analyses, commands such as `kmem`, `rd`, and 
 
 ## Deterministic lock/hang analysis (`lock_hang` package)
 
-[`src/mcp_tools/lock_hang/`](./vmcore-analysis-agent/src/mcp_tools/lock_hang/) is a self-contained MCP provider, auto-discovered by the directory convention in [`registry.py`](./vmcore-analysis-agent/src/mcp_tools/registry.py) — no registry edits required. It collapses the "dump `bt -a` / `ps -m` / `runq` for every CPU" step into structured JSON, shrinking context usage and removing the model's hand-interpretation of stack frames.
+[`src/mcp_tools/lock_hang/`](./src/mcp_tools/lock_hang/) is a self-contained MCP provider, auto-discovered by the directory convention in [`registry.py`](./src/mcp_tools/registry.py) — no registry edits required. It collapses the "dump `bt -a` / `ps -m` / `runq` for every CPU" step into structured JSON, shrinking context usage and removing the model's hand-interpretation of stack frames.
 
 ### Two tools
 
@@ -358,15 +357,21 @@ Output fields: `total_cpus_parsed`, `idle_cpu_count`, `spinlock_contender_count`
 
 ### Suggested usage order
 
-This repository does **not** currently enable a lock/hang fast path in `src/react/sop_fragments.py`; the analyzers are merely exposed as tools. To make the model prefer them over dumping `bt -a` under `soft_lockup` / `hard_lockup` / `hung_task` / `rcu_stall`, add the `lock_hang_fast_path` SOP fragment as described in [`INTEGRATION.md`](./INTEGRATION.md). Recommended order:
+The lock/hang fast path is **enabled**. The prompt steers the model to call the analyzers before dumping `bt -a` / `foreach UN bt`, at three layers (details in [`INTEGRATION.md`](./INTEGRATION.md)):
+
+- **layer0 (every turn)**: section `3.7a Deterministic Lock / Hang Analyzers` lists both analyzers with their syntax and ranks them ahead of the manual commands in 3.5 and the extension commands in 3.8 such as `hanginfo`; fall back only when an analyzer is unavailable or returns nothing.
+- **Playbooks (once the signature is set)**: the `hung_task` playbook requires `analyze_lock_wait_graph` first; the shared `soft_lockup` / `hard_lockup` playbook requires `analyze_cpu_lockup_rcu` first; the `rcu_stall` playbook already required `analyze_cpu_lockup_rcu` first.
+- **SOP fallback (first-turn triage only)**: while the signature is unclassified (`None` / empty / `unknown`) and the full initial context contains a strong signal such as `blocked for more than`, `soft lockup`, `hard lockup`, `detected stalls on cpus` or `self-detected stall`, the `lock_hang_fast_path` fragment is injected; it drops out once the signature is classified.
+
+Recommended order:
 
 1. Call `analyze_lock_wait_graph` (wait relationships) or `analyze_cpu_lockup_rcu` (CPU side) first to obtain the structured graph/summary;
-2. Then run targeted `bt -f <pid>`, `struct`, or `dis -rl` against deadlock cycle members or the root-blocking CPU;
+2. Then run targeted `bt -f <task_addr>`, `bt -c <cpu>`, `struct`, or `dis -rl` against deadlock cycle members or the root-blocking CPU;
 3. To confirm one specific lock address in isolation, use `--lock-addr <hex>` to enter the single-lock owner-tracing branch (`--lock-type` defaults to `mutex` when omitted; pass `rwsem` explicitly for read/write semaphores).
 
 ## Persistent crash session pool and shared daemon
 
-[`src/mcp_tools/crash/`](./vmcore-analysis-agent/src/mcp_tools/crash/) provides a persistent PTY session pool (`session_pool.py`) and an optional cross-process daemon (`daemon.py`), keeping the `run_crash_command` / `run_crash_script` signatures unchanged so `crash`, `stack_canary`, `lock_hang`, and `scsishow` all benefit transparently.
+[`src/mcp_tools/crash/`](./src/mcp_tools/crash/) provides a persistent PTY session pool (`session_pool.py`) and an optional cross-process daemon (`daemon.py`), keeping the `run_crash_command` / `run_crash_script` signatures unchanged so `crash`, `stack_canary`, `lock_hang`, and `scsishow` all benefit transparently.
 
 ### Execution modes
 
@@ -432,36 +437,55 @@ Daemon endpoints: `GET /health` (active sessions, `VmRSS`, hits/misses/evictions
 - **Two-stage timeout recovery**: Sends `SIGINT` to the `crash` process group within a strict 3s budget to preserve loaded symbols; only kills and respawns (with `exit_code` diagnostics and cleared module cache) if recovery fails.
 - **Concurrency & OOM control**: Different vmcores run in parallel; `server.py` offloads blocking calls via `asyncio.to_thread` with loop-scoped `WeakKeyDictionary` semaphores; global LRU eviction (by `last_used_at`) and a background idle-TTL reaper bound host memory.
 
+## Crash reproduction scenarios (`simulate-crash/`)
+
+`simulate-crash/` contains kernel modules that **deliberately create crash scenes**, producing reproducible vmcores for testing and demonstrating the agent's analysis playbooks. Use them only on test machines or VMs. Each directory has its own README covering build, trigger and analysis steps.
+
+| Directory | Module | Scenario | Main parameters | Expected `signature_class` |
+|---|---|---|---|---|
+| [`soft_lockup/`](./simulate-crash/soft_lockup/) | `soft_lockup_module.ko` | Four CPU lockup modes selected by `mode`: `busy` (busy-wait with preemption off), `spinlock` (hold a lock while another CPU contends for it), `softirq` (busy-wait in a timer softirq), `irqoff` (busy-wait with interrupts off; requires `allow_irqoff=1`) | `mode`, `cpu_number`, `contender_cpu`, `enable_soft_lockup` (switchable at runtime) | `soft_lockup`; `hard_lockup` for `irqoff` |
+| [`rcu_stall/`](./simulate-crash/rcu_stall/) | `rcu_stall_mod.ko` | A reader thread sleeps for a long time inside `rcu_read_lock()` while a grace-period waiter blocks, producing an RCU stall | `stall_duration_ms` | `rcu_stall` |
+| [`dma_memory_corruption/`](./simulate-crash/dma_memory_corruption/) | `dma_memory_corruption_mod.ko` | Simulates a DMA overrun that overwrites a function pointer in an object on the adjacent page; optionally also corrupts that page's `struct page` and crashes in the free path | `enable_dma_corruption`, `corrupt_page_struct`, `corruption_len`, `start_delay_ms` | Pointer-corruption class for the function-pointer mode; the `struct page` mode usually crashes in the page-free path |
+
+Conventions:
+
+- **Build flags**: all three Makefiles use `ccflags-y := -g` and build at the kernel's default `-O2`; **`-O0` / `-Og` are no longer used** (the kernel only supports `-O2` / `-Os`). Functions that must keep their own stack frame are marked `noinline` in the source. Do not strip the `.ko`; pass it to the agent with `--debug-symbols`.
+- **Version match**: after building, run `make vermagic` to confirm the `.ko` matches the test machine's kernel (the example environment is `5.14.0-362.24.1.el9_3.x86_64`).
+- **Baseline change**: with `-O2`, instruction offsets and register allocation differ from earlier builds. Reports in `reports/` produced with the old `.ko` files cannot be compared directly; regenerate the vmcores.
+- **Triggering a panic**: soft lockup needs `kernel.softlockup_panic=1`, hard lockup needs `kernel.nmi_watchdog=1` and `kernel.hardlockup_panic=1`, RCU stall needs `kernel.panic_on_rcu_stall=1`, and kdump must be working. See each directory's README for details.
+
 ## Project layout
 
 ```text
-ai-app-hub/                       # Repository root (contains multiple projects)
+vmcore-analysis-agent/            # Repository root
 ├── README.md
 ├── README.zh-CN.md
-└── vmcore-analysis-agent/         # Component described here
-    ├── main.py                   # FastAPI entry point
-    ├── vmcore_agent.bash         # Unified start/stop/status/health/logs script (agent + crash-daemon)
-    ├── client/                   # CLI and HTTP/SSE client
-    ├── src/
-    │   ├── llm/                  # Model initialization
-    │   ├── react/                # Agent graph, prompts, state, evidence, reports
-    │   ├── mcp_tools/            # MCP tools
-    │   └── utils/                # Settings and logging
-    ├── tests/                    # Tests
-    ├── tools/                    # Operations and debug helper scripts
-    ├── doc/                      # Flow diagrams and documentation
-    ├── simulate-crash/           # Crash reproduction scenarios
-    ├── reports/                  # Report output directory
-    ├── ARCHITECTURE.md           # Architecture and core logic (maintainer's code map)
-    ├── INTEGRATION.md            # lock_hang integration guide
-    ├── pyproject.toml
-    ├── uv.lock
-    └── .env.example
+├── main.py                   # FastAPI entry point
+├── vmcore_agent.bash         # Unified start/stop/status/health/logs script (agent + crash-daemon)
+├── client/                   # CLI and HTTP/SSE client
+├── src/
+│   ├── llm/                  # Model initialization
+│   ├── react/                # Agent graph, prompts, state, evidence, reports
+│   ├── mcp_tools/            # MCP tools
+│   └── utils/                # Settings and logging
+├── tests/                    # Tests
+├── tools/                    # Operations and debug helper scripts
+├── doc/                      # Flow diagrams and documentation
+├── simulate-crash/           # Crash reproduction scenarios (see the section above)
+│   ├── soft_lockup/          # soft/hard lockup: busy / spinlock / softirq / irqoff
+│   ├── rcu_stall/            # RCU stall
+│   └── dma_memory_corruption/  # DMA overrun / struct page corruption
+├── reports/                  # Report output directory
+├── ARCHITECTURE.md           # Architecture and core logic (maintainer's code map)
+├── INTEGRATION.md            # lock_hang integration guide
+├── pyproject.toml
+├── uv.lock
+└── .env.example
 ```
 
 ## Troubleshooting
 
-- **Missing configuration on startup:** Check `REASONING_API_KEY`, `REASONING_BASE_URL`, and `REASONING_MODEL` in `vmcore-analysis-agent/.env` or the process environment.
+- **Missing configuration on startup:** Check `REASONING_API_KEY`, `REASONING_BASE_URL`, and `REASONING_MODEL` in `.env` or the process environment.
 - **`400 unsupported_parameter: 'thinking'` from the LLM gateway:** Set `REASONING_PARAM_PROFILE=openai` and choose a supported effort value when using gateways that strictly validate `/v1/chat/completions`.
 - **Script rejected with `shell control flow is not executable by crash`:** `run_script` runs each argument as a single native crash command; it does not support `for`/`while`/`if` loops, `;`, `&&`, redirection (e.g. `2>/dev/null`), or shell variables. Expand loops into individual sequential crash commands per line (batching multiple commands in a single `run_script` call is encouraged to reduce ReAct steps).
 - **Running `daemon` (`unix://`) on Windows / non-POSIX hosts:** Persistent PTY sessions require POSIX `pty`/`termios`, and `unix://` requires `AF_UNIX`. Set `CRASH_EXECUTION_MODE=oneshot` for local Windows development/CI (or `http://` for TCP daemon testing).
@@ -518,8 +542,8 @@ objdump -S -d drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko > mlx5_debug.
 
 # 3. Verify symbol resolution with the project helper
 # Run from the repository root
-cd /path/to/ai-app-hub
-bash vmcore-analysis-agent/tools/show_first_global_func.sh /usr/src/ofa_kernel-5.8/source/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko
+cd /path/to/vmcore-analysis-agent
+bash tools/show_first_global_func.sh /usr/src/ofa_kernel-5.8/source/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko
 ```
 
 ## Contributing and license
